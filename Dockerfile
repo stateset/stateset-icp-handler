@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.6
+
+# --- builder ------------------------------------------------------------
+FROM rust:1.85-bookworm AS builder
+
+# protoc is required for tonic-build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# The handler has a `path = ../stateset-icommerce/...` dependency on the
+# iCommerce workspace. The build context is expected to be the parent of
+# the two checkouts, so that both are reachable.
+#
+#     docker build -f stateset-icp-handler/Dockerfile -t stateset-icp-handler .
+#
+COPY stateset-icommerce ./stateset-icommerce
+COPY stateset-icp-handler ./stateset-icp-handler
+
+WORKDIR /build/stateset-icp-handler
+RUN cargo build --release --bin stateset-icp-handler
+
+# --- runtime ------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 icp \
+    && useradd  --system --uid 1000 --gid icp --shell /usr/sbin/nologin icp
+
+WORKDIR /app
+COPY --from=builder /build/stateset-icp-handler/target/release/stateset-icp-handler \
+     /usr/local/bin/stateset-icp-handler
+
+USER icp
+EXPOSE 8082 50052
+ENV HOST=0.0.0.0 PORT=8082 GRPC_HOST=0.0.0.0 GRPC_PORT=50052
+
+ENTRYPOINT ["/usr/local/bin/stateset-icp-handler"]

@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  icp-handler:
+    build:
+      # Build context must be the parent directory so the Dockerfile
+      # can see both ./stateset-icp-handler and ./stateset-icommerce.
+      context: ..
+      dockerfile: stateset-icp-handler/Dockerfile
+    image: stateset/icp-handler:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8082"
+      GRPC_HOST: 0.0.0.0
+      GRPC_PORT: "50052"
+      LOG_LEVEL: info
+      ICP_ENABLE_DEMO_KEYS: "true"
+      ICP_REQUIRE_MANDATE: "true"
+      COMMERCE_ENABLED: "true"
+      COMMERCE_DB_PATH: /data/commerce.db
+      ICP_PUBLIC_BASE_URL: http://localhost:8082
+    volumes:
+      - icp-data:/data
+    ports:
+      - "8082:8082"
+      - "50052:50052"
+    restart: unless-stopped
+
+volumes:
+  icp-data:

@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# local SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# env files
+.env
+.env.local
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# build artifacts
+dist/
+release/

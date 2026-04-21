@@ -1,0 +1,155 @@
+// Intelligent Commerce Protocol (ICP) — gRPC surface.
+//
+// Payloads are carried as JSON bytes in `payload_json`, using the exact schema
+// defined in the HTTP/JSON spec. This mirrors the ACP and UCP handler
+// conventions and keeps the proto stable while the JSON schema evolves
+// additively.
+
+syntax = "proto3";
+
+package icp_handler.v1;
+
+// --------------------------------------------------------------------------
+// Service
+// --------------------------------------------------------------------------
+
+service IcpHandler {
+  // Discovery: capabilities, supported intents, keys, interop info.
+  rpc GetDiscovery(DiscoveryRequest) returns (DiscoveryResponse);
+
+  // Generic intent submission. The params JSON structure is determined by
+  // `intent` per the ICP spec (§7).
+  rpc SubmitIntent(IntentRequest) returns (IntentResponse);
+
+  // Server-streaming event subscription. The caller subscribes with a filter
+  // and receives events (transaction.*, order.*, shipment.*, a2a.*) as they
+  // occur.
+  rpc StreamEvents(EventStreamRequest) returns (stream EventMessage);
+
+  // Fetch a transaction aggregate.
+  rpc GetTransaction(GetTransactionRequest) returns (TransactionResponse);
+
+  // Fetch a receipt by its JTI.
+  rpc GetReceipt(GetReceiptRequest) returns (ReceiptResponse);
+
+  // Verify a receipt's signature against the handler's published JWKS.
+  rpc VerifyReceipt(VerifyReceiptRequest) returns (VerifyReceiptResponse);
+
+  // Introspect mandate usage (remaining budget, scope, etc.)
+  rpc GetMandateUsage(GetMandateUsageRequest) returns (MandateUsageResponse);
+}
+
+// --------------------------------------------------------------------------
+// Envelope headers
+// --------------------------------------------------------------------------
+
+message Envelope {
+  string icp_version = 1;
+  string agent_id = 2;
+  string request_id = 3;
+  string idempotency_key = 4;
+  string mandate_jws = 5;
+  string trace_id = 6;
+}
+
+// --------------------------------------------------------------------------
+// Discovery
+// --------------------------------------------------------------------------
+
+message DiscoveryRequest {
+  Envelope envelope = 1;
+}
+
+message DiscoveryResponse {
+  // JCS-canonicalized JSON document per ICP §10.
+  bytes payload_json = 1;
+  // Detached JWS over payload_json (compact form) signed by the handler.
+  string signature = 2;
+  string signature_kid = 3;
+}
+
+// --------------------------------------------------------------------------
+// Intent submission
+// --------------------------------------------------------------------------
+
+message IntentRequest {
+  Envelope envelope = 1;
+  // JSON per ICP §7.1 (the intent envelope).
+  bytes payload_json = 2;
+}
+
+message IntentResponse {
+  // JSON response body (transaction / order / etc.)
+  bytes payload_json = 1;
+  // ICP receipt (compact JWS) signed over the canonicalized payload_json.
+  string receipt_jws = 2;
+  string receipt_kid = 3;
+}
+
+// --------------------------------------------------------------------------
+// Event streaming
+// --------------------------------------------------------------------------
+
+message EventStreamRequest {
+  Envelope envelope = 1;
+  // Comma-separated or wildcard filter of event types.
+  string filter = 2;
+  // Optional resume cursor.
+  string since = 3;
+}
+
+message EventMessage {
+  string id = 1;
+  string type = 2;
+  string transaction_id = 3;
+  string occurred_at = 4;
+  bytes payload_json = 5;
+}
+
+// --------------------------------------------------------------------------
+// Reads
+// --------------------------------------------------------------------------
+
+message GetTransactionRequest {
+  Envelope envelope = 1;
+  string transaction_id = 2;
+}
+
+message TransactionResponse {
+  bytes payload_json = 1;
+}
+
+message GetReceiptRequest {
+  Envelope envelope = 1;
+  string receipt_jti = 2;
+}
+
+message ReceiptResponse {
+  string receipt_jws = 1;
+  string receipt_kid = 2;
+  bytes payload_json = 3;
+}
+
+message VerifyReceiptRequest {
+  Envelope envelope = 1;
+  string receipt_jws = 2;
+  // Optional expected body bytes; if provided the server verifies the
+  // body_digest claim as well as the signature.
+  bytes expected_body_json = 3;
+}
+
+message VerifyReceiptResponse {
+  bool valid = 1;
+  string kid = 2;
+  string reason = 3;
+  bytes payload_json = 4;
+}
+
+message GetMandateUsageRequest {
+  Envelope envelope = 1;
+  string mandate_jti = 2;
+}
+
+message MandateUsageResponse {
+  bytes payload_json = 1;
+}
