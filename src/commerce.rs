@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use rust_decimal::Decimal;
-use stateset_core::{CreateCustomer, CreateOrder, CreateOrderItem};
+use stateset_core::{
+    CreateCustomer, CreateOrder, CreateOrderItem, CreateProduct, CreateProductVariant, ProductId,
+};
 use stateset_embedded::Commerce;
 
 use crate::errors::ApiError;
@@ -76,6 +78,18 @@ impl CommerceEngine {
     /// `Ok(None)` when there is not enough buyer identity to create a
     /// customer (the engine requires `email` on `CreateCustomer`), or
     /// `Err` when the engine call fails.
+    ///
+    /// The engine validates:
+    ///   * `customer.first_name` and `email` are non-empty.
+    ///   * Every order item carries a non-nil `product_id` that resolves
+    ///     to a real product in the catalog.
+    ///
+    /// So for each line item we first look up the product by SKU and
+    /// auto-create (`products().create`) with a single default variant
+    /// when the catalog doesn't know the SKU yet. This makes the ICP
+    /// quote→buy flow self-seeding against a fresh engine database —
+    /// useful for demos and conformance runs where no pre-loaded
+    /// catalog exists.
     pub fn persist_order(
         &self,
         buyer: &Buyer,
@@ -92,23 +106,31 @@ impl CommerceEngine {
             .customers()
             .create(CreateCustomer {
                 email: email.clone(),
-                first_name: buyer.first_name.clone().unwrap_or_default(),
+                // Engine rejects empty first_name; fall back to the local
+                // part of the email, then to a sentinel.
+                first_name: non_empty(buyer.first_name.as_deref())
+                    .unwrap_or_else(|| local_part(email).unwrap_or("ICP Buyer").to_string()),
                 last_name: buyer.last_name.clone().unwrap_or_default(),
                 phone: buyer.phone_number.clone(),
                 ..Default::default()
             })
             .map_err(|e| ApiError::EngineUnavailable(format!("customer.create: {e}")))?;
 
-        let order_items = line_items
-            .iter()
-            .map(|li| CreateOrderItem {
+        // Resolve each SKU to a real product_id, auto-creating missing
+        // ones on the fly.
+        let mut order_items = Vec::with_capacity(line_items.len());
+        for li in line_items {
+            let unit_price = minor_to_decimal(li.unit_price.amount_minor, currency);
+            let product_id = self.ensure_product_for_sku(&li.sku, &li.name, unit_price)?;
+            order_items.push(CreateOrderItem {
+                product_id,
                 sku: li.sku.clone(),
                 name: li.name.clone(),
-                quantity: li.quantity.clamp(0, i32::MAX as i64) as i32,
-                unit_price: minor_to_decimal(li.unit_price.amount_minor, currency),
+                quantity: li.quantity.clamp(1, i32::MAX as i64) as i32,
+                unit_price,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
 
         let order = self
             .inner
@@ -130,6 +152,49 @@ impl CommerceEngine {
                 .unwrap_or_else(|| Money::new(0, currency)),
         }))
     }
+
+    /// Look up a product by its variant SKU, or create a product +
+    /// default variant and return the new product id.
+    fn ensure_product_for_sku(
+        &self,
+        sku: &str,
+        name: &str,
+        unit_price: Decimal,
+    ) -> Result<ProductId, ApiError> {
+        match self.inner.products().get_variant_by_sku(sku) {
+            Ok(Some(variant)) => return Ok(variant.product_id),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ApiError::EngineUnavailable(format!(
+                    "products.get_variant_by_sku({sku}): {e}"
+                )));
+            }
+        }
+
+        let display_name = non_empty(Some(name)).unwrap_or_else(|| sku.to_string());
+        let product = self
+            .inner
+            .products()
+            .create(CreateProduct {
+                name: display_name.clone(),
+                description: Some(format!("Auto-created by ICP handler for SKU {sku}")),
+                variants: Some(vec![CreateProductVariant {
+                    sku: sku.to_string(),
+                    name: Some(display_name),
+                    price: unit_price,
+                    compare_at_price: None,
+                    cost: None,
+                    barcode: None,
+                    weight: None,
+                    weight_unit: None,
+                    options: None,
+                    is_default: Some(true),
+                }]),
+                ..Default::default()
+            })
+            .map_err(|e| ApiError::EngineUnavailable(format!("products.create({sku}): {e}")))?;
+        Ok(product.id)
+    }
 }
 
 pub struct PersistedOrder {
@@ -145,4 +210,17 @@ fn minor_to_decimal(amount_minor: i64, currency: &str) -> Decimal {
 
 fn is_postgres_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
+}
+
+fn non_empty(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn local_part(email: &str) -> Option<&str> {
+    email
+        .split_once('@')
+        .map(|(local, _)| local)
+        .filter(|s| !s.is_empty())
 }

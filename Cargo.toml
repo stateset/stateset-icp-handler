@@ -1,6 +1,6 @@
 [package]
 name = "stateset-icp-handler"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Reference implementation of the Intelligent Commerce Protocol (ICP), backed by the StateSet iCommerce engine"
@@ -15,6 +15,14 @@ categories = ["web-programming::http-server", "api-bindings"]
 [[bin]]
 name = "stateset-icp-handler"
 path = "src/main.rs"
+
+[[bin]]
+name = "icp-conformance"
+path = "src/bin/icp_conformance.rs"
+
+[[bin]]
+name = "icp-mcp-stdio"
+path = "src/bin/icp_mcp_stdio.rs"
 
 [dependencies]
 # Async runtime + web
@@ -73,8 +81,29 @@ base64 = "0.22"
 # JSON Canonicalization (JCS, RFC 8785) via the `serde_jcs` crate
 serde_jcs = "0.1"
 
+# DID / multibase decoding (did:key round-trip).
+bs58 = "0.5"
+
+# Async-method-on-trait sugar — needed for `PrincipalResolver` since
+# `DidWebResolver` does HTTP I/O.
+async-trait = "0.1"
+
 # Redis (optional distributed state)
 redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "aio"] }
+
+# Persistent handler state (mandates, receipts, transactions, subscriptions,
+# peer quotes). Independent of the iCommerce engine's own database — this
+# stores protocol-level state that must survive handler restarts. Version
+# tracks the sibling iCommerce workspace for binary-size cohesion.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# OpenAPI 3.1 schema — auto-derived from model + handler annotations so
+# the machine-readable contract never drifts from the code. Swagger UI
+# assets deliberately omitted; `/openapi.json` is served standalone and
+# `/docs` is a tiny CDN-loading HTML page (see src/openapi.rs).
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "decimal"] }
 
 # StateSet iCommerce — embedded engine of record.
 # Pointed at the sibling checkout of the engine workspace so the handler

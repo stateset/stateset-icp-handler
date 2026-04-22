@@ -63,6 +63,9 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("idempotency_conflict: {0}")]
+    IdempotencyConflict(String),
+
     #[error("precondition_failed: {0}")]
     PreconditionFailed(String),
 
@@ -115,6 +118,9 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
             ),
             Self::Conflict(_) => ("conflict", "conflict", StatusCode::CONFLICT),
+            Self::IdempotencyConflict(_) => {
+                ("conflict", "idempotency_conflict", StatusCode::CONFLICT)
+            }
             Self::PreconditionFailed(_) => (
                 "precondition_failed",
                 "precondition_failed",
@@ -148,6 +154,7 @@ impl ApiError {
             | Self::IntentNotSupported(m)
             | Self::ResourceNotFound(m)
             | Self::Conflict(m)
+            | Self::IdempotencyConflict(m)
             | Self::PreconditionFailed(m)
             | Self::EngineUnavailable(m)
             | Self::ProcessingError(m) => m.clone(),

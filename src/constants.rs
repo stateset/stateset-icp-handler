@@ -18,7 +18,7 @@ pub mod headers {
 }
 
 /// Maximum accepted request body size, in bytes. Same as sibling handlers.
-pub const MAX_REQUEST_BODY_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Default session / transaction TTL (seconds). A transaction that has not
 /// reached a terminal state after this many seconds is eligible for GC.

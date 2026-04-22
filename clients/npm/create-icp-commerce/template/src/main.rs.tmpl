@@ -1,0 +1,34 @@
+//! {{name}} — a StateSet ICP merchant.
+//!
+//! Pairs `stateset-icp-handler` with its embedded iCommerce engine and
+//! serves both HTTP and gRPC. All configuration comes from `.env` /
+//! environment variables — see the generated `.env` for defaults.
+
+use std::net::SocketAddr;
+
+use stateset_icp_handler::{build_app_state, config::Config, serve};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Pull `.env` into `process.env` before `Config::load` so the same
+    // knobs work the same way whether this runs via `cargo run` or
+    // inside a container with env injected externally.
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    let config = Config::load()?;
+    let state = build_app_state(&config).await?;
+
+    let http_addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let grpc_addr: SocketAddr = format!("{}:{}", config.grpc_host, config.grpc_port).parse()?;
+
+    tracing::info!("{{name}} listening on http://{}", http_addr);
+    serve(state, http_addr, grpc_addr).await
+}

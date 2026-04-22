@@ -54,9 +54,7 @@ impl Intent {
     /// Parse the canonical wire name (e.g. `intent.buy` → `Intent::Buy`).
     pub fn parse(s: &str) -> Result<Self, ApiError> {
         let trimmed = s.trim();
-        let name = trimmed
-            .strip_prefix("intent.")
-            .unwrap_or(trimmed);
+        let name = trimmed.strip_prefix("intent.").unwrap_or(trimmed);
         Ok(match name {
             "search" => Self::Search,
             "describe" => Self::Describe,
@@ -123,5 +121,38 @@ impl Intent {
     /// therefore must be signed into a receipt).
     pub fn is_state_change(self) -> bool {
         !matches!(self, Self::Search | Self::Describe | Self::Track)
+    }
+
+    /// Whether this handler actually serves the intent end-to-end.
+    ///
+    /// The `Intent` enum catalogs every canonical ICP intent name so
+    /// that inbound payloads parse cleanly; advertising capability in
+    /// discovery / MCP tool catalogs must be gated on real
+    /// implementation to avoid a spec violation where clients call
+    /// `intent.negotiate` and receive `intent_not_supported` back.
+    ///
+    /// Add new intents to this filter **at the same time** as their
+    /// service-layer handler lands.
+    pub fn is_implemented(self) -> bool {
+        matches!(
+            self,
+            Self::Search
+                | Self::Describe
+                | Self::Quote
+                | Self::Authorize
+                | Self::Buy
+                | Self::Pay
+                | Self::Track
+                | Self::Return
+                | Self::RefundRequest
+                | Self::Subscribe
+                | Self::Renew
+                | Self::Pause
+                | Self::CancelSubscription
+                | Self::A2aQuote
+                | Self::A2aPay
+                | Self::Negotiate
+                | Self::ConfirmReceipt
+        )
     }
 }

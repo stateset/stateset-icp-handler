@@ -225,17 +225,56 @@ contract, and a working Rust handler skeleton that:
 - ✅ Streams transaction events via SSE + gRPC
 - ✅ Exposes Prometheus metrics on `/metrics`
 
-Planned for v0.2+:
+Since v0.1:
 
-- [ ] Signature verification against resolvable principal DIDs
+- ✅ **ACP compatibility path** — `/checkout_sessions/*` maps to ICP
+  intents one-to-one (see `src/compat/acp.rs`).
+- ✅ **UCP compatibility path** — `/checkout-sessions/*` + `/.well-known/ucp`
+  (see `src/compat/ucp.rs`).
+- ✅ **MCP surface** — `POST /mcp` serves JSON-RPC 2.0; every ICP intent
+  is advertised as a discoverable tool (see `src/mcp.rs`).
+- ✅ **MCP stdio transport** — second binary `icp-mcp-stdio` for Claude
+  Desktop, Cursor, and other clients that spawn MCP servers as
+  subprocesses (see [`docs/claude-desktop.md`](./docs/claude-desktop.md)).
+- ✅ **Mandate signature verification** — real Ed25519 verification
+  against `did:key` *and* `did:web` principals via a pluggable
+  [`PrincipalResolver`](./src/resolver.rs) trait. On by default
+  (`ICP_VERIFY_MANDATE_SIGNATURES=true`); set to `false` only for local
+  development against `alg:none` test fixtures.
+- ✅ **Subscriptions** — `intent.subscribe` / `renew` / `pause` /
+  `cancel_subscription` shipped, with weekly/monthly/annual cadences,
+  charge-on-subscribe, signed receipts on every state change, and an
+  **automatic billing scheduler** ([`src/scheduler.rs`](./src/scheduler.rs))
+  that runs renewals on a tokio interval. Three consecutive scheduler
+  failures transition a sub to `past_due`; manual `intent.renew` clears
+  the failure counter and reactivates.
+- ✅ **A2A peer commerce** — `intent.a2a_quote` and `intent.a2a_pay`
+  let agents transact directly. Pay-against-quote consumes a `PeerQuote`
+  and produces a signed receipt; direct-pay skips the quote step.
+  Mandate scope `pay_peer` enforced.
+- ✅ **`icp-conformance` harness** — implementation-independent test
+  suite that validates any ICP handler URL against the spec
+  (see `src/bin/icp_conformance.rs`). Run
+  `./demo_conformance.sh` for a one-command self-test.
+- ✅ CI on every push/PR: `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test`, Docker build.
+- ✅ 110+ integration tests locking in ICP, ACP, UCP, MCP (HTTP and
+  stdio), `did:key` and `did:web` mandate verification, engine
+  persistence, subscription lifecycle, scheduler-driven auto-billing,
+  and A2A peer-commerce wire contracts.
+
+15 of 17 catalog intents are now implemented end-to-end; only
+`intent.negotiate` and `intent.confirm_receipt` remain.
+
+Planned for v0.3+:
+
+- [ ] `intent.negotiate`, `intent.confirm_receipt` (catalog completion)
+- [ ] Additional DID resolver methods (`did:stateset:buyer`)
 - [ ] Full engine routing for tax, promotions, shipping
-- [ ] `intent.subscribe` + recurring billing
-- [ ] `intent.a2a_pay` + `intent.a2a_quote` (peer commerce)
-- [ ] Wired ACP and UCP compatibility paths
-- [ ] MCP stdio tool surface
+- [ ] Subscription dunning, prorated mid-cycle changes, trial periods
 - [ ] Language bindings (Node, Python, Go) — mirrored from the ACP/UCP
   handlers
-- [ ] Conformance test suite (`npx icp-conformance`)
+- [ ] Publish `icp-conformance` as `npx icp-conformance` (Node shim)
 
 Consult [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
 

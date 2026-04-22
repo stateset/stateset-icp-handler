@@ -17,6 +17,13 @@ pub struct DiscoveryDocument {
     pub handler_id: String,
     pub service_name: String,
     pub supported_versions: Vec<String>,
+    /// Declared conformance tier (see ICP_SPEC §15.1).
+    ///
+    /// `{ "tier": "icp-core" | "icp-full", "missing_intents": [...] }`.
+    /// `missing_intents` names any ICP-Full intents absent from this
+    /// handler's advertised `intents` set — empty for an `icp-full`
+    /// handler, populated for `icp-core`.
+    pub conformance: Value,
     pub transports: Value,
     pub intents: Vec<String>,
     pub currencies: Vec<String>,
@@ -35,10 +42,34 @@ pub fn build(config: &Config, signer: &ReceiptSigner) -> DiscoveryDocument {
     let mcp = format!("{}/mcp", http);
     let a2a = format!("{}/a2a/v1", http);
 
-    let intents = Intent::CORE
+    // Only advertise intents this handler actually serves — otherwise
+    // clients see the intent in `intents` and then get
+    // `intent_not_supported` back when they call it (caught by
+    // conformance test `discovery_intents_all_live`).
+    let intents: Vec<String> = Intent::CORE
         .iter()
+        .filter(|i| i.is_implemented())
         .map(|i| i.wire_name().to_string())
         .collect();
+
+    // ICP-Full = ICP-Core + negotiate + confirm_receipt (see spec §15.1).
+    // The tier is derived from the concrete intent set so a discovery
+    // document can never lie about what the handler actually serves.
+    let full_only = ["intent.negotiate", "intent.confirm_receipt"];
+    let missing_full: Vec<String> = full_only
+        .iter()
+        .filter(|name| !intents.iter().any(|i| i == *name))
+        .map(|s| s.to_string())
+        .collect();
+    let tier = if missing_full.is_empty() {
+        "icp-full"
+    } else {
+        "icp-core"
+    };
+    let conformance = json!({
+        "tier": tier,
+        "missing_intents": missing_full,
+    });
 
     let transports = json!({
         "http": http,
@@ -90,6 +121,7 @@ pub fn build(config: &Config, signer: &ReceiptSigner) -> DiscoveryDocument {
         handler_id: config.handler_id.clone(),
         service_name: config.service_name.clone(),
         supported_versions: vec![config.icp_version.clone()],
+        conformance,
         transports,
         intents,
         currencies: vec![

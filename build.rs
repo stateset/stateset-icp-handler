@@ -9,10 +9,7 @@ fn main() {
             std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by Cargo"))
                 .join("icp_handler_descriptor.bin"),
         )
-        .compile_protos(
-            &["proto/icp_handler/v1/icp_handler.proto"],
-            &["proto"],
-        )
+        .compile_protos(&["proto/icp_handler/v1/icp_handler.proto"], &["proto"])
         .expect("failed to compile icp_handler proto");
 
     // Embed build metadata the binary can report in health checks.

@@ -1,0 +1,112 @@
+# {{name}}
+
+A StateSet ICP merchant — scaffolded by `@stateset/create-icp-commerce`.
+Pairs [`stateset-icp-handler`](https://github.com/stateset/stateset-icp-handler)
+with the embedded [iCommerce](https://github.com/stateset/stateset-icommerce)
+engine in a single Rust binary.
+
+## Run it
+
+```bash
+cargo run --release
+```
+
+First build compiles the handler (~1–2 minutes on a warm toolchain).
+Subsequent `cargo run` starts in under a second.
+
+The process serves:
+
+- **HTTP** on `:8082` — ICP v1 + ACP / UCP / MCP compat surfaces
+- **gRPC** on `:50052`
+- **OpenAPI 3.1** at `GET /openapi.json`
+- **Swagger UI** at `GET /docs`
+
+## Smoke-test
+
+```bash
+curl -s http://localhost:8082/.well-known/icp \
+  | jq '{tier: .conformance.tier, intents: (.intents | length)}'
+```
+
+Expected output:
+
+```json
+{ "tier": "icp-full", "intents": 17 }
+```
+
+## Buy flow from Python
+
+```bash
+pip install stateset-icp
+```
+
+```python
+from stateset_icp import (
+    Client, Ed25519KeyPair, create_mandate_payload, sign_mandate,
+)
+
+kp = Ed25519KeyPair.generate()
+mandate = sign_mandate(
+    create_mandate_payload(
+        issuer=kp.did,
+        subject="did:stateset:agent:demo",
+        scope=["quote", "authorize", "buy"],
+        budget_currency="USD",
+        budget_amount_minor=50_000,
+    ),
+    kp,
+)
+
+with Client(
+    "http://localhost:8082",
+    api_key="icp_demo_key_123",
+    agent_id="did:stateset:agent:demo",
+) as icp:
+    q = icp.quote(
+        items=[{
+            "sku": "WIDGET-001", "quantity": 1,
+            "unit_price_hint": {"amount_minor": 2999, "currency": "USD"},
+        }],
+        mandate_jws=mandate,
+    )
+    a = icp.authorize(q["transaction"]["id"], mandate_jws=mandate)
+    b = icp.buy(
+        q["transaction"]["id"],
+        payment={"method": "card", "token": "tok_demo",
+                 "last_digits": "4242", "brand": "visa"},
+        mandate_jws=mandate,
+    )
+    print("receipt:", b["receipt"]["jti"])
+```
+
+## Validate conformance
+
+Once the handler is running, verify spec compliance with the reference
+conformance harness:
+
+```bash
+npx @stateset/icp-conformance \
+  --url http://localhost:8082 \
+  --api-key icp_demo_key_123 \
+  --agent-id did:stateset:agent:conformance
+```
+
+## Configure
+
+All knobs live in `.env`. Notable defaults this scaffold wrote:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` / `GRPC_PORT` | `8082` / `50052` | Bind ports |
+| `ICP_REQUIRE_MANDATE` | `true` | Reject writes without `ICP-Mandate` |
+| `ICP_VERIFY_MANDATE_SIGNATURES` | `false` | Dev-only; flip to `true` before prod |
+| `ICP_ENABLE_DEMO_KEYS` | `true` | Accept `icp_demo_key_*` bearer tokens |
+| `COMMERCE_DB_PATH` | `./commerce.db` | Embedded iCommerce SQLite |
+| `ICP_STATE_DB_PATH` | `./icp-state.db` | Handler state (mandates, receipts) |
+
+See [the reference handler's .env.example](https://github.com/stateset/stateset-icp-handler/blob/main/.env.example)
+for the full list.
+
+## License
+
+MIT OR Apache-2.0.

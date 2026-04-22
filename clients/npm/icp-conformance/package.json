@@ -1,0 +1,35 @@
+{
+  "name": "@stateset/icp-conformance",
+  "version": "0.2.0",
+  "description": "Implementation-independent conformance tester for ICP (Intelligent Commerce Protocol) handlers. Wraps the reference Rust binary so non-Rust developers can validate their handlers from one `npx` command.",
+  "license": "MIT OR Apache-2.0",
+  "author": "StateSet <dom@stateset.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stateset/stateset-icp-handler.git",
+    "directory": "clients/npm/icp-conformance"
+  },
+  "homepage": "https://github.com/stateset/stateset-icp-handler/tree/main/clients/npm/icp-conformance",
+  "bugs": "https://github.com/stateset/stateset-icp-handler/issues",
+  "keywords": [
+    "icp",
+    "agentic-commerce",
+    "conformance",
+    "stateset"
+  ],
+  "type": "module",
+  "bin": {
+    "icp-conformance": "bin/icp-conformance.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

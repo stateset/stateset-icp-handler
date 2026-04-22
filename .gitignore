@@ -19,3 +19,13 @@ Cargo.lock
 # build artifacts
 dist/
 release/
+
+# local Claude Code state
+.claude/
+
+# npm / python package build output
+node_modules/
+clients/npm/*/node_modules/
+clients/python/dist/
+clients/python/*.egg-info/
+__pycache__/

@@ -1,0 +1,23 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+[dependencies]
+# Pin `rev` once upstream cuts a tagged release; `branch = "main"` keeps
+# scaffolded projects on the latest spec until then.
+stateset-icp-handler = { git = "https://github.com/stateset/stateset-icp-handler", branch = "main" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

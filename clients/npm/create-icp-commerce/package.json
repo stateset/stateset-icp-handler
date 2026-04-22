@@ -1,0 +1,37 @@
+{
+  "name": "@stateset/create-icp-commerce",
+  "version": "0.2.0",
+  "description": "Scaffolds a StateSet ICP merchant project in one command: `npx @stateset/create-icp-commerce my-store`. Produces a minimal Rust binary that pairs stateset-icp-handler with the embedded iCommerce engine plus a preconfigured dev .env.",
+  "license": "MIT OR Apache-2.0",
+  "author": "StateSet <dom@stateset.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stateset/stateset-icp-handler.git",
+    "directory": "clients/npm/create-icp-commerce"
+  },
+  "homepage": "https://github.com/stateset/stateset-icp-handler/tree/main/clients/npm/create-icp-commerce",
+  "bugs": "https://github.com/stateset/stateset-icp-handler/issues",
+  "keywords": [
+    "icp",
+    "agentic-commerce",
+    "scaffold",
+    "create",
+    "stateset"
+  ],
+  "type": "module",
+  "bin": {
+    "create-icp-commerce": "bin/create-icp-commerce.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "template/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

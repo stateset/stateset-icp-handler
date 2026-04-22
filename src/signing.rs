@@ -93,6 +93,7 @@ impl ReceiptSigner {
     /// `body_json_bytes` MUST be the JCS-canonicalized bytes of the response
     /// body so that verifiers independently canonicalizing the same payload
     /// arrive at the same digest.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_receipt(
         &self,
         aud_agent_id: &str,

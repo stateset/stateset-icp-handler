@@ -583,10 +583,37 @@ The mapping table is normative and is published in
 
 ## 15. Compliance
 
+### 15.1 Conformance tiers
+
+ICP defines two conformance tiers so handlers can ship an honest 1.0
+without waiting for every intent to land, and so clients can declare
+which tier they target.
+
+**ICP-Core** (required for a handler to claim ICP conformance):
+
+- `intent.search`, `intent.describe`
+- `intent.quote`, `intent.authorize`, `intent.buy`, `intent.pay`
+- `intent.track`, `intent.return`, `intent.refund_request`
+- `intent.subscribe`, `intent.renew`, `intent.pause`, `intent.cancel_subscription`
+- `intent.a2a_quote`, `intent.a2a_pay`
+
+**ICP-Full** (ICP-Core plus the richer negotiation surface):
+
+- `intent.negotiate`
+- `intent.confirm_receipt`
+
+A handler MUST declare its tier in the discovery document via
+`conformance.tier` (value `"icp-core"` or `"icp-full"`). Calling an
+intent outside the declared tier returns `intent_not_supported` with
+HTTP `501 Not Implemented`.
+
+### 15.2 Common requirements
+
 A conforming handler MUST:
 
-1. Implement all core intents in §7.2 under at least one transport.
-2. Serve `/.well-known/icp` with accurate capability advertisement.
+1. Implement every intent in its declared tier under at least one transport.
+2. Serve `/.well-known/icp` with accurate capability advertisement,
+   including `conformance.tier`.
 3. Verify mandates on every write under the rules in §6.1.
 4. Issue signed receipts on every state-changing response.
 5. Expose signing keys at `/.well-known/icp/jwks.json`.

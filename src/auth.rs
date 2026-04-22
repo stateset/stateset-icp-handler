@@ -31,9 +31,7 @@ pub async fn auth_middleware(
     let tenant = state
         .keys
         .lookup(&bearer)
-        .ok_or_else(|| into_response(ApiError::AuthenticationFailed(
-            "unknown API key".into(),
-        )))?;
+        .ok_or_else(|| into_response(ApiError::AuthenticationFailed("unknown API key".into())))?;
 
     let agent_id = req
         .headers()

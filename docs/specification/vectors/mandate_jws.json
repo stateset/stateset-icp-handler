@@ -1,0 +1,51 @@
+{
+  "description": "Compact-JWS mandate signing: Ed25519 over base64url(JCS(header)) + \".\" + base64url(JCS(payload)).",
+  "vectors": [
+    {
+      "name": "basic_buy_mandate",
+      "private_key_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "issuer_did": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+      "kid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+      "payload": {
+        "exp": 1745003600,
+        "iat": 1745000000,
+        "icp": {
+          "budget": {
+            "amount_minor": 50000,
+            "currency": "USD",
+            "per_transaction": null,
+            "period": "P1D"
+          },
+          "categories": [],
+          "jurisdictions": [],
+          "linked_payment_methods": [],
+          "merchants": [
+            "*"
+          ],
+          "policies": {
+            "prohibit_subscriptions": false,
+            "require_receipt": true,
+            "require_shipping_address_confirmation": false
+          },
+          "scope": [
+            "quote",
+            "authorize",
+            "buy"
+          ],
+          "version": "2026-04-21"
+        },
+        "iss": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        "jti": "mandate-vector-basic",
+        "nbf": 1745000000,
+        "sub": "did:stateset:agent:demo-alice"
+      },
+      "expected_header_json": "{\"alg\":\"EdDSA\",\"kid\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"typ\":\"JWT\"}",
+      "expected_payload_json": "{\"exp\":1745003600,\"iat\":1745000000,\"icp\":{\"budget\":{\"amount_minor\":50000,\"currency\":\"USD\",\"per_transaction\":null,\"period\":\"P1D\"},\"categories\":[],\"jurisdictions\":[],\"linked_payment_methods\":[],\"merchants\":[\"*\"],\"policies\":{\"prohibit_subscriptions\":false,\"require_receipt\":true,\"require_shipping_address_confirmation\":false},\"scope\":[\"quote\",\"authorize\",\"buy\"],\"version\":\"2026-04-21\"},\"iss\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"jti\":\"mandate-vector-basic\",\"nbf\":1745000000,\"sub\":\"did:stateset:agent:demo-alice\"}",
+      "expected_header_b64url": "eyJhbGciOiJFZERTQSIsImtpZCI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidHlwIjoiSldUIn0",
+      "expected_payload_b64url": "eyJleHAiOjE3NDUwMDM2MDAsImlhdCI6MTc0NTAwMDAwMCwiaWNwIjp7ImJ1ZGdldCI6eyJhbW91bnRfbWlub3IiOjUwMDAwLCJjdXJyZW5jeSI6IlVTRCIsInBlcl90cmFuc2FjdGlvbiI6bnVsbCwicGVyaW9kIjoiUDFEIn0sImNhdGVnb3JpZXMiOltdLCJqdXJpc2RpY3Rpb25zIjpbXSwibGlua2VkX3BheW1lbnRfbWV0aG9kcyI6W10sIm1lcmNoYW50cyI6WyIqIl0sInBvbGljaWVzIjp7InByb2hpYml0X3N1YnNjcmlwdGlvbnMiOmZhbHNlLCJyZXF1aXJlX3JlY2VpcHQiOnRydWUsInJlcXVpcmVfc2hpcHBpbmdfYWRkcmVzc19jb25maXJtYXRpb24iOmZhbHNlfSwic2NvcGUiOlsicXVvdGUiLCJhdXRob3JpemUiLCJidXkiXSwidmVyc2lvbiI6IjIwMjYtMDQtMjEifSwiaXNzIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJqdGkiOiJtYW5kYXRlLXZlY3Rvci1iYXNpYyIsIm5iZiI6MTc0NTAwMDAwMCwic3ViIjoiZGlkOnN0YXRlc2V0OmFnZW50OmRlbW8tYWxpY2UifQ",
+      "expected_signature_b64url": "CErgIZn3r0HRS_O7UrwU1C7itwZ_rvS42gmgLAmGpT_KV1AmS-d3MYRbOetWzRF86doIWCX3L-Zle2dt2V7xCQ",
+      "expected_compact_jws": "eyJhbGciOiJFZERTQSIsImtpZCI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidHlwIjoiSldUIn0.eyJleHAiOjE3NDUwMDM2MDAsImlhdCI6MTc0NTAwMDAwMCwiaWNwIjp7ImJ1ZGdldCI6eyJhbW91bnRfbWlub3IiOjUwMDAwLCJjdXJyZW5jeSI6IlVTRCIsInBlcl90cmFuc2FjdGlvbiI6bnVsbCwicGVyaW9kIjoiUDFEIn0sImNhdGVnb3JpZXMiOltdLCJqdXJpc2RpY3Rpb25zIjpbXSwibGlua2VkX3BheW1lbnRfbWV0aG9kcyI6W10sIm1lcmNoYW50cyI6WyIqIl0sInBvbGljaWVzIjp7InByb2hpYml0X3N1YnNjcmlwdGlvbnMiOmZhbHNlLCJyZXF1aXJlX3JlY2VpcHQiOnRydWUsInJlcXVpcmVfc2hpcHBpbmdfYWRkcmVzc19jb25maXJtYXRpb24iOmZhbHNlfSwic2NvcGUiOlsicXVvdGUiLCJhdXRob3JpemUiLCJidXkiXSwidmVyc2lvbiI6IjIwMjYtMDQtMjEifSwiaXNzIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJqdGkiOiJtYW5kYXRlLXZlY3Rvci1iYXNpYyIsIm5iZiI6MTc0NTAwMDAwMCwic3ViIjoiZGlkOnN0YXRlc2V0OmFnZW50OmRlbW8tYWxpY2UifQ.CErgIZn3r0HRS_O7UrwU1C7itwZ_rvS42gmgLAmGpT_KV1AmS-d3MYRbOetWzRF86doIWCX3L-Zle2dt2V7xCQ"
+    }
+  ]
+}

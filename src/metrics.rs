@@ -36,7 +36,9 @@ pub fn record_http(route: &str, status: u16, elapsed_secs: f64) {
     HTTP_REQUESTS
         .with_label_values(&[route, &status.to_string()])
         .inc();
-    HTTP_LATENCY.with_label_values(&[route]).observe(elapsed_secs);
+    HTTP_LATENCY
+        .with_label_values(&[route])
+        .observe(elapsed_secs);
 }
 
 pub fn record_intent(intent: &str, outcome: &str) {

@@ -21,10 +21,9 @@ pub mod proto {
 
 use proto::icp_handler_server::{IcpHandler, IcpHandlerServer};
 use proto::{
-    DiscoveryRequest, DiscoveryResponse, EventMessage, EventStreamRequest,
-    GetMandateUsageRequest, GetReceiptRequest, GetTransactionRequest, IntentRequest,
-    IntentResponse, MandateUsageResponse, ReceiptResponse, TransactionResponse,
-    VerifyReceiptRequest, VerifyReceiptResponse,
+    DiscoveryRequest, DiscoveryResponse, EventMessage, EventStreamRequest, GetMandateUsageRequest,
+    GetReceiptRequest, GetTransactionRequest, IntentRequest, IntentResponse, MandateUsageResponse,
+    ReceiptResponse, TransactionResponse, VerifyReceiptRequest, VerifyReceiptResponse,
 };
 
 pub struct GrpcHandler {
@@ -76,26 +75,24 @@ impl IcpHandler for GrpcHandler {
             .map_err(|e| Status::invalid_argument(format!("payload_json: {e}")))?;
         let agent = AgentIdentifier::parse(&envelope.agent_id);
 
-        let input = IntentInput {
-            envelope: intent_env,
-            agent,
-            tenant,
-            mandate_jws: if envelope.mandate_jws.is_empty() {
-                None
-            } else {
-                Some(envelope.mandate_jws.as_str())
-            },
-            request_id: if envelope.request_id.is_empty() {
-                format!("req_{}", uuid::Uuid::new_v4().simple())
-            } else {
-                envelope.request_id
-            },
-            trace_id: if envelope.trace_id.is_empty() {
-                None
-            } else {
-                Some(envelope.trace_id)
-            },
+        let mandate_jws = if envelope.mandate_jws.is_empty() {
+            None
+        } else {
+            Some(envelope.mandate_jws.as_str())
         };
+        let request_id = if envelope.request_id.is_empty() {
+            format!("req_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            envelope.request_id.clone()
+        };
+        let trace_id = if envelope.trace_id.is_empty() {
+            None
+        } else {
+            Some(envelope.trace_id.clone())
+        };
+
+        let input =
+            IntentInput::for_icp(intent_env, agent, tenant, mandate_jws, request_id, trace_id);
 
         let body = self
             .service
@@ -103,8 +100,8 @@ impl IcpHandler for GrpcHandler {
             .await
             .map_err(api_error_to_status)?;
 
-        let payload_json = serde_json::to_vec(&body)
-            .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+        let payload_json =
+            serde_json::to_vec(&body).map_err(|e| Status::internal(format!("serialize: {e}")))?;
 
         Ok(Response::new(IntentResponse {
             payload_json,
@@ -188,10 +185,7 @@ impl IcpHandler for GrpcHandler {
         &self,
         req: Request<GetMandateUsageRequest>,
     ) -> Result<Response<MandateUsageResponse>, Status> {
-        let usage = self
-            .service
-            .mandates
-            .usage(&req.into_inner().mandate_jti);
+        let usage = self.service.mandates.usage(&req.into_inner().mandate_jti);
         let payload = serde_json::json!({
             "spent_minor": usage.spent_minor,
             "window_start": usage.window_start,
@@ -217,7 +211,7 @@ fn api_error_to_status(err: crate::errors::ApiError) -> Status {
         E::MandateOutOfScope(m) => Status::permission_denied(m),
         E::MandateBudgetExceeded(m) => Status::resource_exhausted(m),
         E::IntentNotSupported(m) | E::ResourceNotFound(m) => Status::not_found(m),
-        E::Conflict(m) => Status::already_exists(m),
+        E::Conflict(m) | E::IdempotencyConflict(m) => Status::already_exists(m),
         E::PreconditionFailed(m) => Status::failed_precondition(m),
         E::RateLimited => Status::resource_exhausted("rate limited"),
         E::EngineUnavailable(m) => Status::unavailable(m),
