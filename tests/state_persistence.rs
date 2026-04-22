@@ -48,8 +48,13 @@ fn mandate_spend_survives_reopen() {
     {
         let pool = state_db::open(&path_str).expect("open pool 1");
         let ledger = MandateLedger::with_pool(pool);
-        ledger.record_spend(jti, 2500, first_spend_at);
-        ledger.record_spend(jti, 3000, first_spend_at + Duration::seconds(5));
+        ledger.record_spend(jti, "tenant_persist", 2500, first_spend_at);
+        ledger.record_spend(
+            jti,
+            "tenant_persist",
+            3000,
+            first_spend_at + Duration::seconds(5),
+        );
         let usage = ledger.usage(jti);
         assert_eq!(usage.spent_minor, 5500);
         assert!(usage.window_start.is_some());
@@ -86,12 +91,12 @@ fn mandate_spend_accumulates_across_reopen() {
     {
         let pool = state_db::open(&path_str).expect("open pool 1");
         let ledger = MandateLedger::with_pool(pool);
-        ledger.record_spend(jti, 1000, now);
+        ledger.record_spend(jti, "tenant_persist", 1000, now);
     }
     {
         let pool = state_db::open(&path_str).expect("open pool 2");
         let ledger = MandateLedger::with_pool(pool);
-        ledger.record_spend(jti, 2500, now + Duration::seconds(10));
+        ledger.record_spend(jti, "tenant_persist", 2500, now + Duration::seconds(10));
         let usage = ledger.usage(jti);
         assert_eq!(usage.spent_minor, 3500);
     }
@@ -284,7 +289,7 @@ fn in_memory_pools_are_isolated() {
 
     let pool_a = state_db::open(":memory:").expect("open a");
     let ledger_a = MandateLedger::with_pool(pool_a);
-    ledger_a.record_spend(jti, 1000, now);
+    ledger_a.record_spend(jti, "tenant_iso", 1000, now);
     assert_eq!(ledger_a.usage(jti).spent_minor, 1000);
 
     let pool_b = state_db::open(":memory:").expect("open b");

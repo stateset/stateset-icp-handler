@@ -60,6 +60,18 @@ impl ApiKeyStore {
     }
 }
 
+impl ApiKeyInfo {
+    pub fn is_expired_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+    }
+
+    pub fn permits_agent(&self, agent_id: &str) -> bool {
+        self.allowed_agents
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|a| a == "*" || a == agent_id))
+    }
+}
+
 /// Parsed form of the `ICP-Agent-Id` header. Accepts DID strings, HTTPS
 /// URLs, and opaque IDs (for backwards compatibility in dev).
 #[derive(Debug, Clone, Serialize, Deserialize)]

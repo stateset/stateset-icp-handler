@@ -28,11 +28,11 @@ use crate::events::{Event, EventBus};
 use crate::intent::Intent;
 use crate::mandate::{self, MandateEvaluation, MandateLedger};
 use crate::models::{
-    A2aPayParams, A2aQuoteParams, BillingCadence, Buyer, ConfirmReceiptParams, IntentEnvelope,
-    IntentResponseBody, LineItem, Money, NegotiateParams, OrderSummary, PaymentInstrument,
-    PeerQuote, PeerQuoteStatus, QuoteParams, ReceiptStub, RenewParams, RequestItem,
-    ResponseEnvelope, SubscribeParams, Subscription, SubscriptionRefParams, SubscriptionStatus,
-    Totals, Transaction, TransactionState,
+    A2aPayParams, A2aQuoteParams, BillingCadence, BuyParams, Buyer, ConfirmReceiptParams,
+    IntentEnvelope, IntentResponseBody, LineItem, Money, NegotiateParams, OrderSummary,
+    PaymentInstrument, PeerQuote, PeerQuoteStatus, QuoteParams, ReceiptStub, RenewParams,
+    RequestItem, ResponseEnvelope, SubscribeParams, Subscription, SubscriptionRefParams,
+    SubscriptionStatus, Totals, Transaction, TransactionState,
 };
 use crate::receipts::{ReceiptStore, StoredReceipt};
 use crate::resolver::{CompositeResolver, PrincipalResolver};
@@ -176,6 +176,13 @@ impl IcpService {
         &self,
         input: IntentInput<'_>,
     ) -> Result<IntentResponseBody, ApiError> {
+        if input.envelope.agent_id != input.agent.raw {
+            return Err(ApiError::AuthenticationFailed(format!(
+                "envelope.agent_id `{}` does not match ICP-Agent-Id `{}`",
+                input.envelope.agent_id, input.agent.raw
+            )));
+        }
+
         let intent = Intent::parse(&input.envelope.intent)?;
 
         let resolver: Option<&dyn PrincipalResolver> = if self.config.verify_mandate_signatures {
@@ -206,6 +213,14 @@ impl IcpService {
             },
             _ => None,
         };
+        if let Some(ev) = mandate.as_ref() {
+            if ev.payload.sub != input.agent.raw {
+                return Err(ApiError::MandateOutOfScope(format!(
+                    "mandate subject `{}` does not authorize agent `{}`",
+                    ev.payload.sub, input.agent.raw
+                )));
+            }
+        }
 
         // Route by intent.
         let outcome = match intent {
@@ -231,8 +246,12 @@ impl IcpService {
         if let Some(ev) = mandate.as_ref() {
             let spend = outcome.recorded_spend_minor;
             if spend > 0 {
-                self.mandates
-                    .record_spend(&ev.payload.jti, spend, Utc::now());
+                self.mandates.record_spend(
+                    &ev.payload.jti,
+                    &input.tenant.tenant_id,
+                    spend,
+                    Utc::now(),
+                );
             }
         }
 
@@ -406,11 +425,21 @@ impl IcpService {
         let mut line_items = Vec::with_capacity(params.items.len());
         let mut subtotal_minor: i64 = 0;
         for (idx, req) in params.items.iter().enumerate() {
+            if req.quantity <= 0 {
+                return Err(ApiError::InvalidRequest(format!(
+                    "quote.params.items[{idx}].quantity must be positive"
+                )));
+            }
             let unit_minor = req
                 .unit_price_hint
                 .as_ref()
                 .map(|m| m.amount_minor)
                 .unwrap_or(1_000);
+            if unit_minor < 0 {
+                return Err(ApiError::InvalidRequest(format!(
+                    "quote.params.items[{idx}].unit_price_hint.amount_minor must be non-negative"
+                )));
+            }
             let line_subtotal = unit_minor.saturating_mul(req.quantity);
             subtotal_minor = subtotal_minor.saturating_add(line_subtotal);
             line_items.push(LineItem {
@@ -461,6 +490,7 @@ impl IcpService {
         _mandate: Option<&MandateEvaluation>,
     ) -> Result<Outcome, ApiError> {
         let txn_id = require_transaction_id(&input.envelope.params)?;
+        self.ensure_transaction_owner(&txn_id, input)?;
         let txn = self.transactions.update(&txn_id, |t| {
             if let Some(buyer) = input
                 .envelope
@@ -491,13 +521,13 @@ impl IcpService {
         input: &IntentInput<'_>,
         _mandate: Option<&MandateEvaluation>,
     ) -> Result<Outcome, ApiError> {
-        let txn_id = require_transaction_id(&input.envelope.params)?;
+        let params: BuyParams = serde_json::from_value(input.envelope.params.clone())
+            .map_err(|e| ApiError::InvalidRequest(format!("buy.params: {e}")))?;
+        validate_payment_instrument(&params.payment, &self.config.payment_execution_mode)?;
+        let txn_id = params.transaction_id;
 
         // Load transaction.
-        let txn = self
-            .transactions
-            .get(&txn_id)
-            .ok_or_else(|| ApiError::ResourceNotFound(format!("transaction {txn_id}")))?;
+        let txn = self.transaction_for_input(&txn_id, input)?;
         if !matches!(
             txn.state,
             TransactionState::Authorized | TransactionState::Quoted
@@ -567,10 +597,7 @@ impl IcpService {
             .and_then(|v| v.as_str())
             .or(input.envelope.transaction_id.as_deref())
             .ok_or_else(|| ApiError::InvalidRequest("track: transaction_id required".into()))?;
-        let txn = self
-            .transactions
-            .get(txn_id)
-            .ok_or_else(|| ApiError::ResourceNotFound(format!("transaction {txn_id}")))?;
+        let txn = self.transaction_for_input(txn_id, input)?;
         Ok(Outcome {
             transaction: txn,
             order: None,
@@ -601,6 +628,7 @@ impl IcpService {
                     .and_then(|v| v.as_str())
             })
             .ok_or_else(|| ApiError::InvalidRequest("return: transaction_id required".into()))?;
+        self.ensure_transaction_owner(txn_id, input)?;
         let txn = self
             .transactions
             .update(txn_id, |t| {
@@ -639,6 +667,7 @@ impl IcpService {
                 "subscribe.params.items must be non-empty".into(),
             ));
         }
+        validate_payment_instrument(&params.payment, &self.config.payment_execution_mode)?;
 
         let now = Utc::now();
         let next = period_advance(now, params.cadence);
@@ -709,12 +738,8 @@ impl IcpService {
     ) -> Result<Outcome, ApiError> {
         let params: RenewParams = serde_json::from_value(input.envelope.params.clone())
             .map_err(|e| ApiError::InvalidRequest(format!("renew.params: {e}")))?;
-        let sub = self
-            .subscriptions
-            .get(&params.subscription_id)
-            .ok_or_else(|| {
-                ApiError::ResourceNotFound(format!("subscription {}", params.subscription_id))
-            })?;
+        validate_payment_instrument(&params.payment, &self.config.payment_execution_mode)?;
+        let sub = self.subscription_for_input(&params.subscription_id, input)?;
 
         match sub.status {
             SubscriptionStatus::Canceled => {
@@ -785,12 +810,7 @@ impl IcpService {
             serde_json::from_value(input.envelope.params.clone())
                 .map_err(|e| ApiError::InvalidRequest(format!("pause.params: {e}")))?;
 
-        let sub = self
-            .subscriptions
-            .get(&params.subscription_id)
-            .ok_or_else(|| {
-                ApiError::ResourceNotFound(format!("subscription {}", params.subscription_id))
-            })?;
+        let sub = self.subscription_for_input(&params.subscription_id, input)?;
         if sub.status.is_terminal() {
             return Err(ApiError::PreconditionFailed(format!(
                 "cannot pause subscription in state {:?}",
@@ -828,12 +848,7 @@ impl IcpService {
             ApiError::InvalidRequest(format!("cancel_subscription.params: {e}"))
         })?;
 
-        let sub = self
-            .subscriptions
-            .get(&params.subscription_id)
-            .ok_or_else(|| {
-                ApiError::ResourceNotFound(format!("subscription {}", params.subscription_id))
-            })?;
+        let sub = self.subscription_for_input(&params.subscription_id, input)?;
         if sub.status == SubscriptionStatus::Canceled {
             return Err(ApiError::PreconditionFailed(
                 "subscription already canceled".into(),
@@ -886,7 +901,14 @@ impl IcpService {
         );
 
         let (status, price) = match params.price_hint {
-            Some(p) => (PeerQuoteStatus::Quoted, Some(p)),
+            Some(p) => {
+                if p.amount_minor <= 0 {
+                    return Err(ApiError::InvalidRequest(
+                        "a2a_quote.price_hint.amount_minor must be positive".into(),
+                    ));
+                }
+                (PeerQuoteStatus::Quoted, Some(p))
+            }
             None => (PeerQuoteStatus::Pending, None),
         };
 
@@ -966,10 +988,7 @@ impl IcpService {
         // Two flow shapes: pay-against-quote and direct-pay.
         let (peer_id, money, quote_to_consume) = match params.peer_quote_id.as_deref() {
             Some(quote_id) => {
-                let q = self
-                    .peer_quotes
-                    .get(quote_id)
-                    .ok_or_else(|| ApiError::ResourceNotFound(format!("peer_quote {quote_id}")))?;
+                let q = self.peer_quote_for_input(quote_id, input)?;
                 if q.requester_agent_id != input.agent.raw {
                     return Err(ApiError::PreconditionFailed(
                         "a2a_pay: requester does not match the quote's requester_agent_id".into(),
@@ -994,6 +1013,11 @@ impl IcpService {
                 let money = q.price.clone().ok_or_else(|| {
                     ApiError::PreconditionFailed("a2a_pay: peer_quote has no price set".into())
                 })?;
+                if money.amount_minor <= 0 {
+                    return Err(ApiError::PreconditionFailed(
+                        "a2a_pay: peer_quote price must be positive".into(),
+                    ));
+                }
                 (q.peer_agent_id.clone(), money, Some(q))
             }
             None => {
@@ -1005,6 +1029,11 @@ impl IcpService {
                 let money = params.amount.clone().ok_or_else(|| {
                     ApiError::InvalidRequest("a2a_pay: direct payment requires `amount`".into())
                 })?;
+                if money.amount_minor <= 0 {
+                    return Err(ApiError::InvalidRequest(
+                        "a2a_pay.amount.amount_minor must be positive".into(),
+                    ));
+                }
                 if peer_id == input.agent.raw {
                     return Err(ApiError::InvalidRequest(
                         "a2a_pay: cannot pay yourself".into(),
@@ -1109,12 +1138,7 @@ impl IcpService {
             }
         }
 
-        let txn = self
-            .transactions
-            .get(&params.transaction_id)
-            .ok_or_else(|| {
-                ApiError::ResourceNotFound(format!("transaction {}", params.transaction_id))
-            })?;
+        let txn = self.transaction_for_input(&params.transaction_id, input)?;
         if !matches!(txn.state, TransactionState::Quoted) {
             return Err(ApiError::PreconditionFailed(format!(
                 "negotiate: transaction in state {:?} cannot be re-negotiated; only `quoted` is open to counter-offers",
@@ -1131,6 +1155,11 @@ impl IcpService {
             .map(|m| m.amount_minor)
             .unwrap_or(0);
         let new_total_minor = if let Some(pt) = params.proposed_total.as_ref() {
+            if pt.amount_minor < 0 {
+                return Err(ApiError::InvalidRequest(
+                    "negotiate.proposed_total.amount_minor must be non-negative".into(),
+                ));
+            }
             pt.amount_minor
         } else {
             let pct = params.discount_pct.unwrap_or(0.0);
@@ -1189,12 +1218,7 @@ impl IcpService {
         let params: ConfirmReceiptParams = serde_json::from_value(input.envelope.params.clone())
             .map_err(|e| ApiError::InvalidRequest(format!("confirm_receipt.params: {e}")))?;
 
-        let txn = self
-            .transactions
-            .get(&params.transaction_id)
-            .ok_or_else(|| {
-                ApiError::ResourceNotFound(format!("transaction {}", params.transaction_id))
-            })?;
+        let txn = self.transaction_for_input(&params.transaction_id, input)?;
         // Only post-payment states can be receipt-confirmed.
         if !matches!(
             txn.state,
@@ -1321,11 +1345,20 @@ impl IcpService {
                 Ok(txn) => {
                     let new_period_start = sub.current_period_end;
                     let new_period_end = period_advance(new_period_start, sub.cadence);
+                    let new_charges_completed = sub.charges_completed.saturating_add(1);
+                    let txn_id_for_event = txn.id.clone();
+                    let total_amount_minor = txn.totals.total.as_ref().map(|m| m.amount_minor);
+                    let total_currency = txn
+                        .totals
+                        .total
+                        .as_ref()
+                        .map(|m| m.currency.clone())
+                        .unwrap_or_else(|| txn.currency.clone());
                     self.subscriptions.update(&sub.id, |s| {
                         s.current_period_start = new_period_start;
                         s.current_period_end = new_period_end;
                         s.next_charge_at = new_period_end;
-                        s.charges_completed = s.charges_completed.saturating_add(1);
+                        s.charges_completed = new_charges_completed;
                         s.last_transaction_id = Some(txn.id.clone());
                         s.failed_renewal_attempts = 0;
                         s.updated_at = now;
@@ -1339,12 +1372,27 @@ impl IcpService {
                         occurred_at: now,
                         payload: serde_json::json!({
                             "subscription_id": sub.id,
+                            // Pre-existing — kept for back-compat.
                             "automatic": true,
+                            // New cycle-context fields. Receipt-mailing
+                            // automation needs `transaction_id` to link
+                            // to the receipt; cycle accounting needs
+                            // `cycle_number` and the period bounds;
+                            // customer-facing emails need
+                            // `next_charge_at` to set expectations.
+                            "transaction_id": txn_id_for_event,
+                            "cycle_number": new_charges_completed,
+                            "current_period_start": new_period_start,
+                            "current_period_end": new_period_end,
+                            "next_charge_at": new_period_end,
+                            "amount_minor": total_amount_minor,
+                            "currency": total_currency,
                         }),
                     };
                     self.enqueue_webhook(&event, Some(&sub.tenant_id));
                     self.events.emit(event);
                     report.renewed += 1;
+                    crate::metrics::record_subscription_renewal("renewed");
                 }
                 Err(err) => {
                     let max_attempts = self.dunning_max_attempts();
@@ -1353,6 +1401,12 @@ impl IcpService {
                     // backoff, not just the next tick.
                     let new_failure_count = sub.failed_renewal_attempts.saturating_add(1);
                     let next_attempt = self.dunning_next_attempt(new_failure_count, now);
+                    // Capture the error string before `err` is moved
+                    // into the tracing call below so it survives into
+                    // the event payload (operators paged by past_due
+                    // need to know the underlying failure reason —
+                    // `card_declined`, `network_timeout`, etc).
+                    let err_text = err.to_string();
                     let updated = self.subscriptions.update(&sub.id, |s| {
                         s.failed_renewal_attempts = new_failure_count;
                         if s.failed_renewal_attempts >= max_attempts {
@@ -1380,12 +1434,29 @@ impl IcpService {
                                 occurred_at: now,
                                 payload: serde_json::json!({
                                     "subscription_id": sub.id,
+                                    // Pre-existing field — kept for
+                                    // back-compat with existing
+                                    // receivers.
                                     "consecutive_failures": s.failed_renewal_attempts,
+                                    // New triage fields. Operators
+                                    // paged by past_due switch on
+                                    // `next_action` to choose between
+                                    // automated retry vs surfacing to
+                                    // a human, and surface
+                                    // `last_error` to the customer
+                                    // for self-service repair (e.g.
+                                    // "your card was declined; please
+                                    // update payment method").
+                                    "attempts_made": s.failed_renewal_attempts,
+                                    "last_error": err_text,
+                                    "last_attempt_at": now,
+                                    "next_action": "manual_renewal_required",
                                 }),
                             };
                             self.enqueue_webhook(&event, Some(&sub.tenant_id));
                             self.events.emit(event);
                             report.past_due += 1;
+                            crate::metrics::record_subscription_renewal("past_due");
                         }
                     }
                     tracing::warn!(
@@ -1398,9 +1469,151 @@ impl IcpService {
                         "scheduler renewal charge failed",
                     );
                     report.failed += 1;
+                    crate::metrics::record_subscription_renewal("failed");
                 }
             }
         }
+        report
+    }
+
+    /// Sweep transactions and peer quotes whose expiry deadline has
+    /// passed and transition them to their terminal `Expired` state.
+    /// Without this, a stale quote stays in `Quoted` forever and could
+    /// be authorized at the original price hours/days later — a real
+    /// pricing/inventory consistency bug.
+    ///
+    /// **Transactions**: any txn with `quote_expires_at <= now` AND
+    /// state ∈ `{Draft, Quoted}` transitions to `Expired`. Authorized,
+    /// captured, fulfilled, and completed transactions are skipped —
+    /// the caller has already moved past the quote-expiry window.
+    /// Already-terminal transactions are skipped.
+    ///
+    /// **Peer quotes**: any quote with `expires_at <= now` AND status
+    /// ∈ `{Pending, Quoted}` transitions to `Expired`. Accepted,
+    /// expired, and rejected quotes are skipped (terminal).
+    ///
+    /// Each transition emits an `<entity>.expired` event onto the
+    /// originating tenant's webhook + SSE channels.
+    pub async fn tick_expiries(&self, now: chrono::DateTime<Utc>) -> ExpiryTickReport {
+        let mut report = ExpiryTickReport::default();
+
+        // Transactions ----------------------------------------------------
+        let due_txns: Vec<Transaction> = self
+            .transactions
+            .list(usize::MAX)
+            .into_iter()
+            .filter(|t| {
+                matches!(t.state, TransactionState::Draft | TransactionState::Quoted)
+                    && t.quote_expires_at.is_some_and(|exp| exp <= now)
+            })
+            .collect();
+        for txn in due_txns {
+            self.transactions.update(&txn.id, |t| {
+                t.state = TransactionState::Expired;
+                t.updated_at = now;
+            });
+            let event = Event {
+                id: format!("evt_{}", Uuid::new_v4().simple()),
+                r#type: "transaction.expired".into(),
+                transaction_id: Some(txn.id.clone()),
+                order_id: None,
+                agent_id: Some(txn.agent_id.clone()),
+                occurred_at: now,
+                payload: serde_json::json!({
+                    "transaction_id": txn.id,
+                    "expired_at": now,
+                    // The state the txn was in BEFORE the sweep
+                    // transitioned it. Operators handle Draft vs
+                    // Quoted differently — Quoted means a customer
+                    // saw a price they didn't act on (re-quote at
+                    // current price); Draft means they never made
+                    // it past initial discovery.
+                    "previous_state": txn.state.wire_name(),
+                    // The deadline that was hit. Often equals
+                    // expired_at within the sweep tick, but operator
+                    // log searches want the original deadline that
+                    // was set at quote time.
+                    "quote_expires_at": txn.quote_expires_at,
+                    // Customer-facing renewal/notification fields.
+                    // Best-effort — buyer fields populate only if the
+                    // upstream intent supplied them.
+                    "buyer_email": txn.buyer.email,
+                    // Quoted amount that the customer saw, so a
+                    // re-quote email can include the original price
+                    // for context. Best-effort — totals may be unset
+                    // on a Draft txn.
+                    "amount_minor": txn.totals.total.as_ref().map(|m| m.amount_minor),
+                    "currency": txn
+                        .totals
+                        .total
+                        .as_ref()
+                        .map(|m| m.currency.clone())
+                        .unwrap_or_else(|| txn.currency.clone()),
+                    // Stable operator-actionable enum — handlers
+                    // switch on this to choose between automated
+                    // re-quote vs surfacing to a human.
+                    "next_action": "re_quote_required",
+                }),
+            };
+            self.enqueue_webhook(&event, Some(&txn.tenant_id));
+            self.events.emit(event);
+            report.transactions_expired += 1;
+        }
+
+        // Peer quotes — sweep across all tenants. The user-facing
+        // list endpoint is tenant-scoped; this background pass is
+        // operator-level and needs the unrestricted view.
+        let due_quotes: Vec<PeerQuote> = self
+            .peer_quotes
+            .list_all(usize::MAX)
+            .into_iter()
+            .filter(|q| {
+                matches!(q.status, PeerQuoteStatus::Pending | PeerQuoteStatus::Quoted)
+                    && q.expires_at <= now
+            })
+            .collect();
+        for quote in due_quotes {
+            self.peer_quotes.update(&quote.id, |q| {
+                q.status = PeerQuoteStatus::Expired;
+                q.updated_at = now;
+            });
+            let event = Event {
+                id: format!("evt_{}", Uuid::new_v4().simple()),
+                r#type: "peer_quote.expired".into(),
+                transaction_id: None,
+                order_id: None,
+                agent_id: Some(quote.requester_agent_id.clone()),
+                occurred_at: now,
+                payload: serde_json::json!({
+                    "peer_quote_id": quote.id,
+                    "expired_at": now,
+                    // Pre-expiry status: Pending vs Quoted.
+                    // Operators handle them differently — Pending
+                    // means the peer never priced; Quoted means a
+                    // priced offer aged out.
+                    "previous_status": quote.status.wire_name(),
+                    // Both agent ids so receivers don't have to
+                    // re-fetch the quote to know who the parties
+                    // were.
+                    "requester_agent_id": quote.requester_agent_id,
+                    "peer_agent_id": quote.peer_agent_id,
+                    // Service spec — what was being requested.
+                    // Operators dashboarding A2A activity want this
+                    // to segment by service kind.
+                    "service_kind": quote.service.kind,
+                    // The price the requester saw (if any) so a
+                    // re-quote workflow can decide whether to
+                    // re-issue at the same target.
+                    "price_amount_minor": quote.price.as_ref().map(|p| p.amount_minor),
+                    "price_currency": quote.price.as_ref().map(|p| p.currency.clone()),
+                    "next_action": "re_quote_required",
+                }),
+            };
+            self.enqueue_webhook(&event, Some(&quote.tenant_id));
+            self.events.emit(event);
+            report.peer_quotes_expired += 1;
+        }
+
         report
     }
 
@@ -1421,7 +1634,7 @@ impl IcpService {
         let agent = crate::agent::AgentIdentifier::parse(&sub.agent_id);
         let tenant = crate::agent::ApiKeyInfo {
             key: String::new(),
-            tenant_id: format!("scheduler-{}", sub.id),
+            tenant_id: sub.tenant_id.clone(),
             name: "subscription-scheduler".into(),
             rate_limit_per_minute: None,
             allowed_agents: None,
@@ -1471,11 +1684,21 @@ impl IcpService {
         let mut line_items = Vec::with_capacity(items.len());
         let mut subtotal_minor: i64 = 0;
         for (idx, req) in items.iter().enumerate() {
+            if req.quantity <= 0 {
+                return Err(ApiError::InvalidRequest(format!(
+                    "subscription.items[{idx}].quantity must be positive"
+                )));
+            }
             let unit_minor = req
                 .unit_price_hint
                 .as_ref()
                 .map(|m| m.amount_minor)
                 .unwrap_or(1_000);
+            if unit_minor < 0 {
+                return Err(ApiError::InvalidRequest(format!(
+                    "subscription.items[{idx}].unit_price_hint.amount_minor must be non-negative"
+                )));
+            }
             let line_subtotal = unit_minor.saturating_mul(req.quantity);
             subtotal_minor = subtotal_minor.saturating_add(line_subtotal);
             line_items.push(LineItem {
@@ -1560,6 +1783,69 @@ impl IcpService {
 
     // ---------- helpers ----------
 
+    fn transaction_for_input(
+        &self,
+        transaction_id: &str,
+        input: &IntentInput<'_>,
+    ) -> Result<Transaction, ApiError> {
+        let txn = self
+            .transactions
+            .get(transaction_id)
+            .ok_or_else(|| ApiError::ResourceNotFound(format!("transaction {transaction_id}")))?;
+        if txn.tenant_id == input.tenant.tenant_id {
+            Ok(txn)
+        } else {
+            Err(ApiError::ResourceNotFound(format!(
+                "transaction {transaction_id}"
+            )))
+        }
+    }
+
+    fn ensure_transaction_owner(
+        &self,
+        transaction_id: &str,
+        input: &IntentInput<'_>,
+    ) -> Result<(), ApiError> {
+        self.transaction_for_input(transaction_id, input)
+            .map(|_| ())
+    }
+
+    fn subscription_for_input(
+        &self,
+        subscription_id: &str,
+        input: &IntentInput<'_>,
+    ) -> Result<Subscription, ApiError> {
+        let sub = self
+            .subscriptions
+            .get(subscription_id)
+            .ok_or_else(|| ApiError::ResourceNotFound(format!("subscription {subscription_id}")))?;
+        if sub.tenant_id == input.tenant.tenant_id {
+            Ok(sub)
+        } else {
+            Err(ApiError::ResourceNotFound(format!(
+                "subscription {subscription_id}"
+            )))
+        }
+    }
+
+    fn peer_quote_for_input(
+        &self,
+        peer_quote_id: &str,
+        input: &IntentInput<'_>,
+    ) -> Result<PeerQuote, ApiError> {
+        let quote = self
+            .peer_quotes
+            .get(peer_quote_id)
+            .ok_or_else(|| ApiError::ResourceNotFound(format!("peer_quote {peer_quote_id}")))?;
+        if quote.tenant_id == input.tenant.tenant_id {
+            Ok(quote)
+        } else {
+            Err(ApiError::ResourceNotFound(format!(
+                "peer_quote {peer_quote_id}"
+            )))
+        }
+    }
+
     /// Push an event onto the durable webhook outbox.
     ///
     /// Routing: when `tenant_id` has registered active subscribers,
@@ -1586,8 +1872,10 @@ impl IcpService {
         // dashboards observing the whole fleet without re-registering
         // the same URL per tenant.
         if destinations.is_empty() {
-            if let Some(url) = self.webhook_url.as_deref() {
-                destinations.push((url.to_string(), self.webhook_secret.clone()));
+            if let (Some(url), Some(secret)) =
+                (self.webhook_url.as_deref(), self.webhook_secret.clone())
+            {
+                destinations.push((url.to_string(), Some(secret)));
             }
         }
 
@@ -1666,6 +1954,20 @@ struct Outcome {
     recorded_spend_minor: i64,
 }
 
+/// Result of one [`IcpService::tick_expiries`] sweep. Surfaced to
+/// tests for deterministic assertions and to the
+/// `icp_expiries_total{kind}` counter via the run loop.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct ExpiryTickReport {
+    /// Transactions that had `quote_expires_at <= now` and a
+    /// non-terminal pre-auth state (Draft / Quoted) — transitioned
+    /// to `Expired` this tick.
+    pub transactions_expired: usize,
+    /// Peer quotes that had `expires_at <= now` and a non-terminal
+    /// status (Pending / Quoted) — transitioned to `Expired`.
+    pub peer_quotes_expired: usize,
+}
+
 /// Result of one [`IcpService::tick_subscriptions`] sweep — useful for
 /// deterministic testing and Prometheus exposition.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
@@ -1705,6 +2007,64 @@ fn require_transaction_id(params: &Value) -> Result<String, ApiError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| ApiError::InvalidRequest("params.transaction_id required".into()))
+}
+
+fn validate_payment_instrument(
+    payment: &PaymentInstrument,
+    execution_mode: &str,
+) -> Result<(), ApiError> {
+    match payment {
+        PaymentInstrument::Card { token, .. } => {
+            require_non_empty(token.as_deref(), "payment.card.token")?;
+        }
+        PaymentInstrument::DelegatedVault { token, provider } => {
+            require_non_empty(Some(token), "payment.delegated_vault.token")?;
+            if let Some(provider) = provider.as_deref() {
+                require_non_empty(Some(provider), "payment.delegated_vault.provider")?;
+            }
+        }
+        PaymentInstrument::Stablecoin {
+            asset, chain, from, ..
+        } => {
+            require_non_empty(Some(asset), "payment.stablecoin.asset")?;
+            require_non_empty(Some(chain), "payment.stablecoin.chain")?;
+            require_non_empty(Some(from), "payment.stablecoin.from")?;
+        }
+        PaymentInstrument::A2A { peer_agent_id, .. } => {
+            require_non_empty(Some(peer_agent_id), "payment.a2a.peer_agent_id")?;
+        }
+        PaymentInstrument::ExternalAuthorization {
+            provider,
+            authorization_id,
+            ..
+        } => {
+            require_non_empty(Some(provider), "payment.external_authorization.provider")?;
+            require_non_empty(
+                Some(authorization_id),
+                "payment.external_authorization.authorization_id",
+            )?;
+        }
+    }
+
+    if execution_mode == "external_required"
+        && !matches!(payment, PaymentInstrument::ExternalAuthorization { .. })
+    {
+        return Err(ApiError::PreconditionFailed(
+            "external payment authorization required by this handler".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn require_non_empty(value: Option<&str>, field: &str) -> Result<(), ApiError> {
+    if value.is_some_and(|v| !v.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidRequest(format!(
+            "{field} must be non-empty"
+        )))
+    }
 }
 
 /// Advance a billing period anchor by one cadence unit.

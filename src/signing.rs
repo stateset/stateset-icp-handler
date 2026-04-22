@@ -6,9 +6,13 @@
 //! `base64url(header) + "." + base64url(payload)`; the signature is the
 //! Ed25519 signature over those bytes.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::Utc;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,6 +73,18 @@ impl ReceiptSigner {
             signing_key,
             verifying_key,
         }
+    }
+
+    pub fn from_pkcs8_pem(kid: impl Into<String>, pem: &str) -> Result<Self, SigningError> {
+        let der = pem_to_der(pem)?;
+        let signing_key =
+            SigningKey::from_pkcs8_der(&der).map_err(|e| SigningError::KeyLoad(e.to_string()))?;
+        let verifying_key = signing_key.verifying_key();
+        Ok(Self {
+            kid: kid.into(),
+            signing_key,
+            verifying_key,
+        })
     }
 
     pub fn verifying_key_bytes(&self) -> [u8; 32] {
@@ -144,6 +160,87 @@ impl ReceiptSigner {
             claims,
         })
     }
+
+    pub fn verify_receipt(
+        &self,
+        compact_jws: &str,
+        expected_body_json: Option<&[u8]>,
+    ) -> Result<ReceiptClaims, String> {
+        let mut parts = compact_jws.split('.');
+        let header_b64 = parts
+            .next()
+            .ok_or_else(|| "receipt: missing header segment".to_string())?;
+        let payload_b64 = parts
+            .next()
+            .ok_or_else(|| "receipt: missing payload segment".to_string())?;
+        let sig_b64 = parts
+            .next()
+            .ok_or_else(|| "receipt: missing signature segment".to_string())?;
+        if parts.next().is_some() {
+            return Err("receipt: unexpected extra segments".into());
+        }
+
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .map_err(|_| "receipt: header not base64url".to_string())?;
+        let header: JwsHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| format!("receipt: header JSON: {e}"))?;
+        if header.alg != "EdDSA" {
+            return Err(format!("receipt: unsupported alg `{}`", header.alg));
+        }
+        if header.kid != self.kid {
+            return Err(format!(
+                "receipt: kid `{}` does not match handler key `{}`",
+                header.kid, self.kid
+            ));
+        }
+
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .map_err(|_| "receipt: signature not base64url".to_string())?;
+        if sig_bytes.len() != 64 {
+            return Err(format!(
+                "receipt: Ed25519 signature must be 64 bytes, got {}",
+                sig_bytes.len()
+            ));
+        }
+        let sig_array: [u8; 64] = sig_bytes.as_slice().try_into().expect("len checked");
+        let signature = Signature::from_bytes(&sig_array);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        self.verifying_key
+            .verify(signing_input.as_bytes(), &signature)
+            .map_err(|_| "receipt: signature did not verify".to_string())?;
+
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .map_err(|_| "receipt: payload not base64url".to_string())?;
+        let claims: ReceiptClaims = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| format!("receipt: claims JSON: {e}"))?;
+
+        if let Some(expected) = expected_body_json {
+            let expected_digest = format!("sha256:{}", body_sha256(expected));
+            if claims.icp.body_digest != expected_digest {
+                return Err(format!(
+                    "receipt: body_digest `{}` does not match expected `{}`",
+                    claims.icp.body_digest, expected_digest
+                ));
+            }
+        }
+
+        Ok(claims)
+    }
+}
+
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, SigningError> {
+    let body = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("-----BEGIN ") && !line.starts_with("-----END "))
+        .collect::<String>();
+    STANDARD
+        .decode(body)
+        .map_err(|e| SigningError::KeyLoad(format!("PEM base64 decode: {e}")))
 }
 
 pub struct SignedReceipt {
@@ -162,6 +259,8 @@ pub fn body_sha256(body: &[u8]) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
+    #[error("key load failed: {0}")]
+    KeyLoad(String),
     #[error("canonicalization failed: {0}")]
     Canonicalization(String),
     #[error("serialization failed: {0}")]

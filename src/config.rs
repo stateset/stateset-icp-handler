@@ -70,6 +70,33 @@ pub struct Config {
     // Outbound webhooks
     pub webhook_url: Option<String>,
     pub webhook_secret: Option<String>,
+    /// How long to retain `delivered` outbox rows before the worker
+    /// prunes them. Successful deliveries are historical — no retry
+    /// path uses them — so the only reason to keep them is short-term
+    /// debugging. Default 7 days. `0` disables pruning entirely.
+    pub webhook_retain_delivered_days: u32,
+    /// How long to retain `dead_lettered` outbox rows before the
+    /// worker prunes them. Longer than `delivered` because operators
+    /// may still want to inspect why a destination went dead and
+    /// possibly issue a manual `retry` from the API. Default 30 days.
+    /// `0` disables pruning entirely.
+    pub webhook_retain_dead_lettered_days: u32,
+
+    /// How often the idempotency cache sweeper runs, in seconds.
+    /// Default 3600 (1h). Lazy TTL at lookup time prevents stale
+    /// entries from being replayed; the active sweeper only
+    /// reclaims disk. `0` disables the sweeper entirely (rows
+    /// accumulate; not appropriate in production).
+    pub idempotency_sweeper_interval_secs: u64,
+
+    /// How often the quote-expiry sweeper runs, in seconds.
+    /// Default 60. The sweeper transitions transactions whose
+    /// `quote_expires_at <= now` (and that are still in pre-auth
+    /// state) and peer quotes whose `expires_at <= now` to their
+    /// terminal `Expired` state. Without it, a stale quote sits in
+    /// `Quoted` forever and an agent could authorize against
+    /// outdated pricing. `0` disables the sweeper.
+    pub expiry_sweeper_interval_secs: u64,
 
     // A2A + MCP + interop
     pub a2a_enabled: bool,
@@ -96,6 +123,17 @@ pub struct Config {
 
     // Observability
     pub log_level: String,
+
+    // Runtime profile / production safety
+    /// Runtime deployment profile. `production` enables strict
+    /// validation in [`Config::validate_runtime`]; any other value is
+    /// treated as development/test.
+    pub deployment_env: String,
+    /// Payment execution mode. `simulated` validates instrument shape
+    /// but does not call an external processor. `external_required`
+    /// requires `PaymentInstrument::ExternalAuthorization` for buys
+    /// and renewals, preventing accidental fake captures in production.
+    pub payment_execution_mode: String,
 }
 
 impl Config {
@@ -129,7 +167,7 @@ impl Config {
             cors_allow_origins: split_csv(&env_default("ICP_CORS_ALLOW_ORIGINS", "*")),
             api_keys_json: std::env::var("ICP_API_KEYS_JSON").ok(),
             api_keys_file: std::env::var("ICP_API_KEYS_FILE").ok(),
-            enable_demo_keys: env_bool("ICP_ENABLE_DEMO_KEYS", true),
+            enable_demo_keys: env_bool("ICP_ENABLE_DEMO_KEYS", false),
             commerce_enabled: env_bool("COMMERCE_ENABLED", true),
             commerce_db_path: env_default("COMMERCE_DB_PATH", "./commerce.db"),
             transaction_ttl: Duration::from_secs(
@@ -141,6 +179,24 @@ impl Config {
             redis_url: std::env::var("REDIS_URL").ok(),
             webhook_url: std::env::var("ICP_WEBHOOK_URL").ok(),
             webhook_secret: std::env::var("ICP_WEBHOOK_SECRET").ok(),
+            webhook_retain_delivered_days: env_default("ICP_WEBHOOK_RETAIN_DELIVERED_DAYS", "7")
+                .parse()
+                .unwrap_or(7),
+            webhook_retain_dead_lettered_days: env_default(
+                "ICP_WEBHOOK_RETAIN_DEAD_LETTERED_DAYS",
+                "30",
+            )
+            .parse()
+            .unwrap_or(30),
+            idempotency_sweeper_interval_secs: env_default(
+                "ICP_IDEMPOTENCY_SWEEPER_INTERVAL_SECONDS",
+                "3600",
+            )
+            .parse()
+            .unwrap_or(3600),
+            expiry_sweeper_interval_secs: env_default("ICP_EXPIRY_SWEEPER_INTERVAL_SECONDS", "60")
+                .parse()
+                .unwrap_or(60),
             a2a_enabled: env_bool("ICP_A2A_ENABLED", true),
             mcp_enabled: env_bool("ICP_MCP_ENABLED", true),
             acp_compat_enabled: env_bool("ICP_ACP_COMPAT_ENABLED", true),
@@ -166,7 +222,82 @@ impl Config {
                 "1,6,24",
             )),
             log_level: env_default("LOG_LEVEL", "info"),
+            deployment_env: env_default("ICP_DEPLOYMENT_ENV", "development"),
+            payment_execution_mode: env_default("ICP_PAYMENT_EXECUTION_MODE", "simulated"),
         })
+    }
+
+    pub fn validate_runtime(&self) -> anyhow::Result<()> {
+        validate_payment_mode(&self.payment_execution_mode)?;
+        if !self.allow_insecure_urls {
+            require_https("ICP_PUBLIC_BASE_URL", &self.public_base_url)?;
+            if let Some(url) = self.webhook_url.as_deref() {
+                require_https("ICP_WEBHOOK_URL", url)?;
+            }
+        }
+        if !self.is_production() {
+            return Ok(());
+        }
+
+        let mut issues = Vec::new();
+        if self.enable_demo_keys {
+            issues.push("ICP_ENABLE_DEMO_KEYS must be false");
+        }
+        if self.api_keys_json.is_none() && self.api_keys_file.is_none() {
+            issues.push("ICP_API_KEYS_JSON or ICP_API_KEYS_FILE is required");
+        }
+        if self.signing_key_pem_env.is_none() {
+            issues.push("ICP_SIGNING_KEY_PEM is required");
+        }
+        if self.allow_insecure_urls {
+            issues.push("ICP_ALLOW_INSECURE_URLS must be false");
+        }
+        if !self.public_base_url.starts_with("https://") {
+            issues.push("ICP_PUBLIC_BASE_URL must be https://");
+        }
+        if self.cors_allow_origins.iter().any(|o| o == "*") {
+            issues.push("ICP_CORS_ALLOW_ORIGINS must not contain *");
+        }
+        if !self.require_mandate {
+            issues.push("ICP_REQUIRE_MANDATE must be true");
+        }
+        if !self.verify_mandate_signatures {
+            issues.push("ICP_VERIFY_MANDATE_SIGNATURES must be true");
+        }
+        if !self.require_icp_version {
+            issues.push("ICP_REQUIRE_VERSION must be true");
+        }
+        if !self.require_request_id {
+            issues.push("ICP_REQUIRE_REQUEST_ID must be true");
+        }
+        if !self.require_idempotency_key {
+            issues.push("ICP_REQUIRE_IDEMPOTENCY_KEY must be true");
+        }
+        if self.state_db_path == ":memory:" {
+            issues.push("ICP_STATE_DB_PATH must be durable");
+        }
+        if !self.commerce_enabled {
+            issues.push("COMMERCE_ENABLED must be true");
+        }
+        if self.commerce_db_path == ":memory:" {
+            issues.push("COMMERCE_DB_PATH must be durable");
+        }
+        if self.payment_execution_mode != "external_required" {
+            issues.push("ICP_PAYMENT_EXECUTION_MODE must be external_required");
+        }
+
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "invalid production configuration: {}",
+                issues.join("; ")
+            ))
+        }
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.deployment_env.eq_ignore_ascii_case("production")
     }
 
     /// Build a config suitable for integration tests — env-independent,
@@ -200,6 +331,18 @@ impl Config {
             redis_url: None,
             webhook_url: None,
             webhook_secret: None,
+            // Tests use 0 to keep behavior deterministic — no
+            // background pruner ever fires unless the test explicitly
+            // sets a positive retention.
+            webhook_retain_delivered_days: 0,
+            webhook_retain_dead_lettered_days: 0,
+            // Tests drive `idempotency.prune(now)` directly when they
+            // need to exercise eviction; 0 disables the background
+            // sweeper so it never races against the test's clock.
+            idempotency_sweeper_interval_secs: 0,
+            // Same reasoning for expiries — tests call
+            // `tick_expiries(now)` directly with controlled clocks.
+            expiry_sweeper_interval_secs: 0,
             a2a_enabled: true,
             mcp_enabled: true,
             acp_compat_enabled: true,
@@ -216,7 +359,28 @@ impl Config {
             // explicitly.
             subscription_dunning_schedule_hours: vec![],
             log_level: "warn".into(),
+            deployment_env: "test".into(),
+            payment_execution_mode: "simulated".into(),
         }
+    }
+}
+
+fn validate_payment_mode(mode: &str) -> anyhow::Result<()> {
+    match mode {
+        "simulated" | "external_required" => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "invalid ICP_PAYMENT_EXECUTION_MODE `{other}`; expected simulated|external_required"
+        )),
+    }
+}
+
+fn require_https(name: &str, url: &str) -> anyhow::Result<()> {
+    if url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{name} must use https:// when insecure URLs are disabled"
+        ))
     }
 }
 

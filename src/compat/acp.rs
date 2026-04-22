@@ -326,6 +326,9 @@ fn build_context(state: &AppState, headers: &HeaderMap) -> Result<CompatContext,
         .keys
         .lookup(bearer)
         .ok_or_else(|| ApiError::AuthenticationFailed("unknown API key".into()))?;
+    if tenant.is_expired_at(chrono::Utc::now()) {
+        return Err(ApiError::AuthenticationFailed("API key expired".into()));
+    }
 
     // Optional but validated when present.
     if let Some(v) = headers.get("api-version").and_then(|v| v.to_str().ok()) {
@@ -338,6 +341,12 @@ fn build_context(state: &AppState, headers: &HeaderMap) -> Result<CompatContext,
 
     let agent_raw = format!("did:stateset:agent:acp-{}", tenant.tenant_id);
     let agent = AgentIdentifier::parse(&agent_raw);
+    if !tenant.permits_agent(&agent.raw) {
+        return Err(ApiError::AuthenticationFailed(format!(
+            "agent `{}` is not allowed for this API key",
+            agent.raw
+        )));
+    }
 
     let request_id = headers
         .get("request-id")

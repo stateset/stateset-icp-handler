@@ -13,13 +13,18 @@ A 10-minute tour of ICP from an agent integrator's perspective.
 
 ```bash
 ICP_ENABLE_DEMO_KEYS=true \
+ICP_REQUIRE_VERSION=false \
 ICP_REQUIRE_MANDATE=false \
+ICP_REQUIRE_REQUEST_ID=false \
+ICP_REQUIRE_IDEMPOTENCY_KEY=false \
 cargo run --release
 ```
 
 For first-time exploration we disable mandate enforcement so you can walk the
-flow with just a bearer key. Re-enable `ICP_REQUIRE_MANDATE=true` once you're
-ready to work with real mandates.
+flow with just a bearer key. Re-enable `ICP_REQUIRE_VERSION=true`,
+`ICP_REQUIRE_MANDATE=true`, `ICP_REQUIRE_REQUEST_ID=true`, and
+`ICP_REQUIRE_IDEMPOTENCY_KEY=true` once you're ready to work with real
+mandates and retry-safe writes.
 
 ## Discover
 

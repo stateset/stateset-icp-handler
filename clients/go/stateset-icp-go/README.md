@@ -196,7 +196,7 @@ cd clients/go/stateset-icp-go
 go run ./examples/buyflow
 ```
 
-Two runnable demos live under [`examples/`](./examples/):
+Three runnable demos live under [`examples/`](./examples/):
 
 - **[`examples/buyflow/`](./examples/buyflow)** mints a `did:key`,
   signs a mandate, and walks the full lifecycle: discovery → quote →
@@ -209,12 +209,22 @@ Two runnable demos live under [`examples/`](./examples/):
   [`clients/python/examples/listen.py`](../../python/examples/listen.py).
   Ctrl-C exits cleanly via `signal.NotifyContext` cancelling the
   iterator's context. Run with `go run ./examples/listen`.
+- **[`examples/anthropic-agent/`](./examples/anthropic-agent)**
+  lets Claude drive the merchant end-to-end via tool use. Registers
+  five ICP intents as Anthropic tools (`icp_search`, `icp_quote`,
+  `icp_authorize`, `icp_buy`, `icp_track`), runs the standard
+  `tool_use` / `tool_result` loop. Hits the Anthropic Messages API
+  over raw HTTP (no `anthropic-sdk-go` dep) so the library's
+  zero-non-stdlib-deps discipline extends to the example. Parallels
+  [`clients/python/examples/anthropic_agent.py`](../../python/examples/anthropic_agent.py).
+  Set `ANTHROPIC_API_KEY` and run `go run ./examples/anthropic-agent`.
 
 Run `buyflow` and `listen` in two terminals against the same handler
 and the events from the producer show up in the consumer within a
-few hundred milliseconds.
+few hundred milliseconds. Run `anthropic-agent` in a third terminal
+and watch Claude drive a full buy flow through the same handler.
 
-Both demos are configurable via `ICP_URL` / `ICP_API_KEY` /
+All three demos are configurable via `ICP_URL` / `ICP_API_KEY` /
 `ICP_AGENT_ID` env, matching the Python examples' contracts.
 
 ## Roadmap

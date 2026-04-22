@@ -21,7 +21,7 @@ use axum::routing::post;
 use axum::Router;
 use chrono::Utc;
 use serde_json::{json, Value};
-use stateset_icp_handler::webhook::{verify, WebhookOutbox, WebhookWorker};
+use stateset_icp_handler::webhook::{verify, WebhookOutbox, WebhookSubscriber, WebhookWorker};
 use stateset_icp_handler::{build_app_state, build_router, config::Config, AppState};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -226,6 +226,46 @@ async fn worker_tick_delivers_and_signature_verifies() {
     assert_eq!(stored[0].status.wire_name(), "delivered");
     assert_eq!(stored[0].last_status_code, Some(200));
     assert!(stored[0].delivered_at.is_some());
+}
+
+#[tokio::test]
+async fn worker_delivers_per_tenant_subscriber_without_global_secret() {
+    let receiver = Receiver::start(vec![]).await;
+    let mut cfg = Config::for_test();
+    cfg.webhook_url = None;
+    cfg.webhook_secret = None;
+    let state = build_app_state(&cfg).await.expect("state");
+    state.service.webhook_subscribers.insert(WebhookSubscriber {
+        id: "whsub_test".into(),
+        tenant_id: "merchant_demo".into(),
+        url: receiver.url(),
+        secret: Some("tenant-secret".into()),
+        active: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let app = build_router(state.clone());
+    let _ = submit_quote(&app).await;
+
+    let worker =
+        WebhookWorker::new_with_optional_secret(state.service.webhook_outbox.clone(), None)
+            .with_subscribers(state.service.webhook_subscribers.clone());
+    let report = worker.tick(Utc::now()).await;
+    assert_eq!(report.due, 1);
+    assert_eq!(report.delivered, 1);
+    assert_eq!(receiver.count(), 1);
+
+    let last = receiver.last().unwrap();
+    let sig = last
+        .headers
+        .get("icp-signature")
+        .expect("signature header present")
+        .to_str()
+        .unwrap();
+    assert!(
+        verify("tenant-secret", sig, &last.body),
+        "subscriber-specific secret must sign the delivery"
+    );
 }
 
 #[tokio::test]

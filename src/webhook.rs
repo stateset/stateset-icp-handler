@@ -42,7 +42,7 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_TICK_SECS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     /// Enqueued, awaiting first attempt.
@@ -105,7 +105,7 @@ impl RetryError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WebhookDelivery {
     pub id: String,
     pub event_id: String,
@@ -196,7 +196,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// One registered destination for a tenant's webhook events. The
 /// outbox enqueues one `WebhookDelivery` per active subscriber whose
 /// `tenant_id` matches the originating tenant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct WebhookSubscriber {
     pub id: String,
     pub tenant_id: String,
@@ -355,6 +355,68 @@ impl SubscriberStore {
                     None
                 } else {
                     self.get(id)
+                }
+            }
+        }
+    }
+
+    /// In-place mutation of a subscriber's `url` and/or `secret`.
+    /// `None` for a field leaves it unchanged. Returns the updated
+    /// row, or `None` if the id doesn't exist. Used by the
+    /// `PATCH /icp/v1/webhook_subscribers/:id` endpoint to support
+    /// secret rotation and URL updates without forcing a delete +
+    /// recreate (which would rotate the id and orphan the
+    /// downstream verifier configuration).
+    pub fn patch(
+        &self,
+        id: &str,
+        url: Option<&str>,
+        secret: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<WebhookSubscriber> {
+        match &self.backend {
+            SubBackend::Memory(inner) => {
+                let mut guard = inner.write().expect("subscribers write");
+                let s = guard.get_mut(id)?;
+                if let Some(u) = url {
+                    s.url = u.to_string();
+                }
+                if let Some(sec) = secret {
+                    s.secret = Some(sec.to_string());
+                }
+                s.updated_at = now;
+                Some(s.clone())
+            }
+            SubBackend::Sqlite(pool) => {
+                // Read-modify-write so the per-field "None means
+                // leave alone" semantics match in-memory exactly,
+                // without writing five SQL UPDATE permutations.
+                let mut current = self.get(id)?;
+                if let Some(u) = url {
+                    current.url = u.to_string();
+                }
+                if let Some(sec) = secret {
+                    current.secret = Some(sec.to_string());
+                }
+                current.updated_at = now;
+                let conn = pool.get().expect("subscribers pool acquire");
+                let n = conn
+                    .execute(
+                        "UPDATE webhook_subscribers \
+                         SET url = ?1, secret = ?2, updated_at = ?3 \
+                         WHERE id = ?4",
+                        rusqlite::params![
+                            current.url,
+                            current.secret.clone().unwrap_or_default(),
+                            current.updated_at.to_rfc3339(),
+                            id,
+                        ],
+                    )
+                    .expect("subscribers patch");
+                if n == 0 {
+                    None
+                } else {
+                    Some(current)
                 }
             }
         }
@@ -846,9 +908,132 @@ impl WebhookOutbox {
         }
     }
 
+    /// Snapshot of queue depth by status. Used to update the
+    /// Prometheus `icp_webhook_outbox_queue_depth` gauge each worker
+    /// tick — operators dashboard the `pending` and `dead_lettered`
+    /// series to see backlog and to alert on dead-letter growth.
+    pub fn status_counts(&self) -> StatusCounts {
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let guard = inner.read().expect("outbox read");
+                let mut counts = StatusCounts::default();
+                for d in guard.values() {
+                    match d.status {
+                        DeliveryStatus::Pending => counts.pending += 1,
+                        DeliveryStatus::InFlight => counts.in_flight += 1,
+                        DeliveryStatus::Delivered => counts.delivered += 1,
+                        DeliveryStatus::Failed => counts.failed += 1,
+                        DeliveryStatus::DeadLettered => counts.dead_lettered += 1,
+                    }
+                }
+                counts
+            }
+            Backend::Sqlite(pool) => {
+                let conn = pool.get().expect("outbox pool acquire");
+                let mut stmt = conn
+                    .prepare("SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status")
+                    .expect("prepare status_counts");
+                let rows = stmt
+                    .query_map([], |row| {
+                        let s: String = row.get(0)?;
+                        let n: i64 = row.get(1)?;
+                        Ok((s, n))
+                    })
+                    .expect("query status_counts");
+                let mut counts = StatusCounts::default();
+                for r in rows.flatten() {
+                    let (status, n) = r;
+                    let n = n.max(0) as usize;
+                    match status.as_str() {
+                        "pending" => counts.pending = n,
+                        "in_flight" => counts.in_flight = n,
+                        "delivered" => counts.delivered = n,
+                        "failed" => counts.failed = n,
+                        "dead_lettered" => counts.dead_lettered = n,
+                        // Unknown status values shouldn't happen — the FSM
+                        // only writes the five names above. Any drift is
+                        // silently ignored here so a single bad row can't
+                        // panic the metrics tick.
+                        _ => {}
+                    }
+                }
+                counts
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Prune `delivered` rows older than `delivered_cutoff` and
+    /// `dead_lettered` rows older than `dead_lettered_cutoff`.
+    /// `pending`, `in_flight`, and `failed` rows are NEVER pruned —
+    /// those are still in the FSM and the worker would lose work.
+    /// Pass `None` for either cutoff to skip that status. Cutoffs
+    /// compare against `created_at` so rows are aged by enqueue time,
+    /// not by their last status flip (the operator-meaningful
+    /// retention is "how long has this row existed", not "how long
+    /// since it last changed state").
+    pub fn prune(
+        &self,
+        delivered_cutoff: Option<DateTime<Utc>>,
+        dead_lettered_cutoff: Option<DateTime<Utc>>,
+    ) -> PruneReport {
+        let mut report = PruneReport::default();
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut guard = inner.write().expect("outbox write");
+                guard.retain(|_id, d| {
+                    let drop_for_delivered = matches!(d.status, DeliveryStatus::Delivered)
+                        && delivered_cutoff.is_some_and(|c| d.created_at < c);
+                    let drop_for_dead = matches!(d.status, DeliveryStatus::DeadLettered)
+                        && dead_lettered_cutoff.is_some_and(|c| d.created_at < c);
+                    if drop_for_delivered {
+                        report.delivered_pruned += 1;
+                    }
+                    if drop_for_dead {
+                        report.dead_lettered_pruned += 1;
+                    }
+                    !(drop_for_delivered || drop_for_dead)
+                });
+            }
+            Backend::Sqlite(pool) => {
+                let conn = pool.get().expect("outbox pool acquire");
+                if let Some(cutoff) = delivered_cutoff {
+                    let n = conn
+                        .execute(
+                            "DELETE FROM webhook_deliveries \
+                             WHERE status = 'delivered' AND created_at < ?1",
+                            rusqlite::params![cutoff.to_rfc3339()],
+                        )
+                        .expect("prune delivered");
+                    report.delivered_pruned = n;
+                }
+                if let Some(cutoff) = dead_lettered_cutoff {
+                    let n = conn
+                        .execute(
+                            "DELETE FROM webhook_deliveries \
+                             WHERE status = 'dead_lettered' AND created_at < ?1",
+                            rusqlite::params![cutoff.to_rfc3339()],
+                        )
+                        .expect("prune dead_lettered");
+                    report.dead_lettered_pruned = n;
+                }
+            }
+        }
+        report
+    }
+}
+
+/// Result of one [`WebhookOutbox::prune`] call. The two counts feed
+/// the `icp_webhook_outbox_pruned_total{reason}` Prometheus counter
+/// so operators can see retention pressure (a sustained nonzero rate
+/// is a sign that the outbox would otherwise grow unbounded).
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct PruneReport {
+    pub delivered_pruned: usize,
+    pub dead_lettered_pruned: usize,
 }
 
 /// Exponential backoff: `attempts²` seconds, clamped to 1 hour.
@@ -867,28 +1052,76 @@ pub fn backoff_for(attempts: u32) -> Duration {
 #[derive(Clone)]
 pub struct WebhookWorker {
     outbox: WebhookOutbox,
-    secret: String,
+    global_secret: Option<String>,
+    subscribers: Option<SubscriberStore>,
     client: reqwest::Client,
     timeout: StdDuration,
+    /// Retain `delivered` rows for this many days. `None` disables
+    /// pruning of delivered rows entirely.
+    retain_delivered: Option<Duration>,
+    /// Retain `dead_lettered` rows for this many days. `None`
+    /// disables pruning of dead-lettered rows entirely.
+    retain_dead_lettered: Option<Duration>,
 }
 
 impl WebhookWorker {
     pub fn new(outbox: WebhookOutbox, secret: String) -> Self {
+        Self::new_with_optional_secret(outbox, Some(secret))
+    }
+
+    pub fn new_with_optional_secret(outbox: WebhookOutbox, global_secret: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(StdDuration::from_secs(DEFAULT_TIMEOUT_SECS))
             .build()
             .expect("build webhook reqwest client");
         Self {
             outbox,
-            secret,
+            global_secret,
+            subscribers: None,
             client,
             timeout: StdDuration::from_secs(DEFAULT_TIMEOUT_SECS),
+            retain_delivered: None,
+            retain_dead_lettered: None,
         }
+    }
+
+    pub fn with_subscribers(mut self, subscribers: SubscriberStore) -> Self {
+        self.subscribers = Some(subscribers);
+        self
     }
 
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
         self
+    }
+
+    /// Configure retention windows. A `0` value for either count
+    /// disables pruning of that status — matches `Config::for_test()`
+    /// defaults so existing tests don't suddenly start losing rows.
+    pub fn with_retention(mut self, delivered_days: u32, dead_lettered_days: u32) -> Self {
+        self.retain_delivered = if delivered_days > 0 {
+            Some(Duration::days(delivered_days as i64))
+        } else {
+            None
+        };
+        self.retain_dead_lettered = if dead_lettered_days > 0 {
+            Some(Duration::days(dead_lettered_days as i64))
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Run the retention sweep with this worker's configured windows
+    /// against the current time. Public so `run_loop` and tests can
+    /// drive it deterministically.
+    pub fn prune_now(&self, now: DateTime<Utc>) -> PruneReport {
+        let delivered_cutoff = self.retain_delivered.map(|d| now - d);
+        let dead_cutoff = self.retain_dead_lettered.map(|d| now - d);
+        if delivered_cutoff.is_none() && dead_cutoff.is_none() {
+            return PruneReport::default();
+        }
+        self.outbox.prune(delivered_cutoff, dead_cutoff)
     }
 
     /// Run one drain pass — process every due delivery synchronously.
@@ -906,6 +1139,7 @@ impl WebhookWorker {
                 Ok(status) if (200..300).contains(&status) => {
                     self.outbox.mark_delivered(&delivery.id, status, after);
                     report.delivered += 1;
+                    crate::metrics::record_webhook_delivery("delivered");
                 }
                 Ok(status) => {
                     self.outbox.bump_failure(
@@ -917,8 +1151,10 @@ impl WebhookWorker {
                     if let Some(d) = self.outbox.get(&delivery.id) {
                         if matches!(d.status, DeliveryStatus::DeadLettered) {
                             report.dead_lettered += 1;
+                            crate::metrics::record_webhook_delivery("dead_lettered");
                         } else {
                             report.failed += 1;
+                            crate::metrics::record_webhook_delivery("failed");
                         }
                     }
                 }
@@ -928,8 +1164,10 @@ impl WebhookWorker {
                     if let Some(d) = self.outbox.get(&delivery.id) {
                         if matches!(d.status, DeliveryStatus::DeadLettered) {
                             report.dead_lettered += 1;
+                            crate::metrics::record_webhook_delivery("dead_lettered");
                         } else {
                             report.failed += 1;
+                            crate::metrics::record_webhook_delivery("failed");
                         }
                     }
                 }
@@ -938,9 +1176,12 @@ impl WebhookWorker {
         report
     }
 
-    async fn send_one(&self, delivery: &WebhookDelivery) -> reqwest::Result<u16> {
+    async fn send_one(&self, delivery: &WebhookDelivery) -> anyhow::Result<u16> {
         let now_unix = Utc::now().timestamp();
-        let signature = sign(&self.secret, now_unix, delivery.payload_json.as_bytes());
+        let secret = self
+            .secret_for_delivery(delivery)
+            .ok_or_else(|| anyhow::anyhow!("no webhook signing secret for delivery"))?;
+        let signature = sign(&secret, now_unix, delivery.payload_json.as_bytes());
         let resp = self
             .client
             .post(&delivery.url)
@@ -956,11 +1197,41 @@ impl WebhookWorker {
             .await?;
         Ok(resp.status().as_u16())
     }
+
+    fn secret_for_delivery(&self, delivery: &WebhookDelivery) -> Option<String> {
+        if !delivery.tenant_id.is_empty() {
+            if let Some(subscribers) = self.subscribers.as_ref() {
+                if let Some(secret) = subscribers
+                    .list_active_for_tenant(&delivery.tenant_id)
+                    .into_iter()
+                    .find(|s| s.url == delivery.url)
+                    .and_then(|s| s.secret)
+                {
+                    return Some(secret);
+                }
+            }
+        }
+        self.global_secret.clone()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct TickReport {
     pub due: usize,
+    pub delivered: usize,
+    pub failed: usize,
+    pub dead_lettered: usize,
+}
+
+/// Snapshot of webhook outbox depth by FSM state. Refreshed once per
+/// worker tick and reflected onto the
+/// `icp_webhook_outbox_queue_depth{status=...}` gauge — operators
+/// alert on `pending > N` (backlog growing) and `dead_lettered > 0`
+/// (a destination is broken and ops should manually retry).
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct StatusCounts {
+    pub pending: usize,
+    pub in_flight: usize,
     pub delivered: usize,
     pub failed: usize,
     pub dead_lettered: usize,
@@ -977,9 +1248,25 @@ pub async fn run_loop(worker: WebhookWorker, period: StdDuration) {
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let report = worker.tick(Utc::now()).await;
+        let now = Utc::now();
+        let report = worker.tick(now).await;
+        // Run the retention sweep on every tick. When no retention
+        // is configured (the test default) `prune_now` is a no-op.
+        // The cost in production is two indexed DELETEs against
+        // `webhook_deliveries.created_at`.
+        let prune = worker.prune_now(now);
+        crate::metrics::record_webhook_prune(&prune);
+        // Always refresh the queue-depth gauge after a tick — even
+        // ticks that processed zero rows can change the gauge if
+        // intent-side enqueues landed between ticks. The
+        // `record_webhook_tick` helper also bumps the worker
+        // liveness counter.
+        crate::metrics::record_webhook_tick(&worker.outbox.status_counts());
         if report.due > 0 || report.failed > 0 || report.dead_lettered > 0 {
             tracing::debug!(?report, "webhook worker tick");
+        }
+        if prune.delivered_pruned > 0 || prune.dead_lettered_pruned > 0 {
+            tracing::debug!(?prune, "webhook outbox prune");
         }
     }
 }

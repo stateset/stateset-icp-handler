@@ -28,10 +28,16 @@ use sha2::{Digest, Sha256};
 
 use crate::state_db::StatePool;
 
-/// Maximum age of a cached idempotency entry. Reads older than this are
-/// treated as misses; the row stays in the DB until a future GC pass
-/// removes it.
+/// Maximum age of a cached idempotency entry. Reads older than this
+/// are treated as misses; the row is reclaimed by the next sweeper
+/// tick (see [`run_sweeper_loop`]).
 pub const DEFAULT_TTL_HOURS: i64 = 24;
+
+/// Default cadence for the active sweeper, in seconds. 1 hour is a
+/// good balance: shorter cadences burn DB ops for no operator
+/// benefit (the lazy TTL at lookup time already prevents wrong
+/// replays); longer cadences let the table grow more between sweeps.
+pub const DEFAULT_SWEEPER_INTERVAL_SECS: u64 = 3600;
 
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
@@ -238,6 +244,56 @@ impl IdempotencyStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Active eviction sweep — DELETE entries whose `created_at` is
+    /// older than the configured TTL relative to `now`. Without this
+    /// the table grows unbounded: lazy TTL eviction at lookup time
+    /// stops a stale entry from being replayed but never reclaims
+    /// the row. Returns the number of entries removed so the caller
+    /// can update the
+    /// `icp_idempotency_pruned_total` counter.
+    pub fn prune(&self, now: DateTime<Utc>) -> usize {
+        let cutoff = now - self.ttl;
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut guard = inner.write().expect("idempotency write");
+                let before = guard.len();
+                guard.retain(|_k, e| e.created_at >= cutoff);
+                before - guard.len()
+            }
+            Backend::Sqlite(pool) => {
+                let conn = pool.get().expect("idempotency pool acquire");
+                conn.execute(
+                    "DELETE FROM idempotency WHERE created_at < ?1",
+                    rusqlite::params![cutoff.to_rfc3339()],
+                )
+                .expect("idempotency prune")
+            }
+        }
+    }
+}
+
+/// Background TTL sweeper. Designed to be `tokio::spawn`ed alongside
+/// the webhook + scheduler workers. Calls `IdempotencyStore::prune`
+/// at the configured cadence and bumps the
+/// `icp_idempotency_pruned_total` counter with whatever it removes.
+pub async fn run_sweeper_loop(store: IdempotencyStore, period: std::time::Duration) {
+    use tokio::time::{interval, MissedTickBehavior};
+    tracing::info!(
+        interval_secs = period.as_secs_f64(),
+        ttl_hours = store.ttl.num_hours(),
+        "idempotency sweeper started"
+    );
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let pruned = store.prune(Utc::now());
+        crate::metrics::record_idempotency_sweep(pruned);
+        if pruned > 0 {
+            tracing::debug!(pruned, "idempotency sweeper tick");
+        }
     }
 }
 

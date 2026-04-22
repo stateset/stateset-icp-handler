@@ -107,6 +107,21 @@ async fn send(app: &Router, rb: RequestBuilder) -> (StatusCode, Value) {
     (status, v)
 }
 
+async fn send_raw(app: &Router, rb: RequestBuilder) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let resp = app.clone().oneshot(rb.build()).await.expect("send request");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("collect body");
+    let v: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, headers, v)
+}
+
 fn make_mandate_jws(scopes: &[&str], amount_minor: i64, per_txn: Option<i64>) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let now = Utc::now().timestamp();
@@ -293,6 +308,68 @@ async fn intent_quote_produces_quoted_transaction_with_totals() {
 }
 
 #[tokio::test]
+async fn state_changing_response_stamps_receipt_headers() {
+    let app = setup().await;
+    let (status, headers, body) =
+        send_raw(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        headers
+            .get("icp-receipt")
+            .expect("ICP-Receipt header")
+            .to_str()
+            .unwrap(),
+        body["receipt"]["jws"].as_str().unwrap()
+    );
+    assert_eq!(
+        headers
+            .get("icp-receipt-kid")
+            .expect("ICP-Receipt-Kid header")
+            .to_str()
+            .unwrap(),
+        body["receipt"]["kid"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn required_icp_version_and_request_id_are_enforced() {
+    let mut cfg = Config::for_test();
+    cfg.require_icp_version = true;
+    cfg.require_request_id = true;
+    let app = setup_with(cfg).await;
+
+    let (status, body) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("ICP-Version"));
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Version", "2026-04-21")
+            .json_body(quote_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("ICP-Request-Id"));
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Version", "2026-04-21")
+            .header("ICP-Request-Id", "req_required_test")
+            .json_body(quote_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+}
+
+#[tokio::test]
 async fn full_intent_flow_quote_authorize_buy() {
     let app = setup().await;
 
@@ -402,6 +479,86 @@ async fn buy_with_engine_persists_real_order() {
     assert_eq!(order["status"], "created");
     // The id is a real engine UUID, not our `txn_…` opaque string.
     assert!(!order["id"].as_str().unwrap().starts_with("txn_"));
+}
+
+#[tokio::test]
+async fn buy_rejects_malformed_payment_instrument() {
+    let app = setup().await;
+    let (_s, q) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    let txn_id = q["transaction"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "" }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("payment.card.token"));
+}
+
+#[tokio::test]
+async fn external_required_payment_mode_rejects_simulated_card_payment() {
+    let mut cfg = Config::for_test();
+    cfg.payment_execution_mode = "external_required".into();
+    let app = setup_with(cfg).await;
+    let (_s, q) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    let txn_id = q["transaction"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "tok_demo" }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("external payment authorization"));
+}
+
+#[tokio::test]
+async fn external_required_payment_mode_accepts_external_authorization() {
+    let mut cfg = Config::for_test();
+    cfg.payment_execution_mode = "external_required".into();
+    let app = setup_with(cfg).await;
+    let (_s, q) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    let txn_id = q["transaction"]["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": {
+                    "method": "external_authorization",
+                    "provider": "stripe",
+                    "authorization_id": "pi_12345"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["transaction"]["state"], "completed");
 }
 
 #[tokio::test]

@@ -105,8 +105,13 @@ git clone https://github.com/stateset/stateset-icp-handler
 cd stateset-icp-handler
 cargo build --release
 
-# 3. Run (demo API keys on, SQLite at ./commerce.db)
-ICP_ENABLE_DEMO_KEYS=true cargo run --release
+# 3. Run a local demo (demo API key, relaxed request headers)
+ICP_ENABLE_DEMO_KEYS=true \
+ICP_REQUIRE_VERSION=false \
+ICP_REQUIRE_MANDATE=false \
+ICP_REQUIRE_REQUEST_ID=false \
+ICP_REQUIRE_IDEMPOTENCY_KEY=false \
+cargo run --release
 
 # HTTP  → http://0.0.0.0:8082
 # gRPC  → 0.0.0.0:50052
@@ -131,6 +136,9 @@ The demo script runs a full agent flow end-to-end:
    curl -s -X POST http://localhost:8082/icp/v1/intents \
      -H "Authorization: Bearer icp_demo_key_123" \
      -H "ICP-Agent-Id: did:stateset:agent:demo" \
+     -H "ICP-Version: 2026-04-21" \
+     -H "ICP-Request-Id: req_demo_quote_1" \
+     -H "ICP-Idempotency-Key: idem_demo_quote_1" \
      -H "ICP-Mandate: <compact-jws-mandate>" \
      -H "Content-Type: application/json" \
      -d '{

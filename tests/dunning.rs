@@ -249,6 +249,147 @@ async fn successful_renewal_clears_dunning_state() {
 }
 
 #[tokio::test]
+async fn renewed_event_payload_carries_cycle_context() {
+    // Operator automation around `subscription.renewed` needs
+    // cycle context: receipt mailers need `transaction_id` to link
+    // to the signed receipt; accounting needs `cycle_number` +
+    // period bounds; customer-facing notifications need
+    // `next_charge_at` to set expectations. The original payload
+    // (`subscription_id` + `automatic`) was the bare-minimum signal.
+    let (state, app) = build(vec![]).await;
+    let mut events = state.service.events.subscribe();
+
+    // Subscribe with a working card (default test engine accepts
+    // `tok_works`-style tokens).
+    let resp = submit(
+        &app,
+        subscribe_body(json!({ "method": "card", "token": "tok_works" })),
+    )
+    .await;
+    let sub_id = resp["subscription"]["id"].as_str().unwrap().to_string();
+    let pre = state.service.subscriptions.get(&sub_id).unwrap();
+    let charges_pre = pre.charges_completed;
+
+    // Drain setup events so recv() lands on the renewed one.
+    while events.try_recv().is_ok() {}
+
+    let now = Utc::now();
+    force_due(&state, &sub_id, now);
+    let report = state.service.tick_subscriptions(now).await;
+    assert_eq!(report.renewed, 1, "scheduler should renew");
+
+    let mut payload: Option<Value> = None;
+    while let Ok(ev) = events.try_recv() {
+        if ev.r#type == "subscription.renewed" {
+            payload = Some(ev.payload);
+            break;
+        }
+    }
+    let payload = payload.expect("subscription.renewed event must be emitted");
+
+    // Pre-existing fields — kept for back-compat.
+    assert_eq!(payload["subscription_id"], sub_id);
+    assert_eq!(payload["automatic"], true);
+
+    // New cycle-context fields.
+    let txn_id = payload["transaction_id"]
+        .as_str()
+        .expect("transaction_id must be set so receipt mailers can link to the receipt");
+    assert!(
+        txn_id.starts_with("txn_"),
+        "transaction id format: {txn_id}"
+    );
+    assert_eq!(
+        payload["cycle_number"].as_u64().unwrap(),
+        (charges_pre + 1) as u64,
+        "cycle_number is the new charges_completed value (post-increment)"
+    );
+    assert!(
+        payload["current_period_start"].is_string(),
+        "period bounds drive cycle accounting"
+    );
+    assert!(payload["current_period_end"].is_string());
+    assert!(
+        payload["next_charge_at"].is_string(),
+        "next_charge_at sets customer expectations in renewal emails"
+    );
+    assert_eq!(
+        payload["next_charge_at"], payload["current_period_end"],
+        "next_charge_at == period_end on a successful renewal — both stamps"
+    );
+    // amount_minor / currency are best-effort (engine may not always
+    // populate totals.total). Just assert they exist as fields,
+    // even if amount_minor is null.
+    assert!(payload.get("amount_minor").is_some());
+    assert!(payload.get("currency").is_some());
+}
+
+#[tokio::test]
+async fn past_due_event_payload_carries_triage_metadata() {
+    // Operators paged by `subscription.past_due` need triage info to
+    // act: WHY did it fail (last_error), WHEN was the last attempt
+    // (last_attempt_at), and WHAT should they do (next_action).
+    // Without these the alert is a paging-only signal and the
+    // operator has to dig through DB or logs to do anything useful.
+    let (state, app) = build(vec![1]).await; // 1-entry schedule → 2nd failure pasts_due
+    let mut events = state.service.events.subscribe();
+    let resp = submit(&app, subscribe_body(always_failing_payment())).await;
+    let sub_id = resp["subscription"]["id"].as_str().unwrap().to_string();
+    let mut now = Utc::now();
+
+    // Drain any setup events (subscription.created etc) so the
+    // recv() below lands on the past_due event we care about.
+    while events.try_recv().is_ok() {}
+
+    // Two failures: first stays active (1-entry schedule has 1 retry
+    // budget left), second exhausts → past_due.
+    for _ in 0..2 {
+        force_due(&state, &sub_id, now);
+        let _ = state.service.tick_subscriptions(now).await;
+        // Advance past the dunning backoff so the next tick re-picks.
+        let s = state.service.subscriptions.get(&sub_id).unwrap();
+        now = s.next_charge_at + Duration::seconds(1);
+    }
+
+    let post = state.service.subscriptions.get(&sub_id).unwrap();
+    assert_eq!(post.status.wire_name(), "past_due");
+
+    // Drain events looking for the past_due one.
+    let mut past_due_payload: Option<Value> = None;
+    while let Ok(ev) = events.try_recv() {
+        if ev.r#type == "subscription.past_due" {
+            past_due_payload = Some(ev.payload);
+            break;
+        }
+    }
+    let payload = past_due_payload.expect("subscription.past_due event must be emitted");
+
+    // Pre-existing fields — kept for back-compat.
+    assert_eq!(payload["subscription_id"], sub_id);
+    assert!(payload["consecutive_failures"].as_u64().unwrap() >= 2);
+
+    // New triage fields.
+    assert_eq!(
+        payload["attempts_made"], payload["consecutive_failures"],
+        "attempts_made is the back-compat-friendly alias"
+    );
+    let last_err = payload["last_error"].as_str().unwrap_or("");
+    assert!(
+        !last_err.is_empty(),
+        "last_error must surface the underlying charge failure (operators page on past_due and need to know WHY): got {last_err:?}"
+    );
+    assert!(
+        payload["last_attempt_at"].is_string(),
+        "last_attempt_at must be set so operators can scope log searches: got {:?}",
+        payload["last_attempt_at"]
+    );
+    assert_eq!(
+        payload["next_action"], "manual_renewal_required",
+        "operator-actionable next_action lets handlers switch on it"
+    );
+}
+
+#[tokio::test]
 async fn empty_schedule_preserves_legacy_immediate_retry() {
     // Empty schedule = legacy behavior. The existing
     // tests/scheduler.rs::repeated_failures_transition_to_past_due

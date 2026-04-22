@@ -2,8 +2,8 @@
 
 **A reference implementation of the Intelligent Commerce Protocol for agent-native commerce**
 
-Version: 0.2.0 (handler) / `2026-04-21` (protocol)
-Status: Published — tag `v0.2.0`
+Version: 0.3.0 (handler) / `2026-04-21` (protocol)
+Status: Published — tag `v0.3.0`
 Authors: StateSet Commerce Engineering
 
 ---
@@ -575,7 +575,7 @@ Phase 0-3 of the 1.0 readiness plan shipped in `v0.2.0`. Remaining work for a tr
 
 The StateSet ICP Handler is a deliberately small, deliberately opinionated reference for a protocol whose goal is also small: give agents a single, stable, verifiable wire contract for commerce. The handler runs as one process. Every write is bound to an identified agent acting under a signed mandate. Every state change emits a signed receipt that any party can verify offline. State survives restart. Existing ACP, UCP, MCP, and A2A traffic lands on the same engine through compatibility paths. Subscriptions, peer-to-peer payments, negotiation, and receipt confirmation are first-class. Stablecoins, multi-jurisdiction tax, and cross-border fulfillment are not extensions.
 
-The bet behind ICP is that as agents take over an increasing fraction of commerce traffic, the protocol layer becomes the load-bearing surface — and merchants and platforms will prefer one protocol that subsumes the rest to a permanent matrix of bilateral integrations. The bet behind this specific release is that a spec is only as real as the number of independent implementations that can interoperate with it. `v0.2.0` ships the Rust reference handler paired with a polyglot ecosystem — Python client, npm conformance harness, npm merchant scaffolder, byte-exact wire-format vectors — whose sole job is to make that independence provable. A Python developer with this release can implement, operate, and verify a StateSet merchant end-to-end without ever touching Rust. That is the substrate claim.
+The bet behind ICP is that as agents take over an increasing fraction of commerce traffic, the protocol layer becomes the load-bearing surface — and merchants and platforms will prefer one protocol that subsumes the rest to a permanent matrix of bilateral integrations. The bet behind this specific release is that a spec is only as real as the number of independent implementations that can interoperate with it. `v0.3.0` carries that substrate forward with production hardening around tenant isolation, durable background workers, receipt boundaries, webhook operations, and release-grade configuration while preserving the polyglot ecosystem shipped in `v0.2.0`. A Python developer with this release can implement, operate, and verify a StateSet merchant end-to-end without ever touching Rust. That is the substrate claim.
 
 ---
 

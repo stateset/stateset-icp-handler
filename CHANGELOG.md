@@ -8,6 +8,7 @@ npm / PyPI:
 - Python — [`clients/python/CHANGELOG.md`](./clients/python/CHANGELOG.md)
 - npm `@stateset/icp-conformance` — [`clients/npm/icp-conformance/CHANGELOG.md`](./clients/npm/icp-conformance/CHANGELOG.md)
 - npm `@stateset/create-icp-commerce` — [`clients/npm/create-icp-commerce/CHANGELOG.md`](./clients/npm/create-icp-commerce/CHANGELOG.md)
+- Go — [`clients/go/stateset-icp-go/CHANGELOG.md`](./clients/go/stateset-icp-go/CHANGELOG.md)
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to date-based ICP versioning — see
@@ -15,7 +16,550 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-22
+
 ### Added
+- **Expiry event payloads — re-quote context** — completes the
+  background-event enrichment story (subscription scheduler in the
+  prior two iterations; expiry sweeper now). The previous payloads
+  carried only `{id, expired_at}` — operators had to re-fetch to
+  do anything actionable. Both events now carry triage metadata
+  (back-compat — old receivers still work):
+  - **`transaction.expired`** adds:
+    - `previous_state` — Draft vs Quoted. Operators handle them
+      differently: Quoted means a customer saw a price they didn't
+      act on (re-quote); Draft means they never made it past
+      discovery.
+    - `quote_expires_at` — the *original* deadline (not the sweep
+      tick time), for log-search scoping.
+    - `buyer_email` — best-effort; lets customer-facing
+      automation send a re-quote email without re-fetching.
+    - `amount_minor` / `currency` — quoted total the customer
+      saw, for re-quote email context (best-effort; null on
+      Draft txns with no totals).
+    - `next_action: "re_quote_required"` — stable enum operators
+      switch on.
+  - **`peer_quote.expired`** adds:
+    - `previous_status` — Pending (peer never priced) vs Quoted
+      (priced offer aged out). Different operator playbooks.
+    - `requester_agent_id` / `peer_agent_id` — both parties on
+      the payload so receivers don't re-fetch.
+    - `service_kind` — what was being requested. A2A operator
+      dashboards segment by this.
+    - `price_amount_minor` / `price_currency` — the priced
+      offer that aged out (null when previous_status was
+      Pending). Lets re-quote workflows decide whether to
+      re-issue at the same target.
+    - `next_action: "re_quote_required"` — same enum as
+      transaction.expired.
+  - 2 new tests in `tests/expiry_sweeper.rs` (7 total now) —
+    each event's payload assertion: build a realistic source
+    artifact (Quoted txn with totals + buyer email; Quoted peer
+    quote with price), drive the sweeper, drain events from the
+    in-process bus, assert every new field is populated.
+
+- **`subscription.renewed` event payload — cycle context** —
+  symmetric enrichment to last iteration's `past_due` work.
+  The original payload was just `{subscription_id, automatic}`
+  — operator automation around successful renewals had to
+  re-fetch the subscription and the transaction to do anything
+  useful (mail a receipt, run cycle-end accounting, send a
+  customer notification). Six new fields on the renewed payload
+  (back-compat — old receivers still work):
+  - **`transaction_id`** — duplicates the top-level event field
+    in the payload so flat-receiver consumers (one webhook, no
+    Event-envelope parser) can link to the signed receipt
+    without parsing two layers.
+  - **`cycle_number`** — the post-increment
+    `charges_completed`. The Nth successful charge against this
+    subscription. Drives "cycle 12 of 12" type messaging.
+  - **`current_period_start`** / **`current_period_end`** —
+    period bounds for the just-charged cycle. Cycle accounting
+    needs both.
+  - **`next_charge_at`** — when the next auto-renewal will
+    fire. Customer-facing emails set expectations from this.
+    Equal to `current_period_end` on a successful renewal — both
+    fields are stamped for clarity (a future iteration could
+    diverge them, e.g. proration or grace periods).
+  - **`amount_minor`** / **`currency`** — taken from
+    `txn.totals.total` (best-effort; may be null if the engine
+    didn't compute totals on the renewal txn). Lets receipt
+    mailers include the charged amount without re-fetching.
+  - 1 new test in `tests/dunning.rs` (9 total now) —
+    `renewed_event_payload_carries_cycle_context` subscribes to
+    the in-process event bus, drives a working renewal via
+    `tick_subscriptions`, and asserts every new field is
+    populated. Specifically pins `cycle_number` to the
+    post-increment value so a regression that emits the
+    pre-increment count would fail loud.
+
+- **`subscription.past_due` event payload — triage metadata** —
+  the existing payload was just `{subscription_id,
+  consecutive_failures}`. An operator paged by this had no way
+  from the event alone to tell *why* the renewal failed
+  (declined card vs network timeout vs gateway-side outage)
+  or *when* the last attempt was. They had to dig through DB
+  rows or warn-level logs to do anything actionable. The
+  enriched payload adds three triage fields (back-compat — old
+  receivers still work):
+  - **`last_error`** — the underlying charge-failure message
+    captured from the engine error (`err.to_string()`). The
+    operator can switch on this to choose between an automated
+    retry vs surfacing to a human, and surface it to the
+    customer for self-service repair (e.g. "your card was
+    declined; please update payment method"). Captured
+    *before* `err` moves into the `tracing::warn!` call so the
+    same value lands in both the structured log and the event.
+  - **`last_attempt_at`** — RFC3339 timestamp of the failure
+    that triggered past_due. Lets operators scope log searches
+    and correlate with payment-gateway logs.
+  - **`next_action`** — operator-facing string switch
+    (`"manual_renewal_required"` for now). Stable enum value
+    so handlers can route the event to the right runbook.
+  - Added `attempts_made` as a forward-looking alias for
+    `consecutive_failures` — both fields carry the same value
+    so receivers can migrate at their own pace.
+  - 1 new test in `tests/dunning.rs` (8 total now) —
+    `past_due_event_payload_carries_triage_metadata` subscribes
+    to the in-process event bus, drives a sub through dunning
+    schedule exhaustion, and asserts every new field is
+    populated. Fails loud if `last_error` is the empty string
+    (the most common regression: forgetting to thread the
+    error message through).
+
+- **`GET /icp/v1/receipts` list endpoint** — completes the
+  resource-list quartet (transactions + subscriptions + peer_quotes
+  + receipts). Operators auditing past activity can now enumerate
+  signed receipts through the API instead of needing every jti
+  ahead of time. Same shape as the others:
+  - Tenant-scoped — receipts don't carry a `tenant_id` of their own
+    (the signed claims shape is wire-stable), so ownership is
+    derived per-row via `claims.icp.transaction_id` →
+    transaction lookup. Identical policy to the existing
+    `GET /icp/v1/receipts/:jti`.
+  - `?intent=intent.buy` filter — narrows to receipts signed for
+    a specific intent. Useful for audit dashboards that segment
+    by flow (refunds, subscriptions, peer payments, etc).
+  - `?limit=` capped at 500 (default 100). Internally over-fetches
+    by 3× so cross-tenant filtering still gives the caller close
+    to a full page back.
+  - Newest-first sort by `claims.iat` (signed-at timestamp);
+    stable across both backends, unlike `created_at` which only
+    the SQLite backend tracks.
+  - Empty result → **200** `{count:0,data:[]}` (never 404 — same
+    convention as the other list endpoints).
+  - New `ReceiptStore::list_recent(limit)` operator-level scan.
+    Cross-tenant by design; the route handler does the per-row
+    join + tenant filter.
+  - 4 new tests in `tests/receipt_isolation.rs` (8 total now):
+    list returns only caller's rows; intent filter narrows to
+    matching receipts; empty list is 200 not 404; unauthenticated
+    list 401s.
+  - Wired into `openapi.rs` paths registry and the openapi test's
+    path enumeration.
+
+- **`PATCH /icp/v1/webhook_subscribers/:id`** — closes the secret-
+  rotation gap. Previously the only way to rotate an HMAC signing
+  secret (a security-best-practice operation) was to delete +
+  recreate, which **rotates the id**. That breaks any caller
+  holding the existing id (the operator's own dashboard, automated
+  config sync, etc). The new PATCH endpoint updates `url` and/or
+  `secret` in place — id stays.
+  - `UpdateSubscriberBody { url: Option<String>, secret: Option<String> }`.
+    Per-field semantics: omitted (or `null`) → leave alone; supplied
+    → update. Empty body `{}` is a 200 no-op (only `updated_at`
+    advances — that's the audit signal).
+  - Same validation as create: URL must be `http(s)://` if
+    supplied; secret must be non-empty if supplied. Validation
+    runs **before** the existence check so a malformed request
+    gets the right error class regardless of whether the
+    subscriber exists.
+  - Tenant-scoped: cross-tenant ids 404 (parity with
+    get/disable/enable/delete — existence never confirmed across
+    tenants).
+  - Response redacts the secret — the rotated secret is in the
+    request, never the response. Same redaction policy as the
+    other read endpoints.
+  - New `SubscriberStore::patch(id, url, secret, now)` primitive
+    on both backends. The SQLite path uses read-modify-write so
+    the per-field "None means leave alone" semantics match
+    in-memory exactly without writing five SQL UPDATE permutations.
+  - Wired into `openapi.rs` paths + the new `UpdateSubscriberBody`
+    schema. Openapi test extended: subscribers/{id} now declares
+    GET + PATCH + DELETE; PATCH must declare a typed `requestBody`.
+  - 5 new tests in `tests/webhook_subscribers.rs` (18 total now):
+    PATCH rotates secret in place without changing id (events
+    keep flowing under the new HMAC); PATCH updates URL with
+    secret unchanged; empty body is a no-op 200 with refreshed
+    `updated_at`; validation rejects empty/non-http URL and empty
+    secret; cross-tenant PATCH returns 404.
+
+- **`POST /icp/v1/webhook_subscribers/:id/enable`** — closes the
+  inverse of the existing `disable` endpoint. Previously a
+  disabled subscriber could only be re-activated by delete +
+  recreate, which **rotates both the id and the secret** —
+  disruptive when an operator just wants to bring a maintenance-
+  window-disabled receiver back online without churning the
+  verifier configuration on the downstream side.
+  - Same shape as `disable`: tenant-scoped, 404 on cross-tenant
+    (existence not leaked), returns the updated row with the
+    secret redacted. Idempotent — calling `enable` on an
+    already-active subscriber is a no-op 200.
+  - Internal refactor: `disable_webhook_subscriber` and
+    `enable_webhook_subscriber` now both delegate to a shared
+    `set_webhook_subscriber_active(state, id, headers, active)`
+    helper so the tenant-isolation logic lives in one place.
+  - Wired into `openapi.rs` paths registry; the openapi test's
+    path enumeration extended to cover the new route.
+  - 3 new tests in `tests/webhook_subscribers.rs` (13 total now):
+    enable re-activates a disabled subscriber and the same id +
+    secret are preserved (events resume flowing); enable on
+    already-active is an idempotent no-op; cross-tenant enable →
+    404 (parity with `get`/`disable`/`delete`).
+
+- **Quote-expiry sweeper** — closes a real consistency bug:
+  `transaction.quote_expires_at` and `peer_quote.expires_at` were
+  stored at quote creation but nothing previously enforced them.
+  A customer could quote at price X, walk away, then come back
+  hours/days later and authorize at the original price even though
+  the merchant's pricing/inventory had moved on. Same risk on the
+  A2A side: a peer quote with a stale price could be paid against
+  long after the peer would still honor it. The sweeper transitions
+  both kinds to the terminal `Expired` state once their deadline
+  passes:
+  - New `IcpService::tick_expiries(now) -> ExpiryTickReport`.
+    Sweeps **transactions** with `quote_expires_at <= now` AND
+    state ∈ `{Draft, Quoted}` (Authorized/Captured/Completed are
+    **never** touched — the caller has moved past the quote-
+    validity window). Sweeps **peer quotes** with
+    `expires_at <= now` AND status ∈ `{Pending, Quoted}`.
+    Each transition emits a `transaction.expired` /
+    `peer_quote.expired` event onto the originating tenant's
+    webhook outbox + SSE stream.
+  - New `scheduler::run_expiry_loop(service, period)` sweeper
+    spawned from `lib.rs::main_loop` alongside the subscription
+    scheduler, webhook worker, and idempotency sweeper.
+  - New config knob `ICP_EXPIRY_SWEEPER_INTERVAL_SECONDS`
+    (default `60` — sub-minute resolution on quote validity).
+    `Config::for_test()` defaults to `0` so tests drive
+    `tick_expiries(now)` directly.
+  - **Two new Prometheus series**:
+    - `icp_expiries_total{kind}` — counter, `kind` ∈
+      `{transaction, peer_quote}`. Sudden spike can indicate the
+      authorization path is broken (legitimate users can't
+      convert and quotes age out).
+    - `icp_expiry_sweeper_ticks_total` — liveness counter
+      (advances on no-op ticks too).
+  - New `PeerQuoteStore::list_all(limit)` — operator-level scan
+    across all tenants. The user-facing list endpoint stays
+    tenant-scoped; the sweeper needs unrestricted view.
+  - 5-test integration suite (`tests/expiry_sweeper.rs`):
+    Draft/Quoted txns past expiry transition to Expired while
+    fresh ones stay; Authorized/Completed/no-expiry txns are
+    NEVER touched even when ancient (the critical safety
+    property); same shape for Pending/Quoted peer quotes vs
+    Accepted; expiry events fan out per-tenant to the originating
+    tenant's outbox without leaking across tenants; second sweep
+    after expiry is a true no-op (no double-emission of events);
+    metrics path bumps liveness counter on zero-effect ticks too.
+
+- **Idempotency cache TTL sweeper** — closes the same
+  unbounded-growth gap on the second-largest table after the
+  outbox. Lazy TTL at lookup time already prevents stale entries
+  from being replayed (`now - created_at > ttl` → returns `Miss`),
+  but the row was never reclaimed — so the `idempotency` table
+  grew forever for any tenant generating fresh idempotency keys.
+  After a few months of production traffic the table dominates
+  the DB just like the outbox would have. The fix is a background
+  sweeper that runs every hour:
+  - New `IdempotencyStore::prune(now) -> usize` primitive on
+    both backends. In-memory `retain` filter, SQLite
+    `DELETE WHERE created_at < ?`. Returns the row count for
+    metrics. Cutoff is `now - ttl` (default 24h).
+  - New `idempotency::run_sweeper_loop(store, period)` — same
+    shape as `webhook::run_loop` and `scheduler::run_loop`.
+    Spawned alongside the other workers in
+    `lib.rs::main_loop`.
+  - New config knob `ICP_IDEMPOTENCY_SWEEPER_INTERVAL_SECONDS`
+    (default `3600`). `Config::for_test()` defaults to `0` so
+    the background sweeper never races against test clocks —
+    tests drive `prune(now)` directly.
+  - **Two new Prometheus series**:
+    - `icp_idempotency_pruned_total` — counter of rows reclaimed
+      across the sweeper's lifetime. Sustained nonzero rate is
+      the signal that retention is doing its job.
+    - `icp_idempotency_sweeper_ticks_total` — liveness counter,
+      bumped on every tick including no-op ticks. Alert on
+      rate-of-change dropping (sweeper stuck).
+  - 5-test integration suite (`tests/idempotency_sweeper.rs`):
+    expired entries on both backends are deleted while in-TTL
+    entries stay; no-op when nothing has expired; after a sweep,
+    re-using the pruned key with a *different* body returns
+    `Miss` (lets the tenant store fresh content) instead of
+    leaving a hidden row that could trip future replays;
+    `record_idempotency_sweep` bumps both counters and the
+    liveness counter ticks even on zero-prune sweeps.
+
+- **Webhook outbox retention sweep** — closes a real production
+  durability gap: without TTL-based pruning the outbox grows
+  unbounded, since every successful delivery and every dead-lettered
+  row stays forever. After a few months of production traffic the
+  table dominates the DB and the queue-depth gauge becomes
+  meaningless. The fix runs a sweep on every worker tick:
+  - Two new config knobs:
+    - `ICP_WEBHOOK_RETAIN_DELIVERED_DAYS` (default `7`) — how long
+      to keep `delivered` rows. Successful deliveries are
+      historical only; no retry path uses them.
+    - `ICP_WEBHOOK_RETAIN_DEAD_LETTERED_DAYS` (default `30`) —
+      how long to keep `dead_lettered` rows. Longer than
+      delivered because operators may still want to inspect a
+      dead destination and trigger a manual `retry`.
+    - Setting either to `0` disables that side of the sweep.
+      `Config::for_test()` defaults to `0/0` so existing webhook
+      tests pass byte-for-byte without churn.
+  - **Pending, in_flight, and failed rows are NEVER pruned** —
+    the worker still owns those and pruning them would lose
+    work. Only `delivered` and `dead_lettered` rows have stable
+    "this is operationally final" semantics.
+  - `WebhookOutbox::prune(delivered_cutoff, dead_lettered_cutoff)`
+    primitive on both backends (in-memory `retain` filter, SQLite
+    `DELETE WHERE status = ? AND created_at < ?`). `WebhookWorker`
+    gains `with_retention(delivered_days, dead_lettered_days)`
+    and a `prune_now(now)` method that the run loop calls after
+    every `tick()`. Cutoffs are computed against `created_at`
+    (when the row entered the outbox), not `updated_at` —
+    operator-meaningful retention is "how long has this row
+    existed."
+  - New Prometheus counter
+    **`icp_webhook_outbox_pruned_total{reason}`** (`reason` ∈
+    `{delivered, dead_lettered}`) — operators dashboard the rate
+    to see the system actively bounding the outbox. A sustained
+    nonzero rate means retention is doing its job.
+  - 7-test integration suite (`tests/webhook_pruning.rs`):
+    delivered/dead-lettered cutoffs each delete only their own
+    status; `pending`/`in_flight`/`failed` rows are never touched
+    even when ancient; `None` cutoff is a per-side no-op;
+    `with_retention(0, 0)` is a full no-op (keeps existing tests
+    passing); `with_retention(>0, >0)` computes cutoffs from `now`
+    and deletes accordingly; counter advances on real prune;
+    SQLite backend matches in-memory semantics exactly.
+
+- **`GET /icp/v1/peer_quotes` list endpoint** — completes the
+  resource-list trio (transactions + subscriptions + peer quotes
+  now all have parallel list endpoints). A2A operators can finally
+  enumerate their tenant's peer quotes through the API instead of
+  needing every id ahead of time. Same shape as the other two:
+  - Tenant-scoped (rows where `tenant_id` matches the bearer key).
+  - `?status=pending|quoted|accepted|expired|rejected` filter;
+    unknown value → **400** with the bad value echoed.
+  - `?limit=` capped at 500 (default 100).
+  - Newest-first sort by `created_at`; empty result → **200** with
+    `{count: 0, data: []}`, never 404.
+  - New `PeerQuoteStore::list_for_tenant(tenant_id, limit, status)`
+    follows the established pattern.
+  - 3 new tests in `tests/list_endpoints.rs` (12 total now):
+    tenant isolation, status filter, unknown-status 400. Auth-401
+    coverage extended to include the new path. OpenAPI test
+    coverage extended to include `/icp/v1/peer_quotes`.
+
+- **OpenAPI sync: 8 new endpoints + 4 new schemas** — every route
+  added across the recent multi-tenancy + ops iterations is now
+  declared in `/openapi.json`. Without these, an SDK generator
+  (`openapi-generator`, `oapi-codegen`, Stainless) fed the
+  handler's spec would skip these endpoints entirely — the routes
+  exist on the wire but no client can model them. The fix:
+  - `#[utoipa::path]` annotations added to 6 previously-unannotated
+    handlers: `retry_webhook_delivery`, `create_webhook_subscriber`,
+    `list_webhook_subscribers`, `get_webhook_subscriber`,
+    `disable_webhook_subscriber`, `delete_webhook_subscriber`. Each
+    declares its full response set (200 / 400 / 404 as
+    appropriate) and request bodies where they exist.
+  - The two new list endpoints from the prior iteration
+    (`list_transactions`, `list_subscriptions`) wired into the
+    paths registry — already had annotations, just needed
+    registration.
+  - Four new component schemas exposed: `WebhookDelivery`,
+    `DeliveryStatus`, `WebhookSubscriber`, `CreateSubscriberBody`.
+    Each gains `#[derive(utoipa::ToSchema)]` so the generated
+    document carries the typed shapes SDK clients need to model the
+    operator surface.
+  - Two new openapi tests: one asserts the
+    `/icp/v1/webhook_subscribers` collection path declares both
+    GET (list) and POST (create) operations and that POST has a
+    typed `requestBody`; the existing path-coverage and
+    schema-coverage tests are extended to enumerate the 6 new
+    paths and 4 new schemas. Drops in OpenAPI sync now fail loud
+    in CI rather than silently shrinking the contract surface.
+
+- **Tenant-scoped list endpoints for transactions and subscriptions** —
+  closes a real ergonomic gap: previously a tenant had no API path to
+  enumerate their own transactions or subscriptions. Operators had to
+  hold every id in a side store or query the SQLite DB directly.
+  Two new routes mirror the shape of `GET /icp/v1/webhook_deliveries`:
+  - `GET /icp/v1/transactions` — caller's tenant rows, newest first.
+    `?state=…` filters by FSM state
+    (`draft|quoted|authorized|captured|fulfilled|completed|reversed|canceled|expired`).
+    `?limit=…` page-size cap (default 100, hard max 500). Unknown
+    state value → **400** with the bad value echoed (silent-empty
+    would mask typos).
+  - `GET /icp/v1/subscriptions` — same shape, `?status=…` ∈
+    `{active, paused, canceled, past_due}`.
+  - Empty result → **200** with `{count: 0, data: []}` (never 404 —
+    no rows is a successful zero-row list, not a missing resource).
+  - New `TransactionStore::list_for_tenant(tenant_id, limit, state)`
+    and `SubscriptionStore::list_for_tenant(tenant_id, limit, status)`
+    methods. Materialise rows from the JSON-blob store, filter by
+    tenant, then optionally by state/status, sort newest-first by
+    `created_at`, truncate to `limit`. The blob storage shape has no
+    indexable `tenant_id` column — same constraint as
+    `SubscriptionStore::status_counts` from the metrics iteration.
+  - 9-test integration suite (`tests/list_endpoints.rs`):
+    tenant-scoping (A never sees B's rows), state/status narrowing,
+    unknown filter → 400 with echoed bad value, empty list → 200
+    not 404, `?limit=` clamping, unauthenticated reads → 401.
+
+- **Subscription scheduler Prometheus metrics** — completes the
+  observability story for the second background loop in production.
+  Operators now have scrape-able views for both the webhook outbox
+  (last iteration) and the subscription scheduler. Three new
+  series surface on `/metrics`:
+  - **`icp_subscription_renewals_total{outcome}`** — counter,
+    bumped per renewal transition. `outcome` is `renewed`,
+    `failed`, or `past_due`. Alert on a rising `past_due` rate
+    (payment infrastructure is degraded, or a customer cohort is
+    failing at unusual rates) — the difference between `failed`
+    and `past_due` is exactly one dunning-schedule exhaustion.
+  - **`icp_subscriptions_by_status{status}`** — gauge, refreshed
+    at end of every scheduler tick. `status` ∈
+    `{active, paused, canceled, past_due}`. Dashboard `active`
+    for headcount stability and `past_due` to alert on dunning
+    failures requiring operator intervention.
+  - **`icp_subscription_scheduler_ticks_total`** — liveness
+    counter; alert on rate-of-change dropping (scheduler stuck or
+    crashed).
+  - New `SubscriptionStore::status_counts() -> SubscriptionStatusCounts`
+    method materialises all subscription rows and tallies by
+    status. The JSON-blob storage shape has no indexable `status`
+    column so a `GROUP BY` isn't an option here (unlike
+    `webhook_deliveries`); cost is bounded by the same
+    `usize::MAX` list call the scheduler already does each tick.
+  - `metrics::record_subscription_renewal(outcome)` is called
+    inside `tick_subscriptions` per FSM transition;
+    `metrics::record_subscription_scheduler_tick(&counts)` is
+    called from `scheduler::run_loop` after each tick. Same
+    pattern as the webhook metrics — production traffic exercises
+    the metrics path.
+  - 4-test integration suite (`tests/scheduler_metrics.rs`):
+    `status_counts` returns correct distribution after direct
+    state mutation; renewed counter advances on a pre-staged due
+    subscription; failed counter advances when an A2A payment
+    instrument is rejected (mirrors the existing
+    `repeated_failures_transition_to_past_due` failure rig);
+    `/metrics` exposes all three series with their HELP/TYPE
+    headers and the gauge value matches the actual
+    subscription-store snapshot.
+
+- **Webhook outbox Prometheus metrics** — operators now have a
+  scrape-able view of the durable outbox without needing to query
+  the SQLite store. Three new series surface on `/metrics`:
+  - **`icp_webhook_deliveries_total{outcome}`** — counter, bumped
+    once per worker delivery transition. `outcome` is `delivered`,
+    `failed`, or `dead_lettered`. Alert on a sustained
+    `dead_lettered` rate (a destination is broken and ops needs
+    to manually retry) or a high `failed` ratio (a destination is
+    flapping).
+  - **`icp_webhook_outbox_queue_depth{status}`** — gauge,
+    refreshed at the end of every worker tick. `status` is one of
+    the five FSM states (`pending`, `in_flight`, `delivered`,
+    `failed`, `dead_lettered`). Alert on `pending` rising
+    monotonically (backlog growing — the worker can't keep up) or
+    on `dead_lettered > 0` (any dead letter requires operator
+    attention).
+  - **`icp_webhook_worker_ticks_total`** — counter, bumped on
+    every tick (including ticks that processed zero rows). Alert
+    on the rate-of-change dropping (worker stuck or crashed).
+  - New `WebhookOutbox::status_counts() -> StatusCounts` method
+    powers the gauge refresh — runs a single `GROUP BY status`
+    query against SQLite, or a single iteration of the in-memory
+    map, on each tick. The cost is bounded by the number of
+    outbox rows (which is the same bound `list_recent` already
+    accepts).
+  - New `metrics::record_webhook_delivery(outcome)` and
+    `metrics::record_webhook_tick(&counts)` helpers — called from
+    `WebhookWorker::tick` (per delivery transition) and from
+    `webhook::run_loop` (after the tick returns) respectively, so
+    the metrics path is exercised by the same code that drives
+    real production traffic.
+  - 4-test integration suite (`tests/webhook_metrics.rs`):
+    `status_counts` returns correct counts on both backends
+    (in-memory + SQLite-backed via real intent activity); worker
+    tick advances the `delivered` counter against a real test
+    server; `/metrics` exposes all three series with their HELP
+    and TYPE headers and the gauge value matches the actual
+    outbox snapshot.
+
+- **Tenant scoping for `/icp/v1/mandates/:jti/usage`** — closes the
+  last cross-tenant leak on the resource read endpoints. Previously
+  any authenticated caller could `GET /icp/v1/mandates/{jti}/usage`
+  and read another tenant's spend tally — useful intel on a
+  competitor's transaction velocity, mandate budgets, and renewal
+  windows. Worse, it returned a `200` with `spent_minor: 0` for
+  unknown jtis, which let callers enumerate the jti space by
+  watching for non-zero responses.
+  - **First-spender owns the readable view.** The first tenant to
+    record spend against a mandate jti claims ownership of the
+    tally; only that tenant can read it via the API. Subsequent
+    spend recorded against the same jti from any tenant *still
+    consumes the shared budget* — the principal who issued the
+    mandate is protected from double-dipping by a leaked JTI — but
+    those spenders cannot read the aggregated total.
+  - `MandateUsage` gains a `tenant_id` field; `MandateLedger`
+    gains a `usage_for_tenant(jti, tenant_id) -> Option<MandateUsage>`
+    method that returns `None` for non-owners and for never-spent
+    jtis. `record_spend` signature now takes `tenant_id` (call sites
+    in `service.rs` + tests updated).
+  - The handler endpoint now returns **404** for cross-tenant reads
+    AND for never-spent jtis — same shape, so jti space is no
+    longer probable. Owning-tenant reads return 200 with the full
+    tally as before.
+  - Schema: `tenant_id` column added to `mandate_usage` via the
+    additive-migration mechanism. The UPSERT preserves the original
+    owner via `COALESCE(NULLIF(mandate_usage.tenant_id, ''),
+    excluded.tenant_id)` so subsequent spends never overwrite the
+    first spender. Pre-multi-tenant rows backfill to '', invisible
+    to any real tenant — same legacy policy as the other
+    tenant-scoped tables.
+  - 5-test integration + unit suite (`tests/mandate_usage_isolation.rs`):
+    first-spender owns the view; second spender consumes budget but
+    cannot read tally; never-spent jti returns 404 (not empty 200);
+    unauthenticated read 401s; direct-ledger unit test exercises
+    the same primitives end-to-end.
+
+- **Tenant scoping for `/icp/v1/receipts/:jti`** — closes the same
+  cross-tenant leak on the receipt read endpoint. Receipts contain
+  the signed response body, so reading another tenant's receipt
+  exposes their full transaction details (totals, customer info,
+  line items, mandate jti). Unlike the other resources, receipts
+  don't get a new `tenant_id` field — the signed claims shape is
+  wire-stable and changing it would break receipt verifiers
+  (including the conformance harness). Instead, ownership is
+  *derived* at read time:
+  - The handler reads the receipt's `claims.icp.transaction_id`,
+    looks up the transaction, and compares the transaction's
+    `tenant_id` against the bearer's. Mismatch → **404** (not
+    403), same shape as a missing jti, so existence isn't leaked.
+  - Receipts whose backing transaction has been GC'd, never
+    existed, or pre-dates `tenant_id` stamping (`tenant_id == ""`)
+    are unreadable to any real tenant. Conservative default —
+    rather than expose every legacy receipt to whoever asks first,
+    they're hidden entirely. Operators with direct DB access still
+    have them.
+  - 4-test integration suite (`tests/receipt_isolation.rs`):
+    same-tenant read works and exposes the join-key
+    `transaction_id`; cross-tenant read 404s; unknown jti 404s;
+    legacy receipt with empty-string tenant_id on its transaction
+    is invisible to any real tenant; unauthenticated read 401s.
+
 - **Tenant scoping for resource read endpoints** — closes the same
   multi-tenancy gap on the per-resource read paths that the prior
   iteration closed for `webhook_deliveries`. Previously any

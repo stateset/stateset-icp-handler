@@ -119,6 +119,61 @@ impl ReceiptStore {
         }
     }
 
+    /// Operator-level cross-tenant scan ordered newest-first by
+    /// `claims.iat`. The route handler joins each row to the
+    /// underlying transaction and filters out cross-tenant rows
+    /// before returning to the caller — receipts don't carry a
+    /// `tenant_id` field of their own (the signed claims shape is
+    /// wire-stable).
+    pub fn list_recent(&self, limit: usize) -> Vec<StoredReceipt> {
+        let mut all = match &self.backend {
+            ReceiptBackend::Memory(inner) => inner
+                .read()
+                .expect("receipt store read")
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ReceiptBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("receipt pool acquire");
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT jti, kid, jws, body_digest, claims_json \
+                         FROM receipts ORDER BY created_at DESC LIMIT ?1",
+                    )
+                    .expect("prepare receipts list_recent");
+                let rows = stmt
+                    .query_map(rusqlite::params![limit as i64], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })
+                    .expect("query receipts list_recent");
+                rows.filter_map(Result::ok)
+                    .filter_map(|(jti, kid, jws, body_digest, claims_json)| {
+                        serde_json::from_str::<ReceiptClaims>(&claims_json)
+                            .ok()
+                            .map(|claims| StoredReceipt {
+                                jti,
+                                kid,
+                                jws,
+                                body_digest,
+                                claims,
+                            })
+                    })
+                    .collect()
+            }
+        };
+        // Sort by signed-at timestamp regardless of backend so the
+        // in-memory tests get the same ordering as production.
+        all.sort_by(|a, b| b.claims.iat.cmp(&a.claims.iat));
+        all.truncate(limit);
+        all
+    }
+
     pub fn len(&self) -> usize {
         match &self.backend {
             ReceiptBackend::Memory(inner) => inner.read().expect("receipt store read").len(),

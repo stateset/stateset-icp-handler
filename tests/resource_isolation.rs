@@ -299,3 +299,158 @@ async fn unauthenticated_resource_reads_are_rejected() {
         );
     }
 }
+
+#[tokio::test]
+async fn cross_tenant_transaction_intents_return_404() {
+    let (_state, app) = build(vec![key("a", "tenant_a"), key("b", "tenant_b")]).await;
+    let txn_a = quote_returns_txn_id(&app, "k_a").await;
+
+    for (intent, params) in [
+        (
+            "intent.authorize",
+            json!({ "transaction_id": txn_a.clone(), "buyer": { "email": "b@example.com" } }),
+        ),
+        ("intent.track", json!({ "transaction_id": txn_a.clone() })),
+        ("intent.return", json!({ "transaction_id": txn_a.clone() })),
+        (
+            "intent.negotiate",
+            json!({ "transaction_id": txn_a.clone(), "discount_pct": 10.0 }),
+        ),
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/icp/v1/intents",
+            "k_b",
+            Some(json!({
+                "intent": intent,
+                "agent_id": AGENT,
+                "params": params
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{intent} must not reveal or mutate another tenant's transaction: {body}"
+        );
+    }
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/icp/v1/intents",
+        "k_a",
+        Some(json!({
+            "intent": "intent.authorize",
+            "agent_id": AGENT,
+            "params": { "transaction_id": txn_a }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/icp/v1/intents",
+        "k_b",
+        Some(json!({
+            "intent": "intent.buy",
+            "agent_id": AGENT,
+            "params": {
+                "transaction_id": txn_a,
+                "payment": { "method": "card", "token": "tok_cross" }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-tenant buy must not complete another tenant's transaction: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cross_tenant_subscription_intents_return_404() {
+    let (_state, app) = build(vec![key("a", "tenant_a"), key("b", "tenant_b")]).await;
+    let sub_a = subscribe_returns_sub_id(&app, "k_a").await;
+
+    for (intent, params) in [
+        (
+            "intent.renew",
+            json!({
+                "subscription_id": sub_a.clone(),
+                "payment": { "method": "card", "token": "tok_renew" }
+            }),
+        ),
+        ("intent.pause", json!({ "subscription_id": sub_a.clone() })),
+        (
+            "intent.cancel_subscription",
+            json!({ "subscription_id": sub_a.clone() }),
+        ),
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/icp/v1/intents",
+            "k_b",
+            Some(json!({
+                "intent": intent,
+                "agent_id": AGENT,
+                "params": params
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{intent} must not reveal or mutate another tenant's subscription: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_tenant_a2a_pay_returns_404_even_with_same_agent_id() {
+    let (_state, app) = build(vec![key("a", "tenant_a"), key("b", "tenant_b")]).await;
+    let (status, quoted) = send(
+        &app,
+        "POST",
+        "/icp/v1/intents",
+        "k_a",
+        Some(json!({
+            "intent": "intent.a2a_quote",
+            "agent_id": AGENT,
+            "params": {
+                "peer_agent_id": "did:stateset:agent:peer",
+                "service": {
+                    "kind": "compute",
+                    "description": "tenant-isolated job"
+                },
+                "price_hint": { "amount_minor": 500, "currency": "USD" }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "quote setup failed: {quoted}");
+    let quote_id = quoted["peer_quote"]["id"].as_str().unwrap();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/icp/v1/intents",
+        "k_b",
+        Some(json!({
+            "intent": "intent.a2a_pay",
+            "agent_id": AGENT,
+            "params": { "peer_quote_id": quote_id, "from": "0xb" }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "tenant B must not consume tenant A's peer quote even with matching requester_agent_id: {body}"
+    );
+}

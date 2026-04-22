@@ -89,6 +89,15 @@ fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         // any real tenant_id but still queryable for ops by string
         // comparison, which is the desired isolation property.
         "ALTER TABLE webhook_deliveries ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+        // tenant_id on mandate_usage records the *first* tenant to
+        // spend against this mandate (the owner). The
+        // `GET /icp/v1/mandates/:jti/usage` endpoint scopes reads by
+        // this column so cross-tenant probes return 404. Spend
+        // recording from any tenant continues to count toward the
+        // shared budget — that protects the principal who issued the
+        // mandate. Pre-multi-tenant rows backfill to '', invisible to
+        // any real tenant.
+        "ALTER TABLE mandate_usage ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
     ];
     for stmt in COLUMN_ADDITIONS {
         match conn.execute(stmt, []) {

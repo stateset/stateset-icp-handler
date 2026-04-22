@@ -104,6 +104,14 @@ struct JwsHeader {
 pub struct MandateUsage {
     pub spent_minor: i64,
     pub window_start: Option<DateTime<Utc>>,
+    /// Tenant that first recorded spend against this mandate. Empty
+    /// string for legacy rows written before the field existed (and
+    /// before the multi-tenant work in general). The
+    /// `GET /icp/v1/mandates/:jti/usage` endpoint refuses cross-tenant
+    /// reads by comparing against this — first-spender owns the
+    /// readable view. Subsequent spenders still consume the shared
+    /// budget (protecting the principal) but cannot read the tally.
+    pub tenant_id: String,
 }
 
 /// Mandate usage ledger. Backed either by an in-process `HashMap` (tests,
@@ -160,17 +168,22 @@ impl MandateLedger {
                 .unwrap_or_default(),
             MandateBackend::Sqlite(pool) => {
                 let conn = pool.get().expect("mandate ledger pool acquire");
-                let row: rusqlite::Result<(i64, Option<String>)> = conn.query_row(
-                    "SELECT spent_minor, window_start FROM mandate_usage WHERE jti = ?1",
+                // tenant_id is fetched but defaulted on read so this query
+                // also works against pre-migration databases (the column
+                // wouldn't exist; `unwrap_or_default()` collapses both
+                // missing-column and NULL into "").
+                let row: rusqlite::Result<(i64, Option<String>, Option<String>)> = conn.query_row(
+                    "SELECT spent_minor, window_start, tenant_id FROM mandate_usage WHERE jti = ?1",
                     rusqlite::params![jti],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok())),
                 );
                 match row {
-                    Ok((spent_minor, window_start_str)) => MandateUsage {
+                    Ok((spent_minor, window_start_str, tenant_id)) => MandateUsage {
                         spent_minor,
                         window_start: window_start_str
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&Utc)),
+                        tenant_id: tenant_id.unwrap_or_default(),
                     },
                     Err(rusqlite::Error::QueryReturnedNoRows) => MandateUsage::default(),
                     Err(e) => panic!("mandate ledger read: {e}"),
@@ -179,7 +192,28 @@ impl MandateLedger {
         }
     }
 
-    pub fn record_spend(&self, jti: &str, amount_minor: i64, now: DateTime<Utc>) {
+    /// Tenant-scoped read. Returns `None` if no spend has been
+    /// recorded **or** if the calling tenant doesn't own the mandate
+    /// (i.e. wasn't the first spender). Routes that surface this
+    /// should map both cases to a 404 so existence isn't leaked.
+    /// Empty `tenant_id` rows are *not* matched by any real tenant —
+    /// see schema migration notes for the legacy-row policy.
+    pub fn usage_for_tenant(&self, jti: &str, tenant_id: &str) -> Option<MandateUsage> {
+        let usage = self.usage(jti);
+        // No spend recorded → no row → no tenant; treat as miss so
+        // the route doesn't fabricate a "you own this empty bucket"
+        // response for a jti the caller has never used.
+        if usage.window_start.is_none() && usage.spent_minor == 0 && usage.tenant_id.is_empty() {
+            return None;
+        }
+        if usage.tenant_id == tenant_id {
+            Some(usage)
+        } else {
+            None
+        }
+    }
+
+    pub fn record_spend(&self, jti: &str, tenant_id: &str, amount_minor: i64, now: DateTime<Utc>) {
         match &self.backend {
             MandateBackend::Memory(inner) => {
                 let mut guard = inner.write().expect("mandate ledger write");
@@ -187,20 +221,27 @@ impl MandateLedger {
                 if entry.window_start.is_none() {
                     entry.window_start = Some(now);
                 }
+                if entry.tenant_id.is_empty() {
+                    entry.tenant_id = tenant_id.to_string();
+                }
                 entry.spent_minor = entry.spent_minor.saturating_add(amount_minor);
             }
             MandateBackend::Sqlite(pool) => {
                 let conn = pool.get().expect("mandate ledger pool acquire");
-                // UPSERT: preserve the original window_start (only set on first
-                // spend for a given jti), saturating_add on spent_minor. Mirrors
-                // the in-memory semantics exactly — lazy window reset still
-                // happens at read time in `evaluate()`.
+                // UPSERT: preserve the original window_start AND
+                // tenant_id (only set on first spend for a given jti),
+                // saturating_add on spent_minor. Mirrors the in-memory
+                // semantics. The COALESCE(NULLIF(..., ''), ...) guard
+                // keeps the existing tenant_id sticky if it's already
+                // a non-empty string, while letting a non-empty new
+                // tenant_id claim a legacy '' row.
                 conn.execute(
-                    "INSERT INTO mandate_usage (jti, spent_minor, window_start) \
-                     VALUES (?1, ?2, ?3) \
+                    "INSERT INTO mandate_usage (jti, spent_minor, window_start, tenant_id) \
+                     VALUES (?1, ?2, ?3, ?4) \
                      ON CONFLICT(jti) DO UPDATE SET \
-                         spent_minor = MIN(9223372036854775807, mandate_usage.spent_minor + excluded.spent_minor)",
-                    rusqlite::params![jti, amount_minor, now.to_rfc3339()],
+                         spent_minor = MIN(9223372036854775807, mandate_usage.spent_minor + excluded.spent_minor), \
+                         tenant_id = COALESCE(NULLIF(mandate_usage.tenant_id, ''), excluded.tenant_id)",
+                    rusqlite::params![jti, amount_minor, now.to_rfc3339(), tenant_id],
                 )
                 .expect("mandate ledger write");
             }

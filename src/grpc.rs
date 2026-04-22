@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::agent::{AgentIdentifier, ApiKeyStore};
+use crate::agent::{AgentIdentifier, ApiKeyInfo, ApiKeyStore};
 use crate::discovery;
 use crate::models::IntentEnvelope;
 use crate::service::{IcpService, IntentInput};
@@ -62,18 +62,27 @@ impl IcpHandler for GrpcHandler {
     ) -> Result<Response<IntentResponse>, Status> {
         let api_key = extract_bearer_metadata(req.metadata())
             .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-        let tenant = self
-            .keys
-            .lookup(&api_key)
-            .ok_or_else(|| Status::unauthenticated("unknown API key"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
 
         let inner = req.into_inner();
         let envelope = inner
             .envelope
             .ok_or_else(|| Status::invalid_argument("envelope required"))?;
+        if self.service.config.require_icp_version
+            && envelope.icp_version != self.service.config.icp_version
+        {
+            return Err(Status::invalid_argument(format!(
+                "ICP version `{}` not supported; expected `{}`",
+                envelope.icp_version, self.service.config.icp_version
+            )));
+        }
+        if self.service.config.require_request_id && envelope.request_id.is_empty() {
+            return Err(Status::invalid_argument("request_id required"));
+        }
         let intent_env: IntentEnvelope = serde_json::from_slice(&inner.payload_json)
             .map_err(|e| Status::invalid_argument(format!("payload_json: {e}")))?;
         let agent = AgentIdentifier::parse(&envelope.agent_id);
+        ensure_agent_allowed(&tenant, &agent)?;
 
         let mandate_jws = if envelope.mandate_jws.is_empty() {
             None
@@ -112,14 +121,22 @@ impl IcpHandler for GrpcHandler {
 
     async fn stream_events(
         &self,
-        _req: Request<EventStreamRequest>,
+        req: Request<EventStreamRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
         use tokio_stream::wrappers::BroadcastStream;
         use tokio_stream::StreamExt;
 
+        let api_key = extract_bearer_metadata(req.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
+        let tenant_id = tenant.tenant_id.clone();
+        let service = self.service.clone();
         let rx = self.service.events.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|evt| match evt {
+        let stream = BroadcastStream::new(rx).filter_map(move |evt| match evt {
             Ok(e) => {
+                if !event_belongs_to_tenant(service.as_ref(), &e, &tenant_id) {
+                    return None;
+                }
                 let payload_json = serde_json::to_vec(&e.payload).unwrap_or_default();
                 Some(Ok(EventMessage {
                     id: e.id,
@@ -138,12 +155,18 @@ impl IcpHandler for GrpcHandler {
         &self,
         req: Request<GetTransactionRequest>,
     ) -> Result<Response<TransactionResponse>, Status> {
+        let api_key = extract_bearer_metadata(req.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
         let inner = req.into_inner();
         let txn = self
             .service
             .transactions
             .get(&inner.transaction_id)
             .ok_or_else(|| Status::not_found("transaction not found"))?;
+        if txn.tenant_id != tenant.tenant_id {
+            return Err(Status::not_found("transaction not found"));
+        }
         let payload_json =
             serde_json::to_vec(&txn).map_err(|e| Status::internal(format!("serialize: {e}")))?;
         Ok(Response::new(TransactionResponse { payload_json }))
@@ -153,12 +176,23 @@ impl IcpHandler for GrpcHandler {
         &self,
         req: Request<GetReceiptRequest>,
     ) -> Result<Response<ReceiptResponse>, Status> {
+        let api_key = extract_bearer_metadata(req.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
         let inner = req.into_inner();
         let r = self
             .service
             .receipts
             .get(&inner.receipt_jti)
             .ok_or_else(|| Status::not_found("receipt not found"))?;
+        let txn_tenant = self
+            .service
+            .transactions
+            .get(&r.claims.icp.transaction_id)
+            .map(|t| t.tenant_id);
+        if txn_tenant.as_deref() != Some(tenant.tenant_id.as_str()) {
+            return Err(Status::not_found("receipt not found"));
+        }
         let payload_json = serde_json::to_vec(&r.claims)
             .map_err(|e| Status::internal(format!("serialize: {e}")))?;
         Ok(Response::new(ReceiptResponse {
@@ -170,22 +204,65 @@ impl IcpHandler for GrpcHandler {
 
     async fn verify_receipt(
         &self,
-        _req: Request<VerifyReceiptRequest>,
+        req: Request<VerifyReceiptRequest>,
     ) -> Result<Response<VerifyReceiptResponse>, Status> {
-        // Full signature verification path is deferred to v0.2.
-        Ok(Response::new(VerifyReceiptResponse {
-            valid: false,
-            kid: self.service.signer.kid.clone(),
-            reason: "verification not yet implemented".into(),
-            payload_json: Vec::new(),
-        }))
+        let api_key = extract_bearer_metadata(req.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
+        let inner = req.into_inner();
+        match self.service.signer.verify_receipt(
+            &inner.receipt_jws,
+            if inner.expected_body_json.is_empty() {
+                None
+            } else {
+                Some(inner.expected_body_json.as_slice())
+            },
+        ) {
+            Ok(claims) => {
+                let txn_tenant = self
+                    .service
+                    .transactions
+                    .get(&claims.icp.transaction_id)
+                    .map(|t| t.tenant_id);
+                if txn_tenant.as_deref() != Some(tenant.tenant_id.as_str()) {
+                    return Ok(Response::new(VerifyReceiptResponse {
+                        valid: false,
+                        kid: self.service.signer.kid.clone(),
+                        reason: "receipt does not belong to caller tenant".into(),
+                        payload_json: Vec::new(),
+                    }));
+                }
+                let payload_json = serde_json::to_vec(&claims)
+                    .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+                Ok(Response::new(VerifyReceiptResponse {
+                    valid: true,
+                    kid: self.service.signer.kid.clone(),
+                    reason: String::new(),
+                    payload_json,
+                }))
+            }
+            Err(reason) => Ok(Response::new(VerifyReceiptResponse {
+                valid: false,
+                kid: self.service.signer.kid.clone(),
+                reason,
+                payload_json: Vec::new(),
+            })),
+        }
     }
 
     async fn get_mandate_usage(
         &self,
         req: Request<GetMandateUsageRequest>,
     ) -> Result<Response<MandateUsageResponse>, Status> {
-        let usage = self.service.mandates.usage(&req.into_inner().mandate_jti);
+        let api_key = extract_bearer_metadata(req.metadata())
+            .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+        let tenant = authenticate_bearer(&self.keys, &api_key)?;
+        let mandate_jti = req.into_inner().mandate_jti;
+        let usage = self
+            .service
+            .mandates
+            .usage_for_tenant(&mandate_jti, &tenant.tenant_id)
+            .ok_or_else(|| Status::not_found("mandate usage not found"))?;
         let payload = serde_json::json!({
             "spent_minor": usage.spent_minor,
             "window_start": usage.window_start,
@@ -194,6 +271,57 @@ impl IcpHandler for GrpcHandler {
             .map_err(|e| Status::internal(format!("serialize: {e}")))?;
         Ok(Response::new(MandateUsageResponse { payload_json }))
     }
+}
+
+fn authenticate_bearer(keys: &ApiKeyStore, bearer: &str) -> Result<ApiKeyInfo, Status> {
+    let tenant = keys
+        .lookup(bearer)
+        .ok_or_else(|| Status::unauthenticated("unknown API key"))?;
+    if tenant.is_expired_at(chrono::Utc::now()) {
+        return Err(Status::unauthenticated("API key expired"));
+    }
+    Ok(tenant)
+}
+
+fn ensure_agent_allowed(tenant: &ApiKeyInfo, agent: &AgentIdentifier) -> Result<(), Status> {
+    if tenant.permits_agent(&agent.raw) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated(format!(
+            "agent `{}` is not allowed for this API key",
+            agent.raw
+        )))
+    }
+}
+
+fn event_belongs_to_tenant(
+    service: &IcpService,
+    event: &crate::events::Event,
+    tenant_id: &str,
+) -> bool {
+    if let Some(txn_id) = event.transaction_id.as_deref() {
+        return service
+            .transactions
+            .get(txn_id)
+            .is_some_and(|t| t.tenant_id == tenant_id);
+    }
+    if let Some(sub_id) = event
+        .payload
+        .get("subscription_id")
+        .and_then(|v| v.as_str())
+    {
+        return service
+            .subscriptions
+            .get(sub_id)
+            .is_some_and(|s| s.tenant_id == tenant_id);
+    }
+    if let Some(peer_quote_id) = event.payload.get("peer_quote_id").and_then(|v| v.as_str()) {
+        return service
+            .peer_quotes
+            .get(peer_quote_id)
+            .is_some_and(|q| q.tenant_id == tenant_id);
+    }
+    false
 }
 
 fn extract_bearer_metadata(md: &tonic::metadata::MetadataMap) -> Option<String> {

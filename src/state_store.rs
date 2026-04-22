@@ -228,6 +228,30 @@ impl TransactionStore {
         self.inner.list(limit)
     }
 
+    /// Tenant-scoped list. Pulls all rows from the JSON-blob backend
+    /// (no indexable `tenant_id` column — same constraint as
+    /// `SubscriptionStore::status_counts`), filters by tenant, then
+    /// optionally by `state` wire name. The route handler caps
+    /// `limit` to a hard maximum so a single request can't pull
+    /// unbounded payloads.
+    pub fn list_for_tenant(
+        &self,
+        tenant_id: &str,
+        limit: usize,
+        state_filter: Option<crate::models::TransactionState>,
+    ) -> Vec<Transaction> {
+        let mut all: Vec<Transaction> = self
+            .inner
+            .list(usize::MAX)
+            .into_iter()
+            .filter(|t| t.tenant_id == tenant_id)
+            .filter(|t| state_filter.is_none_or(|s| t.state == s))
+            .collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.truncate(limit);
+        all
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -289,6 +313,28 @@ impl SubscriptionStore {
         self.inner.list(limit)
     }
 
+    /// Tenant-scoped list for `GET /icp/v1/subscriptions`. Same shape
+    /// as `TransactionStore::list_for_tenant` — filter by tenant,
+    /// then optionally by status wire name, sort newest-first by
+    /// `created_at`, truncate to `limit`.
+    pub fn list_for_tenant(
+        &self,
+        tenant_id: &str,
+        limit: usize,
+        status_filter: Option<crate::models::SubscriptionStatus>,
+    ) -> Vec<Subscription> {
+        let mut all: Vec<Subscription> = self
+            .inner
+            .list(usize::MAX)
+            .into_iter()
+            .filter(|s| s.tenant_id == tenant_id)
+            .filter(|s| status_filter.is_none_or(|x| s.status == x))
+            .collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.truncate(limit);
+        all
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -296,6 +342,36 @@ impl SubscriptionStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Count subscriptions by status. Materialises all rows once and
+    /// tallies in-process — the JSON-blob storage shape has no
+    /// indexable `status` column so a `GROUP BY` isn't an option.
+    /// Used by the scheduler's metrics tick to refresh the
+    /// `icp_subscriptions_by_status` gauge; the cost is bounded by
+    /// the same `usize::MAX` list call the scheduler already does.
+    pub fn status_counts(&self) -> SubscriptionStatusCounts {
+        let mut counts = SubscriptionStatusCounts::default();
+        for sub in self.inner.list(usize::MAX) {
+            match sub.status {
+                crate::models::SubscriptionStatus::Active => counts.active += 1,
+                crate::models::SubscriptionStatus::Paused => counts.paused += 1,
+                crate::models::SubscriptionStatus::Canceled => counts.canceled += 1,
+                crate::models::SubscriptionStatus::PastDue => counts.past_due += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Snapshot of subscription rows by status. Refreshed once per
+/// scheduler tick. Operators dashboard `past_due > 0` to alert on
+/// failed dunning, and watch `active` for headcount stability.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct SubscriptionStatusCounts {
+    pub active: usize,
+    pub paused: usize,
+    pub canceled: usize,
+    pub past_due: usize,
 }
 
 // --------------------------------------------------------------------------
@@ -352,5 +428,35 @@ impl PeerQuoteStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Cross-tenant scan. Used by the expiry sweeper, which is
+    /// operator-level and needs to see every tenant's quotes —
+    /// tenant-scoped read paths use `list_for_tenant` instead.
+    pub fn list_all(&self, limit: usize) -> Vec<PeerQuote> {
+        self.inner.list(limit)
+    }
+
+    /// Tenant-scoped list for `GET /icp/v1/peer_quotes`. Same shape
+    /// as `TransactionStore::list_for_tenant` and
+    /// `SubscriptionStore::list_for_tenant` — filter by tenant, then
+    /// optionally by status, sort newest-first by `created_at`,
+    /// truncate to `limit`.
+    pub fn list_for_tenant(
+        &self,
+        tenant_id: &str,
+        limit: usize,
+        status_filter: Option<crate::models::PeerQuoteStatus>,
+    ) -> Vec<PeerQuote> {
+        let mut all: Vec<PeerQuote> = self
+            .inner
+            .list(usize::MAX)
+            .into_iter()
+            .filter(|q| q.tenant_id == tenant_id)
+            .filter(|q| status_filter.is_none_or(|s| q.status == s))
+            .collect();
+        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.truncate(limit);
+        all
     }
 }

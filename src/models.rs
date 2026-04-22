@@ -327,6 +327,17 @@ pub enum PaymentInstrument {
         #[serde(default)]
         memo: Option<String>,
     },
+    #[serde(rename = "external_authorization")]
+    ExternalAuthorization {
+        /// Payment provider or rail that already authorized/captured
+        /// the funds outside this handler.
+        provider: String,
+        /// Provider authorization/capture id. Required in production
+        /// `external_required` mode.
+        authorization_id: String,
+        #[serde(default)]
+        instrument_hint: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

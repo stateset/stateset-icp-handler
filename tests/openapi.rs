@@ -75,14 +75,23 @@ async fn openapi_json_includes_every_icp_core_path() {
         "/.well-known/icp",
         "/.well-known/icp/jwks.json",
         "/icp/v1/intents",
+        "/icp/v1/transactions",
         "/icp/v1/transactions/{id}",
+        "/icp/v1/subscriptions",
         "/icp/v1/subscriptions/{id}",
+        "/icp/v1/peer_quotes",
         "/icp/v1/peer_quotes/{id}",
+        "/icp/v1/receipts",
         "/icp/v1/receipts/{jti}",
         "/icp/v1/mandates/{jti}/usage",
         "/icp/v1/events:stream",
         "/icp/v1/webhook_deliveries",
         "/icp/v1/webhook_deliveries/{id}",
+        "/icp/v1/webhook_deliveries/{id}/retry",
+        "/icp/v1/webhook_subscribers",
+        "/icp/v1/webhook_subscribers/{id}",
+        "/icp/v1/webhook_subscribers/{id}/disable",
+        "/icp/v1/webhook_subscribers/{id}/enable",
     ];
     for p in expected {
         assert!(
@@ -91,6 +100,48 @@ async fn openapi_json_includes_every_icp_core_path() {
             paths.keys().collect::<Vec<_>>()
         );
     }
+}
+
+#[tokio::test]
+async fn openapi_json_webhook_subscribers_path_supports_post_get_delete() {
+    // The single `/icp/v1/webhook_subscribers/{id}` path is shared by GET
+    // (read) and DELETE (hard-remove). Same path object, two operations.
+    let (_, doc) = get_json("/openapi.json").await;
+    let by_id = doc["paths"]["/icp/v1/webhook_subscribers/{id}"]
+        .as_object()
+        .expect("subscribers/{id} path object");
+    assert!(
+        by_id.contains_key("get"),
+        "GET subscriber should be declared"
+    );
+    assert!(
+        by_id.contains_key("patch"),
+        "PATCH subscriber (URL/secret rotation) should be declared"
+    );
+    assert!(
+        by_id.contains_key("delete"),
+        "DELETE subscriber should be declared"
+    );
+    let patch = &by_id["patch"];
+    assert!(
+        patch["requestBody"].is_object(),
+        "PATCH /webhook_subscribers/{{id}} must declare a requestBody — UpdateSubscriberBody"
+    );
+
+    // The collection path supports GET (list) and POST (create).
+    let collection = doc["paths"]["/icp/v1/webhook_subscribers"]
+        .as_object()
+        .expect("subscribers collection path object");
+    assert!(collection.contains_key("get"));
+    assert!(collection.contains_key("post"));
+
+    // Create endpoint declares its request body (the schema generator
+    // needs this to emit a typed `CreateSubscriberInput` in clients).
+    let post = &collection["post"];
+    assert!(
+        post["requestBody"].is_object(),
+        "POST /webhook_subscribers must declare a requestBody"
+    );
 }
 
 #[tokio::test]
@@ -115,6 +166,13 @@ async fn openapi_json_includes_core_commerce_schemas() {
         "LineItem",
         "ReceiptStub",
         "PaymentInstrument",
+        // Webhook outbox + subscribers — required for SDKs to model the
+        // operator surface (delivery FSM, subscriber CRUD).
+        "WebhookDelivery",
+        "DeliveryStatus",
+        "WebhookSubscriber",
+        "CreateSubscriberBody",
+        "UpdateSubscriberBody",
     ];
     for name in expected {
         assert!(

@@ -291,6 +291,250 @@ async fn disabling_a_subscriber_stops_future_events() {
 }
 
 #[tokio::test]
+async fn enable_re_activates_a_disabled_subscriber() {
+    let (state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "sa").await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // Disable, confirm no new events flow.
+    let (_, _) = send(
+        &app,
+        "POST",
+        &format!("/icp/v1/webhook_subscribers/{id}/disable"),
+        "k_a",
+        None,
+    )
+    .await;
+    let _ = quote(&app, "k_a").await;
+    assert_eq!(
+        state.service.webhook_outbox.list_recent(10).len(),
+        0,
+        "no fan-out while disabled"
+    );
+
+    // Re-enable. The same id stays — critical: a delete+recreate
+    // would have rotated the id and the secret, breaking any
+    // verifier configuration the operator's downstream system
+    // already has cached.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/icp/v1/webhook_subscribers/{id}/enable"),
+        "k_a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id);
+    assert_eq!(body["active"], true);
+
+    // Next quote DOES fan out.
+    let _ = quote(&app, "k_a").await;
+    assert_eq!(
+        state.service.webhook_outbox.list_recent(10).len(),
+        1,
+        "events resume after enable"
+    );
+}
+
+#[tokio::test]
+async fn enable_is_idempotent_on_already_active_subscriber() {
+    // No state-machine churn for an operator who calls enable
+    // twice in quick succession (e.g. an automation script).
+    let (_state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "sa").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["active"], true, "fresh subscriber starts active");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/icp/v1/webhook_subscribers/{id}/enable"),
+        "k_a",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable on active is a no-op 200");
+    assert_eq!(body["active"], true);
+    assert_eq!(body["id"], id);
+}
+
+#[tokio::test]
+async fn patch_rotates_secret_in_place_without_changing_id() {
+    // The whole point of this endpoint: rotating the HMAC secret
+    // (security best practice) without forcing a delete + recreate
+    // that would rotate the id and orphan the downstream verifier.
+    let (state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "old-secret").await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({ "secret": "new-secret" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id, "id MUST NOT change on patch");
+    assert!(
+        body["secret"].is_null() || body.get("secret").is_none(),
+        "patch responses redact secret — it's in the request, not the response"
+    );
+
+    // The new secret is the one used for HMAC signing on next
+    // delivery. Easiest check: the store has it.
+    let stored = state
+        .service
+        .webhook_subscribers
+        .get(&id)
+        .expect("row still exists");
+    assert_eq!(stored.secret.as_deref(), Some("new-secret"));
+    assert_eq!(stored.url, "https://a.example/hook", "url unchanged");
+}
+
+#[tokio::test]
+async fn patch_can_update_url_in_place() {
+    let (state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://old.example/hook", "secret").await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({ "url": "https://new.example/hook" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["url"], "https://new.example/hook");
+
+    // Secret unchanged — the omitted field stays as-is.
+    let stored = state.service.webhook_subscribers.get(&id).unwrap();
+    assert_eq!(stored.secret.as_deref(), Some("secret"));
+}
+
+#[tokio::test]
+async fn patch_with_empty_body_is_a_noop_200() {
+    // Property: an operator can PATCH with `{}` and not corrupt
+    // anything. Both fields default to None → the helper passes
+    // through with no field updates, just a touched updated_at.
+    let (state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "secret").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let original_updated_at = created["updated_at"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let stored = state.service.webhook_subscribers.get(&id).unwrap();
+    assert_eq!(stored.url, "https://a.example/hook");
+    assert_eq!(stored.secret.as_deref(), Some("secret"));
+    assert_ne!(
+        stored.updated_at.to_rfc3339(),
+        original_updated_at,
+        "even a no-op patch refreshes updated_at — that's the audit signal"
+    );
+}
+
+#[tokio::test]
+async fn patch_validates_url_and_secret() {
+    let (_state, app) = build(None, vec![key("a", "tenant_a")]).await;
+    let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "secret").await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // Empty secret → 400. Sending an empty string is a different
+    // intent from omitting (which leaves it alone), and an empty
+    // secret would silently break HMAC verification.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({ "secret": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Non-http(s) URL → 400.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({ "url": "ftp://nope.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Empty URL string → 400.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id}"),
+        "k_a",
+        Some(json!({ "url": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_on_cross_tenant_subscriber_returns_404() {
+    let (_state, app) = build(None, vec![key("a", "tenant_a"), key("b", "tenant_b")]).await;
+    let (_, sub_a) = create_sub(&app, "k_a", "https://a.example/hook", "sa").await;
+    let id_a = sub_a["id"].as_str().unwrap().to_string();
+
+    // Tenant B tries to rotate tenant A's secret → 404, not 403.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/icp/v1/webhook_subscribers/{id_a}"),
+        "k_b",
+        Some(json!({ "secret": "evil" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-tenant patch must look identical to a missing row"
+    );
+}
+
+#[tokio::test]
+async fn enable_on_cross_tenant_subscriber_returns_404() {
+    let (_state, app) = build(None, vec![key("a", "tenant_a"), key("b", "tenant_b")]).await;
+    let (_, sub_a) = create_sub(&app, "k_a", "https://a.example/hook", "sa").await;
+    let id_a = sub_a["id"].as_str().unwrap().to_string();
+
+    // Tenant B tries to enable tenant A's subscriber → 404, not 403.
+    // Same isolation property as get/disable/delete — existence is
+    // never confirmed across tenants.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/icp/v1/webhook_subscribers/{id_a}/enable"),
+        "k_b",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-tenant enable must look identical to a missing row"
+    );
+}
+
+#[tokio::test]
 async fn delete_removes_the_row_entirely() {
     let (state, app) = build(None, vec![key("a", "tenant_a")]).await;
     let (_, created) = create_sub(&app, "k_a", "https://a.example/hook", "sa").await;

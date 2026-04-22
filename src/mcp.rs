@@ -368,9 +368,18 @@ async fn handle_tools_call(
         .keys
         .lookup(bearer)
         .ok_or((-32001, "unknown API key".into()))?;
+    if tenant.is_expired_at(chrono::Utc::now()) {
+        return Err((-32001, "API key expired".into()));
+    }
 
     let agent_raw = format!("did:stateset:agent:mcp-{}", tenant.tenant_id);
     let agent = AgentIdentifier::parse(&agent_raw);
+    if !tenant.permits_agent(&agent.raw) {
+        return Err((
+            -32001,
+            format!("agent `{}` is not allowed for this API key", agent.raw),
+        ));
+    }
 
     // Extract transaction_id + context from arguments (so MCP clients
     // don't have to hand-build the envelope).
