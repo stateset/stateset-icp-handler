@@ -1,0 +1,130 @@
+{
+  "description": "SSE parser golden vectors. Each case gives the on-wire text/event-stream bytes (as a `lines` array joined with `\\n` + trailing `\\n`) and the sequence of SseEvent records a conforming parser must emit. Pins the HTML Living Standard §9.2.6 rules: blank-line dispatch, `:` comment discard, multi-line `data:` concatenation, single-leading-space strip, unknown-field tolerance. Rust handler emits; Python and Go clients parse — passing this suite is evidence the three implementations agree on the wire framing.",
+  "vectors": [
+    {
+      "name": "two_events_basic",
+      "lines": [
+        "id: evt_1",
+        "event: transaction.quoted",
+        "data: {\"transaction_id\":\"txn_1\",\"state\":\"quoted\"}",
+        "",
+        "id: evt_2",
+        "event: transaction.completed",
+        "data: {\"transaction_id\":\"txn_1\",\"state\":\"completed\",\"order_id\":\"ORD-42\"}",
+        ""
+      ],
+      "expected_events": [
+        {
+          "id": "evt_1",
+          "type": "transaction.quoted",
+          "raw": "{\"transaction_id\":\"txn_1\",\"state\":\"quoted\"}",
+          "data": { "transaction_id": "txn_1", "state": "quoted" }
+        },
+        {
+          "id": "evt_2",
+          "type": "transaction.completed",
+          "raw": "{\"transaction_id\":\"txn_1\",\"state\":\"completed\",\"order_id\":\"ORD-42\"}",
+          "data": { "transaction_id": "txn_1", "state": "completed", "order_id": "ORD-42" }
+        }
+      ]
+    },
+    {
+      "name": "multiline_data_concatenates_with_lf",
+      "lines": [
+        "event: bulk.message",
+        "data: first line",
+        "data: second line",
+        "data: third line",
+        ""
+      ],
+      "expected_events": [
+        {
+          "id": "",
+          "type": "bulk.message",
+          "raw": "first line\nsecond line\nthird line",
+          "data": null
+        }
+      ]
+    },
+    {
+      "name": "comments_and_keep_alives_discarded",
+      "lines": [
+        ": keep-alive",
+        ":",
+        ": another comment",
+        "event: ping",
+        "data: pong",
+        ""
+      ],
+      "expected_events": [
+        { "id": "", "type": "ping", "raw": "pong", "data": null }
+      ]
+    },
+    {
+      "name": "unknown_fields_silently_ignored",
+      "lines": [
+        "retry: 5000",
+        "unknown: ignored",
+        "event: subscription.renewed",
+        "weird-field: whatever",
+        "data: {\"subscription_id\":\"sub_3\"}",
+        ""
+      ],
+      "expected_events": [
+        {
+          "id": "",
+          "type": "subscription.renewed",
+          "raw": "{\"subscription_id\":\"sub_3\"}",
+          "data": { "subscription_id": "sub_3" }
+        }
+      ]
+    },
+    {
+      "name": "single_leading_space_stripped_per_spec",
+      "lines": [
+        "data: one-space-stripped",
+        "",
+        "data:  two-space-preserved",
+        "",
+        "data:no-space-after-colon",
+        ""
+      ],
+      "expected_events": [
+        { "id": "", "type": "", "raw": "one-space-stripped", "data": null },
+        { "id": "", "type": "", "raw": " two-space-preserved", "data": null },
+        { "id": "", "type": "", "raw": "no-space-after-colon", "data": null }
+      ]
+    },
+    {
+      "name": "id_only_event_still_dispatches",
+      "lines": [
+        "id: cursor_42",
+        ""
+      ],
+      "expected_events": [
+        { "id": "cursor_42", "type": "", "raw": "", "data": null }
+      ]
+    },
+    {
+      "name": "peer_quote_family_shape",
+      "lines": [
+        "id: evt_peer_1",
+        "event: peer_quote.accepted",
+        "data: {\"peer_quote_id\":\"pq_9\",\"charge_transaction_id\":\"txn_c1\",\"peer_agent_id\":\"did:stateset:agent:compute\"}",
+        ""
+      ],
+      "expected_events": [
+        {
+          "id": "evt_peer_1",
+          "type": "peer_quote.accepted",
+          "raw": "{\"peer_quote_id\":\"pq_9\",\"charge_transaction_id\":\"txn_c1\",\"peer_agent_id\":\"did:stateset:agent:compute\"}",
+          "data": {
+            "peer_quote_id": "pq_9",
+            "charge_transaction_id": "txn_c1",
+            "peer_agent_id": "did:stateset:agent:compute"
+          }
+        }
+      ]
+    }
+  ]
+}

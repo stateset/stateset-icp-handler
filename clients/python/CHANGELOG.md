@@ -10,6 +10,19 @@ and this package tracks the ICP spec-version it targets (see README).
 ## [Unreleased]
 
 ### Added
+- **SSE cross-language golden-vector test**
+  (`tests/test_vectors_sse.py`) — loads the shared fixture at
+  `docs/specification/vectors/sse_events.json` and drives each case
+  through `_parse_sse`. 7 cases covering blank-line dispatch,
+  multi-line `data:` concatenation, comment discard, unknown-field
+  tolerance, single-leading-space strip, id-only-event dispatch,
+  and the peer-quote event family. Paired with the Go equivalent
+  at `clients/go/stateset-icp-go/vectors_sse_test.go` — both
+  parsers produce identical `SseEvent` sequences for the same
+  wire bytes, pinning the text/event-stream framing semantics
+  across languages.
+
+### Added
 - **`examples/anthropic_agent.py`** — Claude driving an ICP merchant
   end-to-end via tool use. Registers five ICP intents
   (`icp_search` / `icp_quote` / `icp_authorize` / `icp_buy` /

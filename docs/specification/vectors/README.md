@@ -9,23 +9,29 @@ implementation must agree on:
   JSON, the payload JSON (JCS-canonicalized per RFC 8785), the b64url
   encodings, and the resulting three-segment JWS given a fixed 32-byte
   Ed25519 seed.
+- **`sse_events.json`** — `text/event-stream` parsing. Pins the HTML
+  Living Standard §9.2.6 rules (blank-line dispatch, comment
+  discard, multi-line `data:` concatenation, single-leading-space
+  strip, unknown-field tolerance) as concrete input → output pairs.
 
 ## How to use these
 
 Implementers of a non-reference handler or client should run these
 vectors through their code and assert byte-equality. A passing
 implementation **will interoperate** with the reference implementation
-on mandate signing and `did:key` construction; a failing one will see
-`signature did not verify against principal keyset` errors even when the
-crypto is correct, because the pre-signing bytes don't match.
+on mandate signing, `did:key` construction, and SSE parsing; a failing
+one will see `signature did not verify against principal keyset` errors
+even when the crypto is correct (for mandate drift), or silently drop
+events (for SSE drift).
 
-Both languages in this repository exercise the vectors:
+The three language clients in this repository exercise the vectors:
 
-- **Rust:** `cargo test --test vectors` (regression — catches any
-  change in the reference implementation).
-- **Python:** `cd clients/python && pytest tests/test_vectors.py`
-  (interop — proves a handwritten client produces the same bytes as
-  the Rust reference).
+- **Rust** (mandate + did:key): `cargo test --test vectors` — regression
+  against any change in the reference implementation.
+- **Python** (mandate + did:key + SSE): `cd clients/python && pytest
+  tests/test_vectors.py tests/test_vectors_sse.py` — interop proof.
+- **Go** (mandate + did:key + SSE): `cd clients/go/stateset-icp-go && go
+  test -run TestVectors ./...` — interop proof.
 
 ## Determinism properties the vectors depend on
 
