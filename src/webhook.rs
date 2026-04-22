@@ -126,6 +126,12 @@ pub struct WebhookDelivery {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<DateTime<Utc>>,
+    /// Originating tenant id. Empty string for pre-multi-tenant rows
+    /// and for events the handler enqueues outside any tenant scope
+    /// (currently none — every state-changing intent has a bearer key
+    /// so a tenant is always present).
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 // --------------------------------------------------------------------------
@@ -184,6 +190,239 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // --------------------------------------------------------------------------
+// Per-tenant subscribers
+// --------------------------------------------------------------------------
+
+/// One registered destination for a tenant's webhook events. The
+/// outbox enqueues one `WebhookDelivery` per active subscriber whose
+/// `tenant_id` matches the originating tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSubscriber {
+    pub id: String,
+    pub tenant_id: String,
+    pub url: String,
+    /// Secret used to HMAC-sign deliveries to this subscriber.
+    /// Round-trips on the create response so the caller can also
+    /// store / display it; subsequent reads (`GET`) redact it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+pub struct SubscriberStore {
+    backend: SubBackend,
+}
+
+#[derive(Clone)]
+enum SubBackend {
+    Memory(Arc<RwLock<HashMap<String, WebhookSubscriber>>>),
+    Sqlite(StatePool),
+}
+
+impl Default for SubscriberStore {
+    fn default() -> Self {
+        Self::in_memory()
+    }
+}
+
+impl SubscriberStore {
+    pub fn in_memory() -> Self {
+        Self {
+            backend: SubBackend::Memory(Arc::new(RwLock::new(HashMap::new()))),
+        }
+    }
+
+    pub fn with_pool(pool: StatePool) -> Self {
+        Self {
+            backend: SubBackend::Sqlite(pool),
+        }
+    }
+
+    /// Insert a new subscriber. The supplied row must already have a
+    /// fresh id and the secret populated.
+    pub fn insert(&self, sub: WebhookSubscriber) {
+        match &self.backend {
+            SubBackend::Memory(inner) => {
+                inner
+                    .write()
+                    .expect("subscribers write")
+                    .insert(sub.id.clone(), sub);
+            }
+            SubBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("subscribers pool acquire");
+                conn.execute(
+                    "INSERT INTO webhook_subscribers \
+                         (id, tenant_id, url, secret, active, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        sub.id,
+                        sub.tenant_id,
+                        sub.url,
+                        sub.secret.clone().unwrap_or_default(),
+                        i64::from(sub.active),
+                        sub.created_at.to_rfc3339(),
+                        sub.updated_at.to_rfc3339(),
+                    ],
+                )
+                .expect("subscribers insert");
+            }
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<WebhookSubscriber> {
+        match &self.backend {
+            SubBackend::Memory(inner) => inner.read().expect("subscribers read").get(id).cloned(),
+            SubBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("subscribers pool acquire");
+                conn.query_row(
+                    "SELECT id, tenant_id, url, secret, active, created_at, updated_at \
+                     FROM webhook_subscribers WHERE id = ?1",
+                    rusqlite::params![id],
+                    Self::row_to_subscriber,
+                )
+                .optional()
+                .expect("subscribers read")
+            }
+        }
+    }
+
+    /// All subscribers belonging to `tenant_id`, regardless of active
+    /// state. Used by the `GET /icp/v1/webhook_subscribers` endpoint.
+    pub fn list_for_tenant(&self, tenant_id: &str) -> Vec<WebhookSubscriber> {
+        match &self.backend {
+            SubBackend::Memory(inner) => inner
+                .read()
+                .expect("subscribers read")
+                .values()
+                .filter(|s| s.tenant_id == tenant_id)
+                .cloned()
+                .collect(),
+            SubBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("subscribers pool acquire");
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, tenant_id, url, secret, active, created_at, updated_at \
+                         FROM webhook_subscribers WHERE tenant_id = ?1 \
+                         ORDER BY created_at DESC",
+                    )
+                    .expect("prepare list_for_tenant");
+                let rows = stmt
+                    .query_map(rusqlite::params![tenant_id], Self::row_to_subscriber)
+                    .expect("query list_for_tenant");
+                rows.filter_map(Result::ok).collect()
+            }
+        }
+    }
+
+    /// Active subscribers for `tenant_id` — what the fan-out path uses.
+    /// Distinct from `list_for_tenant` because the admin endpoint wants
+    /// to see disabled rows too.
+    pub fn list_active_for_tenant(&self, tenant_id: &str) -> Vec<WebhookSubscriber> {
+        self.list_for_tenant(tenant_id)
+            .into_iter()
+            .filter(|s| s.active)
+            .collect()
+    }
+
+    pub fn set_active(
+        &self,
+        id: &str,
+        active: bool,
+        now: DateTime<Utc>,
+    ) -> Option<WebhookSubscriber> {
+        match &self.backend {
+            SubBackend::Memory(inner) => {
+                let mut guard = inner.write().expect("subscribers write");
+                let s = guard.get_mut(id)?;
+                s.active = active;
+                s.updated_at = now;
+                Some(s.clone())
+            }
+            SubBackend::Sqlite(pool) => {
+                let updated = {
+                    let conn = pool.get().expect("subscribers pool acquire");
+                    conn.execute(
+                        "UPDATE webhook_subscribers SET active = ?1, updated_at = ?2 \
+                         WHERE id = ?3",
+                        rusqlite::params![i64::from(active), now.to_rfc3339(), id],
+                    )
+                    .expect("subscribers set_active")
+                };
+                if updated == 0 {
+                    None
+                } else {
+                    self.get(id)
+                }
+            }
+        }
+    }
+
+    pub fn delete(&self, id: &str) -> bool {
+        match &self.backend {
+            SubBackend::Memory(inner) => inner
+                .write()
+                .expect("subscribers write")
+                .remove(id)
+                .is_some(),
+            SubBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("subscribers pool acquire");
+                conn.execute(
+                    "DELETE FROM webhook_subscribers WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .expect("subscribers delete")
+                    > 0
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.backend {
+            SubBackend::Memory(inner) => inner.read().expect("subscribers read").len(),
+            SubBackend::Sqlite(pool) => {
+                let conn = pool.get().expect("subscribers pool acquire");
+                conn.query_row("SELECT COUNT(*) FROM webhook_subscribers", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map(|n| n as usize)
+                .expect("subscribers count")
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn row_to_subscriber(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebhookSubscriber> {
+        let parse_dt = |s: String| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now())
+        };
+        Ok(WebhookSubscriber {
+            id: row.get(0)?,
+            tenant_id: row.get(1)?,
+            url: row.get(2)?,
+            secret: {
+                let s: String = row.get(3)?;
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            },
+            active: row.get::<_, i64>(4)? != 0,
+            created_at: parse_dt(row.get(5)?),
+            updated_at: parse_dt(row.get(6)?),
+        })
+    }
+}
+
+// --------------------------------------------------------------------------
 // Outbox store
 // --------------------------------------------------------------------------
 
@@ -232,8 +471,8 @@ impl WebhookOutbox {
                          (id, event_id, event_type, url, payload_json, status, \
                           attempts, max_attempts, next_attempt_at, \
                           last_status_code, last_error, \
-                          created_at, updated_at, delivered_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                          created_at, updated_at, delivered_at, tenant_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                      ON CONFLICT(id) DO NOTHING",
                     rusqlite::params![
                         delivery.id,
@@ -250,6 +489,7 @@ impl WebhookOutbox {
                         delivery.created_at.to_rfc3339(),
                         delivery.updated_at.to_rfc3339(),
                         delivery.delivered_at.map(|d| d.to_rfc3339()),
+                        delivery.tenant_id,
                     ],
                 )
                 .expect("outbox enqueue");
@@ -267,7 +507,7 @@ impl WebhookOutbox {
                         "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
-                                created_at, updated_at, delivered_at \
+                                created_at, updated_at, delivered_at, tenant_id \
                          FROM webhook_deliveries WHERE id = ?1",
                         rusqlite::params![id],
                         DeliveryRow::from_row,
@@ -305,7 +545,7 @@ impl WebhookOutbox {
                         "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
-                                created_at, updated_at, delivered_at \
+                                created_at, updated_at, delivered_at, tenant_id \
                          FROM webhook_deliveries \
                          WHERE status IN ('pending','failed') \
                            AND next_attempt_at <= ?1 \
@@ -346,7 +586,7 @@ impl WebhookOutbox {
                         "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
-                                created_at, updated_at, delivered_at \
+                                created_at, updated_at, delivered_at, tenant_id \
                          FROM webhook_deliveries \
                          ORDER BY created_at DESC LIMIT ?1",
                     )
@@ -358,6 +598,106 @@ impl WebhookOutbox {
                     .map(WebhookDelivery::from_row)
                     .collect()
             }
+        }
+    }
+
+    /// Tenant-scoped variant of [`list_recent`]. Returns only rows
+    /// whose `tenant_id` matches; optionally narrows by `status`.
+    /// `status` is the wire name (`"pending"`, `"in_flight"`,
+    /// `"delivered"`, `"failed"`, `"dead_lettered"`); unknown values
+    /// match nothing (the route handler validates first).
+    pub fn list_recent_for_tenant(
+        &self,
+        tenant_id: &str,
+        limit: usize,
+        status: Option<DeliveryStatus>,
+    ) -> Vec<WebhookDelivery> {
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut all: Vec<_> = inner
+                    .read()
+                    .expect("outbox read")
+                    .values()
+                    .filter(|d| d.tenant_id == tenant_id)
+                    .filter(|d| status.is_none_or(|s| d.status == s))
+                    .cloned()
+                    .collect();
+                all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                all.truncate(limit);
+                all
+            }
+            Backend::Sqlite(pool) => {
+                let conn = pool.get().expect("outbox pool acquire");
+                let rows: Vec<DeliveryRow> = if let Some(status) = status {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, event_id, event_type, url, payload_json, status, \
+                                    attempts, max_attempts, next_attempt_at, \
+                                    last_status_code, last_error, \
+                                    created_at, updated_at, delivered_at, tenant_id \
+                             FROM webhook_deliveries \
+                             WHERE tenant_id = ?1 AND status = ?2 \
+                             ORDER BY created_at DESC LIMIT ?3",
+                        )
+                        .expect("prepare list_recent_for_tenant_filtered");
+                    let mapped = stmt
+                        .query_map(
+                            rusqlite::params![tenant_id, status.wire_name(), limit as i64],
+                            DeliveryRow::from_row,
+                        )
+                        .expect("query list_recent_for_tenant_filtered");
+                    mapped.filter_map(Result::ok).collect()
+                } else {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, event_id, event_type, url, payload_json, status, \
+                                    attempts, max_attempts, next_attempt_at, \
+                                    last_status_code, last_error, \
+                                    created_at, updated_at, delivered_at, tenant_id \
+                             FROM webhook_deliveries \
+                             WHERE tenant_id = ?1 \
+                             ORDER BY created_at DESC LIMIT ?2",
+                        )
+                        .expect("prepare list_recent_for_tenant");
+                    let mapped = stmt
+                        .query_map(
+                            rusqlite::params![tenant_id, limit as i64],
+                            DeliveryRow::from_row,
+                        )
+                        .expect("query list_recent_for_tenant");
+                    mapped.filter_map(Result::ok).collect()
+                };
+                rows.into_iter().map(WebhookDelivery::from_row).collect()
+            }
+        }
+    }
+
+    /// Tenant-scoped get. Returns `None` for rows that don't exist
+    /// **or** that belong to a different tenant — callers map both to
+    /// 404 so existence isn't leaked across tenant boundaries.
+    pub fn get_for_tenant(&self, id: &str, tenant_id: &str) -> Option<WebhookDelivery> {
+        let d = self.get(id)?;
+        if d.tenant_id == tenant_id {
+            Some(d)
+        } else {
+            None
+        }
+    }
+
+    /// Tenant-scoped retry. Cross-tenant ids return `NotFound` so the
+    /// route handler emits a 404 — same shape a missing row produces.
+    pub fn reset_for_retry_for_tenant(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<WebhookDelivery, RetryError> {
+        match self.get(id) {
+            Some(d) if d.tenant_id == tenant_id => self.reset_for_retry(id, now),
+            // Cross-tenant or nonexistent — both surface as NotFound so
+            // tenant A can't probe for the existence of tenant B's
+            // delivery ids.
+            _ => Err(RetryError::NotFound),
         }
     }
 
@@ -459,7 +799,7 @@ impl WebhookOutbox {
                         "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
-                                created_at, updated_at, delivered_at \
+                                created_at, updated_at, delivered_at, tenant_id \
                          FROM webhook_deliveries WHERE id = ?1",
                         rusqlite::params![id],
                         DeliveryRow::from_row,
@@ -664,6 +1004,7 @@ struct DeliveryRow {
     created_at: String,
     updated_at: String,
     delivered_at: Option<String>,
+    tenant_id: String,
 }
 
 impl DeliveryRow {
@@ -683,6 +1024,7 @@ impl DeliveryRow {
             created_at: row.get(11)?,
             updated_at: row.get(12)?,
             delivered_at: row.get(13)?,
+            tenant_id: row.get(14).unwrap_or_default(),
         })
     }
 }
@@ -709,6 +1051,7 @@ impl WebhookDelivery {
             created_at: parse_dt(&r.created_at),
             updated_at: parse_dt(&r.updated_at),
             delivered_at: r.delivered_at.as_deref().map(parse_dt),
+            tenant_id: r.tenant_id,
         }
     }
 }
@@ -771,6 +1114,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             delivered_at: None,
+            tenant_id: String::new(),
         };
         outbox.enqueue(d);
         assert_eq!(outbox.len(), 1);
@@ -805,6 +1149,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             delivered_at: None,
+            tenant_id: String::new(),
         });
         outbox.bump_failure("del_2", Some(500), Some("server".into()), now);
         assert_eq!(outbox.get("del_2").unwrap().status, DeliveryStatus::Failed);

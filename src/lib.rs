@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::from_fn,
     response::IntoResponse,
@@ -112,7 +112,8 @@ pub async fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
     service.subscriptions = crate::state_store::SubscriptionStore::with_pool(state_pool.clone());
     service.peer_quotes = crate::state_store::PeerQuoteStore::with_pool(state_pool.clone());
     service.idempotency = crate::idempotency::IdempotencyStore::with_pool(state_pool.clone());
-    service.webhook_outbox = crate::webhook::WebhookOutbox::with_pool(state_pool);
+    service.webhook_outbox = crate::webhook::WebhookOutbox::with_pool(state_pool.clone());
+    service.webhook_subscribers = crate::webhook::SubscriberStore::with_pool(state_pool);
 
     let keys = load_api_keys(config)?;
     if keys.is_empty() {
@@ -174,6 +175,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/icp/v1/webhook_deliveries/:id/retry",
             post(retry_webhook_delivery),
+        )
+        .route(
+            "/icp/v1/webhook_subscribers",
+            post(create_webhook_subscriber).get(list_webhook_subscribers),
+        )
+        .route(
+            "/icp/v1/webhook_subscribers/:id",
+            get(get_webhook_subscriber).delete(delete_webhook_subscriber),
+        )
+        .route(
+            "/icp/v1/webhook_subscribers/:id/disable",
+            post(disable_webhook_subscriber),
         );
 
     if acp_enabled {
@@ -568,12 +581,17 @@ pub async fn get_transaction(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
-    let txn = state
-        .service
-        .transactions
-        .get(&id)
-        .ok_or_else(|| ApiError::ResourceNotFound(format!("transaction {id}")))?;
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    // Cross-tenant ids surface as 404 (not 403) — same shape as a
+    // missing row, so callers can't enumerate other tenants' ids.
+    // Legacy rows written before `tenant_id` was stamped have
+    // `tenant_id == ""` and remain visible to operators querying
+    // with an empty bearer tenant; they're invisible to any real
+    // tenant — the desired isolation property.
+    let txn = match state.service.transactions.get(&id) {
+        Some(t) if t.tenant_id == tenant.tenant_id => t,
+        _ => return Err(ApiError::ResourceNotFound(format!("transaction {id}"))),
+    };
     Ok(Json(serde_json::to_value(txn)?))
 }
 
@@ -592,12 +610,11 @@ pub async fn get_subscription(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
-    let sub = state
-        .service
-        .subscriptions
-        .get(&id)
-        .ok_or_else(|| ApiError::ResourceNotFound(format!("subscription {id}")))?;
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let sub = match state.service.subscriptions.get(&id) {
+        Some(s) if s.tenant_id == tenant.tenant_id => s,
+        _ => return Err(ApiError::ResourceNotFound(format!("subscription {id}"))),
+    };
     Ok(Json(serde_json::to_value(sub)?))
 }
 
@@ -616,33 +633,72 @@ pub async fn get_peer_quote(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
-    let quote = state
-        .service
-        .peer_quotes
-        .get(&id)
-        .ok_or_else(|| ApiError::ResourceNotFound(format!("peer_quote {id}")))?;
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let quote = match state.service.peer_quotes.get(&id) {
+        Some(q) if q.tenant_id == tenant.tenant_id => q,
+        _ => return Err(ApiError::ResourceNotFound(format!("peer_quote {id}"))),
+    };
     Ok(Json(serde_json::to_value(quote)?))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ListDeliveriesQuery {
+    /// Optional `status` filter — one of `pending`, `in_flight`,
+    /// `delivered`, `failed`, `dead_lettered`. Anything else returns
+    /// 400 (rather than silently empty) so a typo surfaces fast.
+    pub status: Option<String>,
+    /// Page size cap. Defaults to 100, max 500 — keeps a single
+    /// request from pulling unbounded payloads into memory.
+    pub limit: Option<usize>,
 }
 
 #[utoipa::path(
     get,
     path = "/icp/v1/webhook_deliveries",
     tag = "ICP Core",
+    params(
+        ("status" = Option<String>, Query, description = "Filter: pending|in_flight|delivered|failed|dead_lettered"),
+        ("limit" = Option<usize>, Query, description = "Page size, default 100, max 500"),
+    ),
     responses(
-        (status = 200, description = "Recent outbound webhook delivery attempts."),
+        (status = 200, description = "Recent outbound webhook delivery attempts for the caller's tenant."),
+        (status = 400, description = "Unknown status filter."),
     ),
 )]
 pub async fn list_webhook_deliveries(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<ListDeliveriesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
-    let recent = state.service.webhook_outbox.list_recent(100);
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let status = match q.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_status_filter(s)?),
+    };
+    let limit = q.limit.unwrap_or(100).min(500);
+    let recent =
+        state
+            .service
+            .webhook_outbox
+            .list_recent_for_tenant(&tenant.tenant_id, limit, status);
     Ok(Json(serde_json::json!({
         "data": recent,
         "count": recent.len(),
     })))
+}
+
+fn parse_status_filter(s: &str) -> Result<crate::webhook::DeliveryStatus, ApiError> {
+    use crate::webhook::DeliveryStatus;
+    match s {
+        "pending" => Ok(DeliveryStatus::Pending),
+        "in_flight" => Ok(DeliveryStatus::InFlight),
+        "delivered" => Ok(DeliveryStatus::Delivered),
+        "failed" => Ok(DeliveryStatus::Failed),
+        "dead_lettered" => Ok(DeliveryStatus::DeadLettered),
+        other => Err(ApiError::InvalidRequest(format!(
+            "unknown status filter '{other}' — expected one of pending|in_flight|delivered|failed|dead_lettered"
+        ))),
+    }
 }
 
 #[utoipa::path(
@@ -652,7 +708,7 @@ pub async fn list_webhook_deliveries(
     params(("id" = String, Path, description = "Delivery ID")),
     responses(
         (status = 200, description = "Single webhook delivery record."),
-        (status = 404, description = "Delivery not found."),
+        (status = 404, description = "Delivery not found (or belongs to a different tenant — existence is not leaked)."),
     ),
 )]
 pub async fn get_webhook_delivery(
@@ -660,35 +716,167 @@ pub async fn get_webhook_delivery(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
+    let tenant = resolve_tenant(&headers, &state.keys)?;
     let d = state
         .service
         .webhook_outbox
-        .get(&id)
+        .get_for_tenant(&id, &tenant.tenant_id)
         .ok_or_else(|| ApiError::ResourceNotFound(format!("webhook_delivery {id}")))?;
     Ok(Json(serde_json::to_value(d)?))
 }
 
 /// Operator-initiated retry of a `failed` or `dead_lettered` webhook
-/// delivery. Maps `RetryError` variants to the spec-aligned HTTP error
+/// delivery. Tenant-scoped: another tenant's delivery id surfaces as
+/// 404, identical to a missing row, so existence isn't leaked across
+/// tenants. Maps `RetryError` variants to the spec-aligned HTTP error
 /// shape: `NotFound` → 404, the three "wrong state" variants → 412.
 pub async fn retry_webhook_delivery(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
-    match state
-        .service
-        .webhook_outbox
-        .reset_for_retry(&id, chrono::Utc::now())
-    {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    match state.service.webhook_outbox.reset_for_retry_for_tenant(
+        &id,
+        &tenant.tenant_id,
+        chrono::Utc::now(),
+    ) {
         Ok(d) => Ok(Json(serde_json::to_value(d)?)),
         Err(crate::webhook::RetryError::NotFound) => {
             Err(ApiError::ResourceNotFound(format!("webhook_delivery {id}")))
         }
         Err(e) => Err(ApiError::PreconditionFailed(e.message().to_string())),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateSubscriberBody {
+    pub url: String,
+    pub secret: String,
+}
+
+/// Register a new per-tenant webhook subscriber. Tenant scope is
+/// implicit — the row's `tenant_id` is taken from the bearer key, so
+/// the caller can never create subscribers for a tenant they don't
+/// authenticate as. Validates the URL is a non-empty `http(s)://`
+/// string and the secret is non-empty.
+pub async fn create_webhook_subscriber(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateSubscriberBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let url = body.url.trim();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(ApiError::InvalidRequest(
+            "url must be a non-empty http(s):// string".into(),
+        ));
+    }
+    if body.secret.trim().is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "secret must be non-empty — events are HMAC-signed and the receiver needs the same secret to verify".into(),
+        ));
+    }
+    let now = chrono::Utc::now();
+    let sub = crate::webhook::WebhookSubscriber {
+        id: format!("whsub_{}", uuid::Uuid::new_v4().simple()),
+        tenant_id: tenant.tenant_id.clone(),
+        url: url.to_string(),
+        secret: Some(body.secret),
+        active: true,
+        created_at: now,
+        updated_at: now,
+    };
+    state.service.webhook_subscribers.insert(sub.clone());
+    Ok(Json(serde_json::to_value(sub)?))
+}
+
+/// List the calling tenant's subscribers (active + disabled). Secrets
+/// are redacted in the response — the create call is the only time
+/// the secret is returned.
+pub async fn list_webhook_subscribers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let mut rows = state
+        .service
+        .webhook_subscribers
+        .list_for_tenant(&tenant.tenant_id);
+    for s in rows.iter_mut() {
+        s.secret = None;
+    }
+    let count = rows.len();
+    Ok(Json(serde_json::json!({ "data": rows, "count": count })))
+}
+
+pub async fn get_webhook_subscriber(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let mut sub = state
+        .service
+        .webhook_subscribers
+        .get(&id)
+        .ok_or_else(|| ApiError::ResourceNotFound(format!("webhook_subscriber {id}")))?;
+    if sub.tenant_id != tenant.tenant_id {
+        // Don't leak existence across tenants — same response as miss.
+        return Err(ApiError::ResourceNotFound(format!(
+            "webhook_subscriber {id}"
+        )));
+    }
+    sub.secret = None;
+    Ok(Json(serde_json::to_value(sub)?))
+}
+
+/// Soft-disable a subscriber — flips `active` to false. Future events
+/// won't fan out to this URL, but the row remains in the store so the
+/// operator can re-enable it later (a future endpoint, not yet wired).
+pub async fn disable_webhook_subscriber(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let existing = state
+        .service
+        .webhook_subscribers
+        .get(&id)
+        .ok_or_else(|| ApiError::ResourceNotFound(format!("webhook_subscriber {id}")))?;
+    if existing.tenant_id != tenant.tenant_id {
+        return Err(ApiError::ResourceNotFound(format!(
+            "webhook_subscriber {id}"
+        )));
+    }
+    let mut updated = state
+        .service
+        .webhook_subscribers
+        .set_active(&id, false, chrono::Utc::now())
+        .ok_or_else(|| ApiError::ResourceNotFound(format!("webhook_subscriber {id}")))?;
+    updated.secret = None;
+    Ok(Json(serde_json::to_value(updated)?))
+}
+
+pub async fn delete_webhook_subscriber(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tenant = resolve_tenant(&headers, &state.keys)?;
+    let existing = state
+        .service
+        .webhook_subscribers
+        .get(&id)
+        .ok_or_else(|| ApiError::ResourceNotFound(format!("webhook_subscriber {id}")))?;
+    if existing.tenant_id != tenant.tenant_id {
+        return Err(ApiError::ResourceNotFound(format!(
+            "webhook_subscriber {id}"
+        )));
+    }
+    state.service.webhook_subscribers.delete(&id);
+    Ok(Json(serde_json::json!({ "id": id, "deleted": true })))
 }
 
 #[utoipa::path(

@@ -55,9 +55,17 @@ pub struct IcpService {
     /// lookups. Disabled when the configured capacity is 0.
     pub pre_auth_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub webhook_outbox: crate::webhook::WebhookOutbox,
-    /// URL to enqueue events to. `None` disables enqueueing entirely
-    /// (for tests + demos that don't want webhook traffic).
+    /// Per-tenant webhook subscriber registry. Production deployments
+    /// register one or more rows per tenant via the admin endpoints;
+    /// the outbox fans out to all `active` rows on each event.
+    pub webhook_subscribers: crate::webhook::SubscriberStore,
+    /// Global fallback URL used when a tenant has no registered
+    /// subscribers. `None` disables the fallback. The global secret
+    /// (`Config.webhook_secret`) is what the worker signs with for
+    /// the fallback path; per-tenant subscribers carry their own
+    /// secret on the row.
     pub webhook_url: Option<String>,
+    pub webhook_secret: Option<String>,
     pub signer: Arc<ReceiptSigner>,
     pub events: EventBus,
     pub resolver: Arc<dyn PrincipalResolver>,
@@ -136,6 +144,7 @@ impl IcpService {
         resolver: Arc<dyn PrincipalResolver>,
     ) -> Self {
         let webhook_url = config.webhook_url.clone();
+        let webhook_secret = config.webhook_secret.clone();
         let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::per_minute(
             config.rate_limit_per_minute,
         ));
@@ -154,7 +163,9 @@ impl IcpService {
             rate_limiter,
             pre_auth_limiter,
             webhook_outbox: crate::webhook::WebhookOutbox::default(),
+            webhook_subscribers: crate::webhook::SubscriberStore::default(),
             webhook_url,
+            webhook_secret,
             signer: Arc::new(signer),
             events: EventBus::default(),
             resolver,
@@ -330,7 +341,7 @@ impl IcpService {
         // search/describe noise. Read-only intents already skip the
         // receipt path; same gate applies here.
         if intent.is_state_change() {
-            self.enqueue_webhook(&event);
+            self.enqueue_webhook(&event, Some(&input.tenant.tenant_id));
         }
         self.events.emit(event);
 
@@ -661,6 +672,7 @@ impl IcpService {
             id: format!("sub_{}", Uuid::new_v4().simple()),
             status: SubscriptionStatus::Active,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: mandate.map(|m| m.payload.jti.clone()),
             buyer,
             ship_to: params.ship_to,
@@ -881,6 +893,7 @@ impl IcpService {
         let quote = PeerQuote {
             id: format!("pq_{}", Uuid::new_v4().simple()),
             status,
+            tenant_id: input.tenant.tenant_id.clone(),
             requester_agent_id: input.agent.raw.clone(),
             peer_agent_id: params.peer_agent_id,
             service: params.service,
@@ -904,6 +917,7 @@ impl IcpService {
             id: format!("txn_{}", Uuid::new_v4().simple()),
             state: TransactionState::Draft,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: mandate.map(|m| m.payload.jti.clone()),
             currency: quote
                 .price
@@ -1035,6 +1049,7 @@ impl IcpService {
             id: format!("txn_{}", Uuid::new_v4().simple()),
             state: TransactionState::Completed,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: mandate.map(|m| m.payload.jti.clone()),
             currency: money.currency.clone(),
             jurisdiction: input.envelope.context.jurisdiction.clone(),
@@ -1226,10 +1241,50 @@ impl IcpService {
 
     // ---------- scheduler-driven auto-renewal ----------
 
-    /// Maximum number of consecutive scheduler-driven failures before
-    /// a subscription transitions to `past_due` and stops being
-    /// retried. The agent must call `intent.renew` manually to recover.
+    /// Maximum consecutive scheduler-driven failures before a
+    /// subscription transitions to `past_due` when no
+    /// `subscription_dunning_schedule_hours` is configured. With a
+    /// non-empty dunning schedule, the schedule length determines the
+    /// max instead (see `dunning_max_attempts`).
     pub const MAX_RENEWAL_FAILURES: u32 = 3;
+
+    /// Effective max-attempts count for a subscription failure cycle.
+    /// With a non-empty dunning schedule of length N, the (N+1)th
+    /// failure transitions to past_due (each failure consumes one
+    /// schedule entry; once exhausted there are no more retries left
+    /// to schedule). With an empty schedule, falls back to
+    /// `MAX_RENEWAL_FAILURES`.
+    fn dunning_max_attempts(&self) -> u32 {
+        let schedule = &self.config.subscription_dunning_schedule_hours;
+        if schedule.is_empty() {
+            Self::MAX_RENEWAL_FAILURES
+        } else {
+            // schedule.len() entries = schedule.len() retry windows;
+            // past_due triggers on the failure that would need the
+            // (N+1)th window. So total allowed failures = N+1.
+            (schedule.len() as u32).saturating_add(1)
+        }
+    }
+
+    /// Compute the next-attempt timestamp after the Nth failure
+    /// (1-indexed). Returns `None` when the schedule is exhausted
+    /// (caller transitions to past_due) or when no schedule is set.
+    fn dunning_next_attempt(
+        &self,
+        failure_count: u32,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<chrono::DateTime<Utc>> {
+        let schedule = &self.config.subscription_dunning_schedule_hours;
+        if schedule.is_empty() {
+            return None;
+        }
+        // failure_count is 1-based; map to the 0-based schedule index
+        // by subtracting 1. After the schedule is consumed, return
+        // None — caller pasts_due.
+        let idx = failure_count.checked_sub(1)? as usize;
+        let hours = *schedule.get(idx)?;
+        Some(now + chrono::Duration::hours(hours as i64))
+    }
 
     /// Drive automatic billing for every subscription whose
     /// `next_charge_at` has passed at `now`. Returns a summary of the
@@ -1287,16 +1342,31 @@ impl IcpService {
                             "automatic": true,
                         }),
                     };
-                    self.enqueue_webhook(&event);
+                    self.enqueue_webhook(&event, Some(&sub.tenant_id));
                     self.events.emit(event);
                     report.renewed += 1;
                 }
                 Err(err) => {
+                    let max_attempts = self.dunning_max_attempts();
+                    // Compute the next attempt BEFORE the update closure
+                    // borrows — we want it pinned to the per-failure
+                    // backoff, not just the next tick.
+                    let new_failure_count = sub.failed_renewal_attempts.saturating_add(1);
+                    let next_attempt = self.dunning_next_attempt(new_failure_count, now);
                     let updated = self.subscriptions.update(&sub.id, |s| {
-                        s.failed_renewal_attempts = s.failed_renewal_attempts.saturating_add(1);
-                        if s.failed_renewal_attempts >= Self::MAX_RENEWAL_FAILURES {
+                        s.failed_renewal_attempts = new_failure_count;
+                        if s.failed_renewal_attempts >= max_attempts {
                             s.status = SubscriptionStatus::PastDue;
+                        } else if let Some(nx) = next_attempt {
+                            // With a dunning schedule, push the next
+                            // attempt forward by the configured backoff
+                            // so a transient failure doesn't burn the
+                            // remaining budget in successive ticks.
+                            s.next_charge_at = nx;
                         }
+                        // Without a schedule, leave next_charge_at
+                        // alone — the legacy "burn fast" semantics
+                        // expected by `repeated_failures_transition_to_past_due`.
                         s.updated_at = now;
                     });
                     if let Some(s) = updated.as_ref() {
@@ -1313,7 +1383,7 @@ impl IcpService {
                                     "consecutive_failures": s.failed_renewal_attempts,
                                 }),
                             };
-                            self.enqueue_webhook(&event);
+                            self.enqueue_webhook(&event, Some(&sub.tenant_id));
                             self.events.emit(event);
                             report.past_due += 1;
                         }
@@ -1434,6 +1504,7 @@ impl IcpService {
             id: format!("txn_{}", Uuid::new_v4().simple()),
             state: TransactionState::Completed,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: input.envelope.mandate_jti.clone(),
             currency: currency.to_string(),
             jurisdiction: input.envelope.context.jurisdiction.clone(),
@@ -1470,6 +1541,7 @@ impl IcpService {
             id: format!("txn_{}", Uuid::new_v4().simple()),
             state,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: sub.mandate_jti.clone(),
             currency: sub.currency.clone(),
             jurisdiction: input.envelope.context.jurisdiction.clone(),
@@ -1488,31 +1560,63 @@ impl IcpService {
 
     // ---------- helpers ----------
 
-    /// Push an event onto the durable webhook outbox for the configured
-    /// subscriber URL. No-op when no `webhook_url` is configured.
-    fn enqueue_webhook(&self, event: &Event) {
-        let Some(url) = self.webhook_url.as_deref() else {
-            return;
-        };
+    /// Push an event onto the durable webhook outbox.
+    ///
+    /// Routing: when `tenant_id` has registered active subscribers,
+    /// fan out one delivery per subscriber. Otherwise fall back to
+    /// the global `webhook_url` if configured. No-op when there's
+    /// neither a tenant subscriber nor a global URL.
+    ///
+    /// `tenant_id == None` skips per-tenant lookup and falls straight
+    /// to the global URL — used by scheduler-driven events that
+    /// originate without a tenant context. Subscription-bound events
+    /// pass the tenant id stored on the subscription.
+    fn enqueue_webhook(&self, event: &Event, tenant_id: Option<&str>) {
         let payload_json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
         let now = Utc::now();
-        self.webhook_outbox
-            .enqueue(crate::webhook::WebhookDelivery {
-                id: format!("del_{}", Uuid::new_v4().simple()),
-                event_id: event.id.clone(),
-                event_type: event.r#type.clone(),
-                url: url.to_string(),
-                payload_json,
-                status: crate::webhook::DeliveryStatus::Pending,
-                attempts: 0,
-                max_attempts: crate::webhook::DEFAULT_MAX_ATTEMPTS,
-                next_attempt_at: now,
-                last_status_code: None,
-                last_error: None,
-                created_at: now,
-                updated_at: now,
-                delivered_at: None,
-            });
+
+        let mut destinations: Vec<(String, Option<String>)> = Vec::new();
+        if let Some(t) = tenant_id {
+            for sub in self.webhook_subscribers.list_active_for_tenant(t) {
+                destinations.push((sub.url, sub.secret));
+            }
+        }
+        // Global fallback fires only when this tenant has zero
+        // subscribers — production deployments use it for ops
+        // dashboards observing the whole fleet without re-registering
+        // the same URL per tenant.
+        if destinations.is_empty() {
+            if let Some(url) = self.webhook_url.as_deref() {
+                destinations.push((url.to_string(), self.webhook_secret.clone()));
+            }
+        }
+
+        for (url, _secret) in destinations {
+            // The per-subscriber `secret` is read at delivery time by
+            // the worker — we only need to remember the URL on the row
+            // for now. (A future iteration can store the secret
+            // alongside the delivery so the worker doesn't have to
+            // re-resolve the subscriber.)
+            let _ = _secret;
+            self.webhook_outbox
+                .enqueue(crate::webhook::WebhookDelivery {
+                    id: format!("del_{}", Uuid::new_v4().simple()),
+                    event_id: event.id.clone(),
+                    event_type: event.r#type.clone(),
+                    url,
+                    payload_json: payload_json.clone(),
+                    status: crate::webhook::DeliveryStatus::Pending,
+                    attempts: 0,
+                    max_attempts: crate::webhook::DEFAULT_MAX_ATTEMPTS,
+                    next_attempt_at: now,
+                    last_status_code: None,
+                    last_error: None,
+                    created_at: now,
+                    updated_at: now,
+                    delivered_at: None,
+                    tenant_id: tenant_id.unwrap_or("").to_string(),
+                });
+        }
     }
 
     fn fresh_transaction(&self, input: &IntentInput<'_>, state: TransactionState) -> Transaction {
@@ -1531,6 +1635,7 @@ impl IcpService {
             id,
             state,
             agent_id: input.agent.raw.clone(),
+            tenant_id: input.tenant.tenant_id.clone(),
             mandate_jti: input.envelope.mandate_jti.clone(),
             currency,
             jurisdiction: input.envelope.context.jurisdiction.clone(),

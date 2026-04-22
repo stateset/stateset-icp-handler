@@ -305,6 +305,7 @@ async fn outbox_unit_refuses_in_flight_retries() {
         created_at: now,
         updated_at: now,
         delivered_at: None,
+        tenant_id: String::new(),
     });
     outbox.mark_in_flight("del_x", now);
     let err = outbox.reset_for_retry("del_x", now).unwrap_err();

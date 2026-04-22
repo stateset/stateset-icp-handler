@@ -6,7 +6,7 @@ ICP_SPEC §6. No code generation; no Rust source imports. If this client
 keeps working as the spec evolves, that's evidence the contract is real.
 """
 
-from stateset_icp.client import Client, IcpError
+from stateset_icp.client import Client, EventStream, IcpError, SseEvent
 from stateset_icp.mandate import (
     Ed25519KeyPair,
     create_mandate_payload,
@@ -16,7 +16,9 @@ from stateset_icp.mandate import (
 
 __all__ = [
     "Client",
+    "EventStream",
     "IcpError",
+    "SseEvent",
     "Ed25519KeyPair",
     "create_mandate_payload",
     "did_key_from_public_key",

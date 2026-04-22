@@ -182,6 +182,7 @@ fn minimal_txn(id: &str) -> Transaction {
         id: id.into(),
         state: TransactionState::Draft,
         agent_id: "did:stateset:agent:a".into(),
+        tenant_id: String::new(),
         mandate_jti: None,
         currency: "USD".into(),
         jurisdiction: None,

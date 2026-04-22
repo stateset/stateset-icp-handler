@@ -32,6 +32,7 @@ dependencies = [
 Homepage = "https://github.com/stateset/stateset-icp-handler"
 Specification = "https://github.com/stateset/stateset-icp-handler/blob/main/docs/specification/ICP_SPEC.md"
 OpenAPI = "https://github.com/stateset/stateset-icp-handler/blob/main/docs/openapi.json"
+Changelog = "https://github.com/stateset/stateset-icp-handler/blob/main/clients/python/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["stateset_icp"]

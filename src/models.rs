@@ -163,6 +163,13 @@ pub struct Transaction {
     pub id: String,
     pub state: TransactionState,
     pub agent_id: String,
+    /// Tenant that owns this transaction — derived from the bearer
+    /// key at creation time. The `GET /icp/v1/transactions/:id`
+    /// endpoint rejects cross-tenant reads (404 to avoid leaking
+    /// existence). Defaulted for backwards compat with rows written
+    /// before the field existed.
+    #[serde(default)]
+    pub tenant_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mandate_jti: Option<String>,
     pub currency: String,
@@ -376,6 +383,14 @@ pub struct Subscription {
     pub id: String,
     pub status: SubscriptionStatus,
     pub agent_id: String,
+    /// Tenant that originally created the subscription. Stored on the
+    /// row so scheduler-driven events (`subscription.renewed`,
+    /// `subscription.past_due`) can fan out to that tenant's
+    /// per-tenant webhook subscribers — no IntentInput available at
+    /// scheduler time. Defaulted for backwards compat with rows
+    /// written before the field existed.
+    #[serde(default)]
+    pub tenant_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mandate_jti: Option<String>,
     pub buyer: Buyer,
@@ -494,6 +509,13 @@ pub struct A2aServiceSpec {
 pub struct PeerQuote {
     pub id: String,
     pub status: PeerQuoteStatus,
+    /// Tenant that owns this peer quote — derived from the
+    /// requester's bearer key. `GET /icp/v1/peer_quotes/:id` rejects
+    /// cross-tenant reads (404 to avoid leaking existence).
+    /// Defaulted for backwards compat with rows written before the
+    /// field existed.
+    #[serde(default)]
+    pub tenant_id: String,
     /// The agent that asked for the quote (who pays on acceptance).
     pub requester_agent_id: String,
     /// The agent that will perform the work (who gets paid).

@@ -84,6 +84,15 @@ pub struct Config {
     // Subscription auto-billing scheduler
     pub subscription_scheduler_enabled: bool,
     pub subscription_scheduler_interval_secs: u64,
+    /// Backoff schedule between failed renewal attempts, in hours.
+    /// Each entry is the delay until the next try after the
+    /// corresponding failure: `[1, 6, 24]` means wait 1h after the 1st
+    /// failure, 6h after the 2nd, 24h after the 3rd; on the 4th
+    /// failure (no schedule entry left) the subscription transitions
+    /// to `past_due`. An empty schedule preserves the legacy "burn
+    /// all retries in immediate succession then past_due" behavior —
+    /// fine for tests, never appropriate in production.
+    pub subscription_dunning_schedule_hours: Vec<u32>,
 
     // Observability
     pub log_level: String,
@@ -152,6 +161,10 @@ impl Config {
             )
             .parse()
             .unwrap_or(60),
+            subscription_dunning_schedule_hours: parse_dunning_schedule(&env_default(
+                "ICP_SUBSCRIPTION_DUNNING_SCHEDULE_HOURS",
+                "1,6,24",
+            )),
             log_level: env_default("LOG_LEVEL", "info"),
         })
     }
@@ -197,6 +210,11 @@ impl Config {
             // the background loop is off unless the test opts in.
             subscription_scheduler_enabled: false,
             subscription_scheduler_interval_secs: 60,
+            // Empty schedule preserves the legacy "fail fast then
+            // past_due" behavior the existing scheduler tests assume.
+            // Production / test_dunning opt in by setting this
+            // explicitly.
+            subscription_dunning_schedule_hours: vec![],
             log_level: "warn".into(),
         }
     }
@@ -211,6 +229,20 @@ fn env_bool(key: &str, default: bool) -> bool {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
         Err(_) => default,
     }
+}
+
+/// Parse a comma-separated list of u32 hours into a dunning schedule.
+/// Empty input → empty schedule (legacy semantics). Invalid entries
+/// (non-numeric, zero, > 8760) are silently dropped — operators get
+/// the validated subset, never a panic at boot. A schedule of all
+/// invalid entries collapses to empty.
+fn parse_dunning_schedule(s: &str) -> Vec<u32> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<u32>().ok())
+        .filter(|n| (1..=8760).contains(n))
+        .collect()
 }
 
 fn split_csv(s: &str) -> Vec<String> {

@@ -2,8 +2,8 @@
 
 **A reference implementation of the Intelligent Commerce Protocol for agent-native commerce**
 
-Version: 0.1 (handler) / `2026-04-21` (protocol)
-Status: Draft technical whitepaper
+Version: 0.2.0 (handler) / `2026-04-21` (protocol)
+Status: Published — tag `v0.2.0`
 Authors: StateSet Commerce Engineering
 
 ---
@@ -487,11 +487,11 @@ The protocol defines two tiers so handlers can ship an honest 1.0 without gating
 
 `intent.negotiate`, `intent.confirm_receipt`.
 
-A handler declares its tier in the discovery document under `conformance.tier`. Calling an intent outside the declared tier returns `intent_not_supported` with HTTP `501 Not Implemented`.
+A handler declares its tier in the discovery document under `conformance.tier`, and the advertised tier is *derived from the concrete intent set* — the handler cannot lie about it. Calling an intent outside the declared tier returns `intent_not_supported` with HTTP `501 Not Implemented`.
 
-The repository ships an `icp-conformance` binary — an implementation-independent test suite that drives any ICP handler URL through the spec and reports pass/fail per requirement. `./demo_conformance.sh` runs the suite against the local handler in one command. Publishing it as `npx icp-conformance` is on the roadmap for v0.3.
+The repository ships an `icp-conformance` binary — an implementation-independent test suite that drives any ICP handler URL through the spec and reports pass/fail per requirement. It deliberately imports **nothing** from the handler library so that passing its suite is evidence a *different* handler conforms, not that it matches StateSet's internals. `./demo_conformance.sh` runs the suite against the local handler in one command; `npx @stateset/icp-conformance --url … --api-key … --agent-id …` runs it without a Rust toolchain installed.
 
-The reference handler is currently shipping 15 of 17 catalog intents end-to-end (Core complete; Full pending `intent.negotiate` and `intent.confirm_receipt`).
+The reference handler ships **all 17 catalog intents end-to-end** and advertises `tier: "icp-full"` in its discovery document.
 
 ---
 
@@ -524,41 +524,58 @@ Agents do not assume an extension is available without consulting discovery.
 
 ## 14. Implementation notes
 
-The reference handler is ~9,000 lines of Rust across the `src/` tree (core handler, compatibility paths, conformance binary, MCP stdio binary). Notable choices:
+The reference handler is ~14,000 lines of Rust across the `src/` tree (core handler, compatibility paths, conformance binary, MCP stdio binary, persistence layer, webhook outbox, rate limiter). Notable choices:
 
-- **Async runtime:** Tokio. The HTTP server uses axum 0.7; the gRPC server uses tonic 0.12 with proto build via `tonic-build`.
+- **Async runtime:** Tokio. The HTTP server uses axum 0.7; the gRPC server uses tonic 0.12 with proto build via `tonic-build`. In the sibling `stateset-embedded` crate, Tokio is **optional** — a consumer can build with `default-features = false, features = ["sqlite"]` and pull in zero async-runtime crates, making the engine genuinely usable in CLI tools, WASM targets, and sync Rust services.
 - **Crypto:** `ed25519-dalek` for signing and verification. Mandate JWS handling lives in `mandate.rs`; receipt JWS handling in `signing.rs`.
 - **Canonicalization:** `serde_jcs` (RFC 8785) for both mandate verification and receipt body digesting.
-- **Persistence:** `rusqlite` with the `bundled` feature so the handler ships without a system SQLite dependency. An `r2d2` pool in front. PostgreSQL is opt-in via Cargo feature.
-- **OpenAPI:** `utoipa` derives the OpenAPI 3.1 schema from the same Rust types the handler executes against, so the machine-readable contract cannot drift from the code. `/openapi.json` is served standalone.
+- **Persistence:** `rusqlite` with the `bundled` feature so the handler ships without a system SQLite dependency. An `r2d2` pool in front. A shared `state_db` pool backs mandates, receipts, transactions, subscriptions, peer quotes, idempotency records, webhook deliveries, and per-tenant webhook subscribers — one SQLite file, one schema, one migration entrypoint. PostgreSQL is opt-in via Cargo feature.
+- **Idempotency:** `ICP-Idempotency-Key` (spec §13) is honored end-to-end. Request equivalence is computed via JCS canonicalization + SHA-256, so a retry that reorders JSON object keys still matches. Only successful (2xx) responses are cached — transient errors never poison the cache. Cache survives handler restart.
+- **Outbound webhooks:** HMAC-SHA256 signed (`ICP-Signature: t=<unix>,v1=<hex>`), outbox pattern with durable rows in SQLite so delivery is at-least-once across crashes. Exponential backoff, 5-attempt dead-letter, operator retry endpoint. Per-tenant subscribers fan out events to tenant-specific destinations; cross-tenant leakage is impossible by construction.
+- **Rate limiting:** per-tenant (fixed-window counter keyed by `ApiKeyInfo.tenant_id`) **and** per-IP pre-auth (keyed by `X-Forwarded-For` first segment → `X-Real-IP` → `direct` sentinel). Pre-auth limiter fires *before* tenant resolution so fake-bearer floods get capped at the IP layer. Both stamp `X-RateLimit-Limit / Remaining / Reset` headers; denials include `Retry-After`.
+- **Subscription dunning:** `ICP_SUBSCRIPTION_DUNNING_SCHEDULE_HOURS` (default `1,6,24`) governs the backoff between failed renewal attempts. Transient card declines no longer past_due customers in seconds.
+- **OpenAPI:** `utoipa` derives the OpenAPI 3.1 schema from the same Rust types the handler executes against, so the machine-readable contract cannot drift from the code. `/openapi.json` is served standalone; `/docs` renders Swagger UI via CDN (no multi-MB UI assets compiled into the binary).
 - **Observability:** `tracing` + `tracing-subscriber` for structured logs; `prometheus` for `/metrics`.
 - **Build:** `cargo build --release`; `Dockerfile` and `docker-compose.yml` ship for one-command deployment. Release profile uses `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`.
 - **CI:** `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, Docker build on every push and PR.
-- **Tests:** 110+ integration tests covering ICP, ACP, UCP, MCP (HTTP and stdio), `did:key` and `did:web` mandate verification, engine persistence, subscription lifecycle, scheduler-driven auto-billing, and A2A peer-commerce wire contracts.
+- **Tests:** 226 integration tests on the Rust side covering every intent, every compat surface, durable state across restart, mandate signatures (`did:key` + `did:web`), subscription lifecycle + scheduler-driven auto-billing, dunning, webhooks end-to-end (with HMAC verification), rate limits, idempotency replays, golden-vector regression, and the MCP stdio subprocess.
 
 A second binary `icp-mcp-stdio` exposes the MCP surface as a subprocess-spawnable server suitable for Claude Desktop, Cursor, and other MCP-native clients.
 
 ---
 
-## 15. Roadmap
+## 15. Polyglot substrate
 
-Beyond the v0.1 cornerstone:
+The whole point of the spec + OpenAPI + golden-vectors discipline is that the ecosystem doesn't end at the Rust binary. A non-Rust developer can implement, operate, and verify an ICP deployment end-to-end:
 
-- `intent.negotiate`, `intent.confirm_receipt` (catalog completion)
-- Additional DID resolver methods (`did:stateset:buyer`)
-- Full engine routing for tax, promotions, shipping (placeholders today)
-- Subscription dunning, prorated mid-cycle changes, trial periods
-- Language bindings (Node, Python, Go) mirroring the ACP/UCP handlers
-- Publishing `icp-conformance` as `npx icp-conformance`
-- Multi-handler horizontal scale-out behind a sticky-by-`agent_id` load balancer with shared PostgreSQL
+- **`stateset-icp`** (PyPI) — a synchronous Python client handwritten from `/openapi.json` and `ICP_SPEC.md`. No code is imported or generated from the Rust source. Covers every ICP-Full intent (ergonomic `quote` / `authorize` / `buy` / `subscribe` / `a2a_pay` / `negotiate` / `confirm_receipt` / … wrappers), every read endpoint, the SSE event stream (context-managed `EventStream`), and inline mandate signing (`did:key` construction + compact-JWS signing with only `cryptography` as a crypto dep). 34 tests covering cross-language interop and wire contracts, all runnable offline via `httpx.MockTransport`.
+- **`@stateset/icp-conformance`** (npm) — a ~150-LOC pure-Node launcher around the Rust `icp-conformance` binary. Resolves the binary in priority order (env override → platform cache → `PATH` → `cargo run` fallback), passes argv through, propagates exit code. Lets non-Rust developers validate any handler against the spec with `npx @stateset/icp-conformance --url … --api-key …` and no cargo installed. Zero runtime deps.
+- **`@stateset/create-icp-commerce`** (npm) — one-command merchant scaffolder. `npx @stateset/create-icp-commerce my-store` generates a runnable Rust project (Cargo.toml + 20-line `main.rs` that calls `build_app_state` + `serve`, plus a preconfigured `.env`, `.gitignore`, and README walking through `cargo run` → `curl` smoke test → Python buy flow → `npx @stateset/icp-conformance` validation). 60 seconds from zero to a live merchant.
+- **Golden wire-format vectors** (`docs/specification/vectors/`) — byte-exact fixtures for the operations every implementation must agree on: Ed25519 public key → `did:key` multibase encoding, compact-JWS mandate signing (JCS-canonicalized header + payload, Ed25519 over the signing-input bytes). Pinned 32-byte seeds use RFC 8032 test vectors so the inputs are publicly cross-checkable. Rust regression tests and Python interop tests both load the same JSON fixtures and assert byte-identical output. **Proven end-to-end:** a mandate signed by the Python client decodes and verifies under the Rust handler; identical JWS strings come out of both languages given identical inputs.
+
+The Python and npm packages each carry their own package-scoped CHANGELOG so PyPI / npm readers see focused release notes rather than the handler's full changelog.
 
 ---
 
-## 16. Conclusion
+## 16. Roadmap
 
-The StateSet ICP Handler is a deliberately small, deliberately opinionated reference for a protocol whose goal is also small: give agents a single, stable, verifiable wire contract for commerce. The handler runs as one process. Every write is bound to an identified agent acting under a signed mandate. Every state change emits a signed receipt that any party can verify offline. Existing ACP, UCP, MCP, and A2A traffic lands on the same engine through compatibility paths. Subscriptions and peer-to-peer payments are first-class. Stablecoins, multi-jurisdiction tax, and cross-border fulfillment are not extensions.
+Phase 0-3 of the 1.0 readiness plan shipped in `v0.2.0`. Remaining work for a true 1.0:
 
-The bet behind ICP is that as agents take over an increasing fraction of commerce traffic, the protocol layer becomes the load-bearing surface — and merchants and platforms will prefer one protocol that subsumes the rest to a permanent matrix of bilateral integrations. This handler is the artifact that lets a merchant make that bet today, in one binary, against the same iCommerce engine that the rest of the StateSet stack runs on.
+- Additional DID resolver methods (`did:stateset:buyer`, formal `did:web` TTL-cache documentation).
+- Full engine routing for tax, promotions, and shipping (stub seams exist today — real providers pluggable via `ShippingCalculator`, `TaxEngine`, `PromotionEngine` traits in a follow-up release).
+- Go and Ruby bindings (Python + npm shipped; Go is the next natural target given agent frameworks in that language).
+- Distributed state: the in-memory rate-limit counter and the per-instance SQLite state pool both cap multi-handler scale-out. A Redis- or Postgres-backed `StateBackend` trait implementation removes that cap.
+- Multi-handler horizontal scale-out behind a sticky-by-`agent_id` load balancer with shared state.
+- GitHub Releases publishing pre-built `icp-conformance` binaries so `npx @stateset/icp-conformance` can download on first run rather than requiring a monorepo checkout.
+- ACP / UCP wire-format golden vectors to complement the current ICP-native ones.
+
+---
+
+## 17. Conclusion
+
+The StateSet ICP Handler is a deliberately small, deliberately opinionated reference for a protocol whose goal is also small: give agents a single, stable, verifiable wire contract for commerce. The handler runs as one process. Every write is bound to an identified agent acting under a signed mandate. Every state change emits a signed receipt that any party can verify offline. State survives restart. Existing ACP, UCP, MCP, and A2A traffic lands on the same engine through compatibility paths. Subscriptions, peer-to-peer payments, negotiation, and receipt confirmation are first-class. Stablecoins, multi-jurisdiction tax, and cross-border fulfillment are not extensions.
+
+The bet behind ICP is that as agents take over an increasing fraction of commerce traffic, the protocol layer becomes the load-bearing surface — and merchants and platforms will prefer one protocol that subsumes the rest to a permanent matrix of bilateral integrations. The bet behind this specific release is that a spec is only as real as the number of independent implementations that can interoperate with it. `v0.2.0` ships the Rust reference handler paired with a polyglot ecosystem — Python client, npm conformance harness, npm merchant scaffolder, byte-exact wire-format vectors — whose sole job is to make that independence provable. A Python developer with this release can implement, operate, and verify a StateSet merchant end-to-end without ever touching Rust. That is the substrate claim.
 
 ---
 
@@ -566,11 +583,16 @@ The bet behind ICP is that as agents take over an increasing fraction of commerc
 
 - ICP specification — `docs/specification/ICP_SPEC.md` (this repository)
 - ICP error catalog — `docs/specification/errors.md`
+- ICP wire-format golden vectors — `docs/specification/vectors/`
+- OpenAPI 3.1 schema — `GET /openapi.json` on any running handler
 - Architecture notes — `docs/architecture.md`
 - Interoperability mapping — `docs/interop.md`
 - Getting started — `docs/getting-started.md`
 - Agent guide — `docs/agent-guide.md`
 - Claude Desktop integration — `docs/claude-desktop.md`
+- Python client (`stateset-icp`) — `clients/python/README.md`
+- npm conformance wrapper (`@stateset/icp-conformance`) — `clients/npm/icp-conformance/README.md`
+- npm merchant scaffolder (`@stateset/create-icp-commerce`) — `clients/npm/create-icp-commerce/README.md`
 - StateSet iCommerce — https://github.com/stateset/stateset-icommerce
 - RFC 2119 — Key words for use in RFCs
 - RFC 3339 — Date and time on the Internet

@@ -1,11 +1,234 @@
 # Changelog
 
-All notable changes to the StateSet ICP Handler are documented here.
+All notable changes to the StateSet ICP Handler (Rust crate) are
+documented here. The sibling client packages each carry their own
+package-scoped changelog alongside their release notes on
+npm / PyPI:
+
+- Python — [`clients/python/CHANGELOG.md`](./clients/python/CHANGELOG.md)
+- npm `@stateset/icp-conformance` — [`clients/npm/icp-conformance/CHANGELOG.md`](./clients/npm/icp-conformance/CHANGELOG.md)
+- npm `@stateset/create-icp-commerce` — [`clients/npm/create-icp-commerce/CHANGELOG.md`](./clients/npm/create-icp-commerce/CHANGELOG.md)
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to date-based ICP versioning — see
 [`docs/specification/ICP_SPEC.md` §16](./docs/specification/ICP_SPEC.md#16-versioning).
 
 ## [Unreleased]
+
+### Added
+- **Tenant scoping for resource read endpoints** — closes the same
+  multi-tenancy gap on the per-resource read paths that the prior
+  iteration closed for `webhook_deliveries`. Previously any
+  authenticated caller could `GET /icp/v1/transactions/{id}`,
+  `/icp/v1/subscriptions/{id}`, or `/icp/v1/peer_quotes/{id}` and
+  read another tenant's PII / payment data, peer-quote pricing, and
+  subscription billing details just by guessing or enumerating ids.
+  - `Transaction` and `PeerQuote` now carry the originating
+    `tenant_id` (Subscription already did from the multi-tenant
+    webhook iteration). The field is stamped at creation time from
+    the bearer key — no caller-supplied path — and `#[serde(default)]`
+    keeps deserialization of pre-multi-tenant rows working.
+  - All 5 transaction-construction sites in `service.rs`
+    (`fresh_transaction`, the two A2A pay branches, the
+    refund-flow constructor, and `subscription_pseudo_txn`) plus
+    the peer-quote constructor in `do_a2a_quote` propagate
+    `input.tenant.tenant_id`.
+  - The three `GET /:id` handlers compare `tenant_id` after fetch
+    and return **404** on mismatch (not 403) — same shape as a
+    missing row, so a tenant cannot enumerate other tenants' id
+    spaces or confirm an id-guess.
+  - 4-test integration suite (`tests/resource_isolation.rs`):
+    each resource type's same-tenant read works and exposes the
+    stamped `tenant_id`; cross-tenant reads return 404; missing
+    ids also return 404; unauthenticated reads return 401.
+
+- **Tenant scoping + status filtering for `/icp/v1/webhook_deliveries`** —
+  closes the multi-tenancy gap introduced when per-tenant subscribers
+  shipped: previously every authenticated caller could `GET
+  /icp/v1/webhook_deliveries` and see *every other tenant's* webhook
+  payloads (and could probe / retry their delivery ids by guessing).
+  - `WebhookDelivery` rows now carry the originating `tenant_id`,
+    stamped at enqueue time from the bearer key (or from
+    `Subscription.tenant_id` for scheduler-driven renewal events).
+  - `GET /icp/v1/webhook_deliveries` returns only the caller's
+    tenant's rows. New `?status=pending|in_flight|delivered|failed|dead_lettered`
+    filter narrows by FSM state — useful for ops dashboards triaging
+    only the dead-letter queue. An unknown `status` value returns
+    400 with the bad value echoed (silent-empty would mask typos).
+    `?limit=` is supported with a hard upper bound of 500.
+  - `GET /icp/v1/webhook_deliveries/:id` and
+    `POST /icp/v1/webhook_deliveries/:id/retry` are tenant-scoped:
+    a cross-tenant id surfaces as **404** (identical to a missing
+    row), not 403/412 — existence is not leaked across tenant
+    boundaries, so tenant A can't enumerate B's id space or learn
+    that a given id is `failed`.
+  - 7-test integration suite (`tests/webhook_delivery_isolation.rs`):
+    list-only-own-rows, cross-tenant get → 404, cross-tenant retry →
+    404, status filter narrows, unknown status → 400, limit clamping,
+    unauthenticated rejection.
+- **Additive schema migrations** (`apply_column_additions`) — first
+  step toward versioned migrations. Splits the schema into a static
+  `CREATE TABLE IF NOT EXISTS` block (run on every open) and an
+  ordered list of `ALTER TABLE ... ADD COLUMN` statements that
+  tolerate the SQLite "duplicate column name" / "no such table"
+  errors a re-run produces. Indexes that depend on additively-added
+  columns also live here so they're created *after* the column
+  exists (a legacy DB would otherwise see `CREATE INDEX` fail with
+  "no such column"). Bootstraps the upgrade path: a handler binary
+  built from this commit applied against a DB created by an older
+  binary lifts the `tenant_id` column onto `webhook_deliveries`
+  with `''` defaults, leaves existing rows queryable, and adds the
+  `idx_webhook_deliveries_tenant_created` index needed by the new
+  per-tenant list endpoint. Verified by
+  `additive_migration_backfills_tenant_id_on_legacy_db` —
+  drops the column to simulate a pre-upgrade DB, reopens the pool,
+  and asserts the legacy row is still queryable with the defaulted
+  tenant_id.
+
+- **Per-tenant webhook subscribers** — multi-tenant deployments can
+  now register their own webhook destinations rather than sharing the
+  handler-wide `ICP_WEBHOOK_URL`. New CRUD surface lives under
+  `/icp/v1/webhook_subscribers`:
+  - `POST /icp/v1/webhook_subscribers` — create a subscriber for the
+    bearer's tenant. Body: `{ "url": "https://...", "secret": "..." }`.
+    URL must be `http(s)://`; secret must be non-empty (per-subscriber
+    HMAC key — receivers verify deliveries with this exact secret).
+    Returns the secret **once** so the caller can persist it
+    out-of-band; subsequent reads redact it.
+  - `GET /icp/v1/webhook_subscribers` — list this tenant's subscribers
+    (active + disabled), secret redacted.
+  - `GET /icp/v1/webhook_subscribers/:id` — read one. Returns 404
+    across tenants (existence is not leaked across tenant boundaries —
+    intentionally not 403).
+  - `POST /icp/v1/webhook_subscribers/:id/disable` — soft-disable.
+    Future events skip the subscriber; the row stays so the operator
+    can audit / re-enable.
+  - `DELETE /icp/v1/webhook_subscribers/:id` — hard-remove.
+  - Persistent `webhook_subscribers` table joins the existing SQLite
+    schema and survives restart; an in-memory variant backs the test
+    suite.
+  - **Fan-out semantics:** every state-changing intent enqueues one
+    `WebhookDelivery` per **active** subscriber whose `tenant_id`
+    matches the originating bearer's tenant. If the tenant has zero
+    subscribers, the legacy `ICP_WEBHOOK_URL` fallback fires (existing
+    single-tenant deployments keep working with no config change).
+    When subscribers are present, the global fallback is **suppressed**
+    for that tenant — explicit always wins over default.
+  - The originating `tenant_id` propagates from the bearer key
+    (`IntentInput.tenant.tenant_id`) and from the subscription
+    scheduler (`Subscription.tenant_id`, new field, defaulted for serde
+    backwards-compat). Cross-tenant event leakage is impossible by
+    construction — there is no code path where tenant A's event sees
+    tenant B's destinations.
+  - 10-test integration suite (`tests/webhook_subscribers.rs`) covering
+    CRUD, fan-out, tenant isolation (404 on cross-tenant read/write/
+    disable), disable semantics, validation (empty URL / non-http(s)
+    URL / empty secret), unauthenticated rejection, secret redaction
+    on read paths, global fallback behavior, and the "no subscribers +
+    no global = no outbox writes" no-op case.
+
+- **`examples/anthropic_agent.py`** (Python) — Claude running an ICP
+  merchant via Anthropic tool-use. 5 tools (search/quote/authorize/buy/
+  track), standard tool-use loop, mandate attached only to writes.
+  Substrate test for "agent framework as first-class consumer" — the
+  glue between Claude and the merchant is exactly the Python client
+  library, nothing custom. Optional `anthropic` dep; `ANTHROPIC_API_KEY`
+  required at runtime. See `clients/python/CHANGELOG.md` for the
+  package-scoped entry.
+- **`examples/listen.py`** — live SSE listener demo that pairs with
+  `buy_flow.py`. Prints each event to stdout with a fixed-width type
+  column and a one-line summary (`transaction_id`, `subscription_id`,
+  `peer_quote_id`, `order_id`, `agent_id`, totals when present), so the
+  output tails cleanly in a terminal. Ctrl-C exits without leaking the
+  underlying HTTP stream. Together with `buy_flow.py` the two examples
+  cover "agent-as-merchant" + "agent-as-observer" — the producer/
+  consumer halves of an ICP-Full deployment.
+- **Python SSE event-stream wrapper** — `icp.events()` returns a
+  context-managed iterator over `GET /icp/v1/events:stream`. Inline
+  text/event-stream parser (no new dep) handles blank-line dispatch,
+  comment keep-alives, multi-line `data:`, single-leading-space
+  stripping per the HTML Living Standard. `SseEvent` dataclass carries
+  `id`, `type`, auto-parsed `data` (when JSON), and `raw` for non-JSON
+  payloads. Clean break-out: exiting the `with` block closes the
+  underlying HTTP stream even on early `break`. 10-test
+  `tests/test_sse.py` suite using `httpx.MockTransport` covers the
+  parser end-to-end + the Client wrapper + 4xx → `IcpError` +
+  unmanaged-iteration guard.
+
+### Added
+- **Python client reaches ICP-Full parity** —
+  `clients/python/stateset_icp/client.py` now ships ergonomic wrappers
+  for all 17 intents in the ICP-Full catalog: `search`, `describe`,
+  `quote`, `authorize`, `buy`, `pay`, `track`, `return_` (trailing `_`
+  dodges the Python keyword), `refund_request`, `subscribe`, `renew`,
+  `pause`, `cancel_subscription`, `a2a_quote`, `a2a_pay` (two shapes —
+  pay-against-quote vs direct-pay, with a client-side validator),
+  `negotiate` (proposed-total vs discount-pct, mutually exclusive),
+  and `confirm_receipt`. The shared `_call(intent, params, ...)` helper
+  centralizes envelope construction so headers + auth propagate
+  uniformly through every wrapper.
+- **22-test envelope-contract suite** (`clients/python/tests/test_client_envelopes.py`)
+  using `httpx.MockTransport` — covers each wrapper's HTTP method +
+  URL, the exact `IntentEnvelope` body it produces, and header
+  propagation (`ICP-Mandate`, `ICP-Idempotency-Key`,
+  auto-generated `ICP-Request-Id`). Runs offline — no handler needed.
+  Catches any shape drift between the client and server's parsing
+  before a live request would 400.
+- Python client README updated with a complete intent-to-method table
+  so `pip install stateset-icp` → instant reference for every ICP-Full
+  flow.
+
+### Added
+- **Subscription dunning** — production-grade backoff between failed
+  renewal attempts. Previously after `MAX_RENEWAL_FAILURES = 3`
+  consecutive scheduler failures (which all happened in immediate
+  succession, often within a single tick window), a subscription
+  would past_due — meaning a transient card decline could past_due
+  the customer in seconds. The new
+  `Config.subscription_dunning_schedule_hours` (env var
+  `ICP_SUBSCRIPTION_DUNNING_SCHEDULE_HOURS`) takes a comma-separated
+  list of hour-counts; each entry is the wait between the Nth failure
+  and the next attempt. After the schedule is exhausted, the next
+  failure transitions to past_due. Default `1,6,24` (1h → 6h → 24h
+  → past_due on the 4th failure) gives transient issues the time
+  they need to self-resolve. An empty schedule preserves the legacy
+  immediate-retry semantics; `Config::for_test()` defaults to empty
+  so every existing scheduler test still passes byte-for-byte.
+  - New `IcpService::dunning_max_attempts()` derives the past-due
+    threshold from the schedule length so the two knobs can never
+    drift apart.
+  - New `dunning_next_attempt(failure_count, now)` consults the
+    schedule and returns the timestamp the next attempt should be
+    scheduled for; `None` means the schedule is exhausted.
+  - The scheduler's failure branch now pushes `next_charge_at`
+    forward by the configured backoff on each failure instead of
+    leaving it where it was — so the worker won't re-pick the sub
+    until the wall clock has advanced past the schedule entry.
+  - `parse_dunning_schedule` validates the env input: drops empty,
+    non-numeric, zero, and >8760 (>1 year) entries silently so a
+    typo can never crash boot or accept absurd waits.
+- 7 dunning integration tests (`tests/dunning.rs`):
+  - `first_failure_pushes_next_charge_by_first_backoff` — `[1, 6, 24]`
+    schedule + 1 failure → `next_charge_at` is exactly 1h forward.
+  - `second_tick_before_backoff_elapses_does_not_re_attempt` — the
+    property test: 30 min after a failure (still inside the 1h
+    backoff), a `tick_subscriptions` call sees 0 due subs and the
+    failure counter doesn't advance.
+  - `backoff_grows_with_each_failure_per_schedule` — three
+    consecutive failures with `[1, 6, 24]` set the backoff to 1h,
+    6h, 24h respectively.
+  - `schedule_exhaustion_transitions_to_past_due` — 4th failure
+    against a 3-entry schedule pasts_due.
+  - `successful_renewal_clears_dunning_state` — a manual
+    `intent.renew` between failures resets the counter AND moves
+    `next_charge_at` past the dunning backoff target.
+  - `empty_schedule_preserves_legacy_immediate_retry` — pins the
+    backwards-compat property: with no schedule, `next_charge_at`
+    is unchanged on failure (so the existing tests' `force_due`
+    pattern keeps working).
+  - `long_dunning_window_works_correctly` — Stripe-style
+    `[24, 72, 168]` (1d / 3d / 1w) schedule end-to-end through
+    past_due.
 
 ## [0.2.0] — 2026-04-21
 

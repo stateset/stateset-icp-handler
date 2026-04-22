@@ -56,6 +56,65 @@ pub fn open(path: &str) -> anyhow::Result<StatePool> {
 fn migrate(pool: &StatePool) -> anyhow::Result<()> {
     let conn = pool.get().context("acquire state conn for migration")?;
     conn.execute_batch(SCHEMA).context("apply state schema")?;
+    apply_column_additions(&conn).context("apply additive column migrations")?;
+    Ok(())
+}
+
+/// Idempotent additive column migrations + dependent index creation.
+///
+/// `CREATE TABLE IF NOT EXISTS` covers fresh DBs but doesn't touch a
+/// table that already exists with a stale shape. For each column added
+/// post-1.0 we issue an `ALTER TABLE ... ADD COLUMN` that tolerates the
+/// "duplicate column name" error a second-run will produce. SQLite has
+/// no native `ADD COLUMN IF NOT EXISTS`, so this is the supported
+/// pattern. Every column added here must have a `DEFAULT` so existing
+/// rows backfill cleanly without a separate UPDATE pass.
+///
+/// Indexes that reference newly-added columns live here too — they
+/// can't go in the static `SCHEMA` block because on a legacy DB that
+/// block runs *before* the column is added, and the bare
+/// `CREATE INDEX` would fail with `no such column`.
+///
+/// Keep this list strictly additive — never reorder, never alter,
+/// never drop. Breaking schema changes get a real `schema_version` /
+/// per-version migration ladder.
+fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    // 1) Add columns. Tolerate "duplicate column name" so a second run
+    //    is a no-op. Tolerate "no such table" so a partial / aborted
+    //    earlier migration doesn't wedge subsequent runs.
+    const COLUMN_ADDITIONS: &[&str] = &[
+        // tenant_id added so list/get/retry endpoints can scope by
+        // tenant and avoid leaking other tenants' webhook payloads.
+        // Existing pre-multi-tenant rows backfill to '' — invisible to
+        // any real tenant_id but still queryable for ops by string
+        // comparison, which is the desired isolation property.
+        "ALTER TABLE webhook_deliveries ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+    ];
+    for stmt in COLUMN_ADDITIONS {
+        match conn.execute(stmt, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") || msg.starts_with("no such table") => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("additive column migration failed: {stmt}")))
+            }
+        }
+    }
+
+    // 2) Indexes that depend on the columns above. `IF NOT EXISTS`
+    //    makes these safely idempotent.
+    const INDEX_ADDITIONS: &[&str] = &[
+        // Per-tenant list/get/retry queries scope by (tenant_id,
+        // created_at DESC). A composite index keeps the scan from
+        // touching cold rows as the table grows.
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_created \
+             ON webhook_deliveries(tenant_id, created_at)",
+    ];
+    for stmt in INDEX_ADDITIONS {
+        conn.execute(stmt, [])
+            .with_context(|| format!("additive index migration failed: {stmt}"))?;
+    }
     Ok(())
 }
 
@@ -136,13 +195,38 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     last_error       TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
-    delivered_at     TEXT
+    delivered_at     TEXT,
+    -- Originating tenant. The list/get/retry endpoints scope by this
+    -- column so tenant A never sees tenant B's payloads. Defaults to
+    -- '' for legacy single-tenant rows; see additive migration below.
+    tenant_id        TEXT NOT NULL DEFAULT ''
 );
 
 -- Worker scans by (status, next_attempt_at) every tick — composite index
 -- collapses the scan to an index range without touching cold rows.
 CREATE INDEX IF NOT EXISTS idx_webhook_status_next
     ON webhook_deliveries(status, next_attempt_at);
+
+-- Per-tenant webhook subscribers. Each row is one (tenant_id, url) pair
+-- that will receive events from that tenant's intent activity. The
+-- global ICP_WEBHOOK_URL stays as a fallback when a tenant has no
+-- registered subscribers — useful for ops dashboards observing the
+-- whole fleet — but production multi-tenant deployments register
+-- per-tenant rows so each merchant's events go to their own system.
+CREATE TABLE IF NOT EXISTS webhook_subscribers (
+    id          TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    secret      TEXT NOT NULL,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+-- Lookups always filter by tenant + active; index supports the
+-- per-tick fan-out scan with no full-table reads.
+CREATE INDEX IF NOT EXISTS idx_webhook_subscribers_tenant_active
+    ON webhook_subscribers(tenant_id, active);
 "#;
 
 #[cfg(test)]
@@ -167,6 +251,7 @@ mod tests {
         assert!(tables.contains(&"peer_quotes".to_string()));
         assert!(tables.contains(&"idempotency".to_string()));
         assert!(tables.contains(&"webhook_deliveries".to_string()));
+        assert!(tables.contains(&"webhook_subscribers".to_string()));
     }
 
     #[test]
@@ -196,6 +281,70 @@ mod tests {
                 .expect("select");
             assert_eq!(spent, 500);
             assert_eq!(window.as_deref(), Some("2026-04-21T00:00:00Z"));
+        }
+    }
+
+    /// Verifies the additive `tenant_id` migration backfills cleanly
+    /// onto a DB created by an older handler that didn't have the
+    /// column. Simulates the upgrade path: open a fresh pool, drop
+    /// `tenant_id` (post-condition: schema looks pre-migration),
+    /// insert a legacy row, then reopen — `apply_column_additions`
+    /// must run idempotently and the legacy row must remain queryable
+    /// with `tenant_id = ''`.
+    #[test]
+    fn additive_migration_backfills_tenant_id_on_legacy_db() {
+        let dir = tempdir();
+        let path = dir.join("legacy.db");
+        let path_str = path.to_string_lossy().to_string();
+
+        // First open: full schema (current version) is applied.
+        {
+            let pool = open(&path_str).expect("open 1");
+            let conn = pool.get().expect("acquire");
+            // Simulate "this DB was created before tenant_id existed"
+            // by dropping the column (and the index that references
+            // it). SQLite ≥ 3.35 supports DROP COLUMN.
+            conn.execute("DROP INDEX idx_webhook_deliveries_tenant_created", [])
+                .expect("drop tenant index");
+            conn.execute("ALTER TABLE webhook_deliveries DROP COLUMN tenant_id", [])
+                .expect("drop tenant_id to simulate legacy schema");
+            // Insert a legacy row without a tenant_id.
+            conn.execute(
+                "INSERT INTO webhook_deliveries \
+                     (id, event_id, event_type, url, payload_json, status, \
+                      attempts, max_attempts, next_attempt_at, \
+                      created_at, updated_at) \
+                 VALUES ('legacy_1', 'evt_legacy', 'transaction.completed', \
+                         'https://hooks.example/legacy', '{}', 'pending', \
+                          0, 5, '2026-01-01T00:00:00Z', \
+                          '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("insert legacy row");
+        }
+
+        // Second open: additive migration must run + the legacy row
+        // must still be readable, with tenant_id defaulted to ''.
+        {
+            let pool = open(&path_str).expect("open 2 (after schema upgrade)");
+            let conn = pool.get().expect("acquire");
+            let tenant_id: String = conn
+                .query_row(
+                    "SELECT tenant_id FROM webhook_deliveries WHERE id = 'legacy_1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("legacy row queryable post-migration");
+            assert_eq!(
+                tenant_id, "",
+                "legacy rows must backfill to empty string, not NULL"
+            );
+        }
+
+        // Third open: rerunning the migration must be a no-op (no
+        // duplicate-column error escapes).
+        {
+            let _pool = open(&path_str).expect("open 3 (idempotent re-migration)");
         }
     }
 
