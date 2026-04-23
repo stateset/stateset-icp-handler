@@ -83,6 +83,23 @@ fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     //    is a no-op. Tolerate "no such table" so a partial / aborted
     //    earlier migration doesn't wedge subsequent runs.
     const COLUMN_ADDITIONS: &[&str] = &[
+        // Denormalized metadata for indexed tenant list endpoints.
+        // The JSON payload remains the source of truth; these columns
+        // are maintained on insert/update so list endpoints don't need
+        // to materialize every row in production.
+        "ALTER TABLE transactions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE transactions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE transactions ADD COLUMN state TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE transactions ADD COLUMN quote_expires_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE subscriptions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE subscriptions ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE subscriptions ADD COLUMN next_charge_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE subscriptions ADD COLUMN payment_present INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE peer_quotes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE peer_quotes ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE peer_quotes ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE peer_quotes ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''",
         // tenant_id added so list/get/retry endpoints can scope by
         // tenant and avoid leaking other tenants' webhook payloads.
         // Existing pre-multi-tenant rows backfill to '' — invisible to
@@ -119,6 +136,24 @@ fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         // touching cold rows as the table grows.
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_created \
              ON webhook_deliveries(tenant_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_tenant_created \
+             ON transactions(tenant_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_tenant_state_created \
+             ON transactions(tenant_id, state, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_expiry_due \
+             ON transactions(state, quote_expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_created \
+             ON subscriptions(tenant_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_status_created \
+             ON subscriptions(tenant_id, status, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_subscriptions_renewal_due \
+             ON subscriptions(status, payment_present, next_charge_at)",
+        "CREATE INDEX IF NOT EXISTS idx_peer_quotes_tenant_created \
+             ON peer_quotes(tenant_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_peer_quotes_tenant_status_created \
+             ON peer_quotes(tenant_id, status, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_peer_quotes_expiry_due \
+             ON peer_quotes(status, expires_at)",
     ];
     for stmt in INDEX_ADDITIONS {
         conn.execute(stmt, [])
@@ -146,19 +181,32 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE TABLE IF NOT EXISTS transactions (
     id           TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    state        TEXT NOT NULL DEFAULT '',
+    quote_expires_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (
     id           TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT '',
+    next_charge_at TEXT NOT NULL DEFAULT '',
+    payment_present INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS peer_quotes (
     id           TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT '',
+    expires_at   TEXT NOT NULL DEFAULT ''
 );
 
 -- Durable idempotency cache (ICP spec §13). Stores the response body and

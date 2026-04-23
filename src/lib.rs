@@ -139,12 +139,12 @@ pub async fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
 fn load_api_keys(config: &Config) -> anyhow::Result<ApiKeyStore> {
     if let Some(raw) = &config.api_keys_json {
         let keys: Vec<ApiKeyInfo> = serde_json::from_str(raw)?;
-        return Ok(ApiKeyStore::new(keys));
+        return ApiKeyStore::try_new(keys);
     }
     if let Some(path) = &config.api_keys_file {
         let bytes = std::fs::read(path)?;
         let keys: Vec<ApiKeyInfo> = serde_json::from_slice(&bytes)?;
-        return Ok(ApiKeyStore::new(keys));
+        return ApiKeyStore::try_new(keys);
     }
     if config.enable_demo_keys {
         info!("loading bundled demo API keys (ICP_ENABLE_DEMO_KEYS=true)");
@@ -1425,7 +1425,7 @@ pub async fn get_mandate_usage(
     let usage = state
         .service
         .mandates
-        .usage_for_tenant(&jti, &tenant.tenant_id)
+        .try_usage_for_tenant(&jti, &tenant.tenant_id)?
         .ok_or_else(|| ApiError::ResourceNotFound(format!("mandate_usage {jti}")))?;
     Ok(Json(serde_json::json!({
         "jti": jti,
@@ -1451,13 +1451,18 @@ pub async fn sse_events(
     >,
     ApiError,
 > {
-    let _tenant = resolve_tenant(&headers, &state.keys)?;
+    let tenant = resolve_tenant(&headers, &state.keys)?;
     use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::StreamExt;
 
+    let tenant_id = tenant.tenant_id.clone();
+    let service = state.service.clone();
     let rx = state.service.events.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|evt| match evt {
+    let stream = BroadcastStream::new(rx).filter_map(move |evt| match evt {
         Ok(e) => {
+            if !service.event_belongs_to_tenant(&e, &tenant_id) {
+                return None;
+            }
             let data = serde_json::to_string(&e).unwrap_or_default();
             Some(Ok(axum::response::sse::Event::default()
                 .id(e.id)

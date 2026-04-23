@@ -24,6 +24,16 @@ fn key(name: &str, allowed_agents: Option<Vec<String>>, expires_delta: Duration)
     }
 }
 
+async fn build_with_keys_error(keys: Vec<ApiKeyInfo>) -> String {
+    let mut cfg = Config::for_test();
+    cfg.enable_demo_keys = false;
+    cfg.api_keys_json = Some(serde_json::to_string(&keys).unwrap());
+    match build_app_state(&cfg).await {
+        Ok(_) => panic!("build_app_state should reject malformed API keys"),
+        Err(err) => err.to_string(),
+    }
+}
+
 async fn submit_quote(app: &axum::Router, bearer: &str, agent_id: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -56,6 +66,34 @@ async fn submit_quote(app: &axum::Router, bearer: &str, agent_id: &str) -> (Stat
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+#[tokio::test]
+async fn duplicate_api_keys_are_rejected_at_boot() {
+    let err = build_with_keys_error(vec![
+        key("dup", None, Duration::hours(1)),
+        key("dup", None, Duration::hours(1)),
+    ])
+    .await;
+    assert!(err.contains("invalid API key configuration"));
+    assert!(err.contains("duplicate API key"));
+}
+
+#[tokio::test]
+async fn malformed_api_key_entries_are_rejected_at_boot() {
+    let err = build_with_keys_error(vec![ApiKeyInfo {
+        key: " ".into(),
+        tenant_id: "".into(),
+        name: "".into(),
+        rate_limit_per_minute: None,
+        allowed_agents: Some(vec!["".into()]),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+    }])
+    .await;
+    assert!(err.contains("key must not be empty"));
+    assert!(err.contains("tenant_id must not be empty"));
+    assert!(err.contains("name must not be empty"));
+    assert!(err.contains("allowed_agents[0] must not be empty"));
 }
 
 #[tokio::test]

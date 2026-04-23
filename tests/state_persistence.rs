@@ -278,6 +278,75 @@ fn transaction_update_missing_returns_none() {
     assert!(result.is_none());
 }
 
+#[test]
+fn transaction_index_metadata_is_stamped_and_updated() {
+    let path = scratch_db_path();
+    let path_str = path.to_string_lossy().to_string();
+    let id = "txn-index-1";
+
+    {
+        let pool = state_db::open(&path_str).expect("open pool");
+        let store = TransactionStore::with_pool(pool.clone());
+        let mut txn = minimal_txn(id);
+        txn.tenant_id = "tenant_index".into();
+        store.insert(txn);
+
+        let conn = pool.get().expect("conn");
+        let (tenant, state): (String, String) = conn
+            .query_row(
+                "SELECT tenant_id, state FROM transactions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("metadata row");
+        assert_eq!(tenant, "tenant_index");
+        assert_eq!(state, "draft");
+
+        store
+            .update(id, |t| t.state = TransactionState::Quoted)
+            .expect("update");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM transactions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("updated metadata row");
+        assert_eq!(state, "quoted");
+    }
+
+    cleanup(&path);
+}
+
+#[test]
+fn corrupt_transaction_payload_is_logged_and_ignored() {
+    let pool = state_db::open(":memory:").expect("open in-memory");
+    let conn = pool.get().expect("conn");
+    conn.execute(
+        "INSERT INTO transactions \
+             (id, payload_json, updated_at, tenant_id, created_at, state) \
+         VALUES ('txn-corrupt', '{not json', '2026-04-23T00:00:00Z', \
+                 'tenant_corrupt', '2026-04-23T00:00:00Z', 'draft')",
+        [],
+    )
+    .expect("insert corrupt row");
+    drop(conn);
+
+    let store = TransactionStore::with_pool(pool);
+    assert!(
+        store.get("txn-corrupt").is_none(),
+        "corrupt persisted JSON should behave like a miss, not panic"
+    );
+    assert!(
+        store.list(10).is_empty(),
+        "list should skip corrupt rows instead of panicking"
+    );
+    assert!(
+        store.update("txn-corrupt", |_t| {}).is_none(),
+        "update should skip corrupt rows instead of panicking"
+    );
+}
+
 // --------------------------------------------------------------------------
 // In-memory isolation — separate open() calls must not share state
 // --------------------------------------------------------------------------

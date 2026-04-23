@@ -246,12 +246,12 @@ impl IcpService {
         if let Some(ev) = mandate.as_ref() {
             let spend = outcome.recorded_spend_minor;
             if spend > 0 {
-                self.mandates.record_spend(
+                self.mandates.try_record_spend(
                     &ev.payload.jti,
                     &input.tenant.tenant_id,
                     spend,
                     Utc::now(),
-                );
+                )?;
             }
         }
 
@@ -365,6 +365,39 @@ impl IcpService {
         self.events.emit(event);
 
         Ok(body)
+    }
+
+    /// Return true when an in-process event belongs to `tenant_id`.
+    ///
+    /// The event bus is intentionally process-wide so background
+    /// workers, gRPC streams, and SSE can share one fan-out channel.
+    /// Public streaming endpoints must apply this predicate before
+    /// serializing an event, otherwise one tenant can observe another
+    /// tenant's lifecycle metadata.
+    pub fn event_belongs_to_tenant(&self, event: &Event, tenant_id: &str) -> bool {
+        if let Some(txn_id) = event.transaction_id.as_deref() {
+            return self
+                .transactions
+                .get(txn_id)
+                .is_some_and(|t| t.tenant_id == tenant_id);
+        }
+        if let Some(sub_id) = event
+            .payload
+            .get("subscription_id")
+            .and_then(|v| v.as_str())
+        {
+            return self
+                .subscriptions
+                .get(sub_id)
+                .is_some_and(|s| s.tenant_id == tenant_id);
+        }
+        if let Some(peer_quote_id) = event.payload.get("peer_quote_id").and_then(|v| v.as_str()) {
+            return self
+                .peer_quotes
+                .get(peer_quote_id)
+                .is_some_and(|q| q.tenant_id == tenant_id);
+        }
+        false
     }
 
     // ---------- search / describe ----------
@@ -1322,16 +1355,7 @@ impl IcpService {
     /// `past_due`. A successful renewal resets the counter.
     pub async fn tick_subscriptions(&self, now: chrono::DateTime<Utc>) -> SchedulerTickReport {
         let mut report = SchedulerTickReport::default();
-        let due: Vec<Subscription> = self
-            .subscriptions
-            .list(usize::MAX)
-            .into_iter()
-            .filter(|s| {
-                matches!(s.status, SubscriptionStatus::Active)
-                    && s.next_charge_at <= now
-                    && s.payment_instrument.is_some()
-            })
-            .collect();
+        let due: Vec<Subscription> = self.subscriptions.list_due_for_renewal(now);
         report.scanned = self.subscriptions.len();
         report.due = due.len();
 
@@ -1498,15 +1522,7 @@ impl IcpService {
         let mut report = ExpiryTickReport::default();
 
         // Transactions ----------------------------------------------------
-        let due_txns: Vec<Transaction> = self
-            .transactions
-            .list(usize::MAX)
-            .into_iter()
-            .filter(|t| {
-                matches!(t.state, TransactionState::Draft | TransactionState::Quoted)
-                    && t.quote_expires_at.is_some_and(|exp| exp <= now)
-            })
-            .collect();
+        let due_txns: Vec<Transaction> = self.transactions.list_due_for_expiry(now);
         for txn in due_txns {
             self.transactions.update(&txn.id, |t| {
                 t.state = TransactionState::Expired;
@@ -1563,15 +1579,7 @@ impl IcpService {
         // Peer quotes — sweep across all tenants. The user-facing
         // list endpoint is tenant-scoped; this background pass is
         // operator-level and needs the unrestricted view.
-        let due_quotes: Vec<PeerQuote> = self
-            .peer_quotes
-            .list_all(usize::MAX)
-            .into_iter()
-            .filter(|q| {
-                matches!(q.status, PeerQuoteStatus::Pending | PeerQuoteStatus::Quoted)
-                    && q.expires_at <= now
-            })
-            .collect();
+        let due_quotes: Vec<PeerQuote> = self.peer_quotes.list_due_for_expiry(now);
         for quote in due_quotes {
             self.peer_quotes.update(&quote.id, |q| {
                 q.status = PeerQuoteStatus::Expired;

@@ -16,6 +16,44 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-04-23
+
+### Changed
+- Tenant list endpoints for transactions, subscriptions, and peer
+  quotes now use SQLite metadata indexes (`tenant_id`, lifecycle
+  state/status, `created_at`) instead of materializing every JSON
+  payload in the state store. Legacy blank-metadata rows still fall
+  back to the old JSON scan path when needed.
+- Subscription scheduler status counts now aggregate from indexed
+  SQLite status metadata when available, avoiding full JSON
+  materialization on every metrics tick.
+- Subscription renewal and quote-expiry workers now fetch due work from
+  SQLite deadline indexes (`next_charge_at`, `quote_expires_at`,
+  `expires_at`) instead of scanning every subscription, transaction,
+  and peer quote on each background tick.
+- Mandate budget checks and post-intent spend recording now surface
+  durable-ledger backend failures as retriable engine errors instead
+  of crashing the process or continuing with an unsafe empty ledger
+  view.
+
+### Fixed
+- HTTP SSE event streams now apply the same tenant ownership filter as
+  gRPC streams before serializing events. A caller subscribed to
+  `/icp/v1/events:stream` only receives events whose transaction,
+  subscription, or peer quote belongs to the caller's bearer tenant.
+- API key JSON/file loading now fails fast on malformed credentials
+  instead of silently accepting blank fields or duplicate bearer keys
+  that shadow earlier entries.
+- Corrupt JSON rows in the transaction/subscription/peer-quote store
+  are logged and skipped rather than panicking request handlers or
+  background workers.
+- Idempotency and receipt stores now log backend, lock, and corrupt-row
+  failures and return miss/empty results instead of panicking the
+  handler process.
+- Webhook subscriber and outbox stores now handle lock, pool, query,
+  update, count, and prune failures without panicking request handlers
+  or background delivery workers.
+
 ## [0.3.0] — 2026-04-22
 
 ### Added

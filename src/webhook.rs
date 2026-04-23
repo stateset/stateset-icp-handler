@@ -245,15 +245,23 @@ impl SubscriberStore {
     /// fresh id and the secret populated.
     pub fn insert(&self, sub: WebhookSubscriber) {
         match &self.backend {
-            SubBackend::Memory(inner) => {
-                inner
-                    .write()
-                    .expect("subscribers write")
-                    .insert(sub.id.clone(), sub);
-            }
+            SubBackend::Memory(inner) => match inner.write() {
+                Ok(mut guard) => {
+                    guard.insert(sub.id.clone(), sub);
+                }
+                Err(err) => {
+                    tracing::error!(%err, "webhook subscriber write lock poisoned");
+                }
+            },
             SubBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("subscribers pool acquire");
-                conn.execute(
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id = %sub.id, %err, "webhook subscriber pool acquire failed");
+                        return;
+                    }
+                };
+                if let Err(err) = conn.execute(
                     "INSERT INTO webhook_subscribers \
                          (id, tenant_id, url, secret, active, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -266,17 +274,30 @@ impl SubscriberStore {
                         sub.created_at.to_rfc3339(),
                         sub.updated_at.to_rfc3339(),
                     ],
-                )
-                .expect("subscribers insert");
+                ) {
+                    tracing::error!(%err, "webhook subscriber insert failed");
+                }
             }
         }
     }
 
     pub fn get(&self, id: &str) -> Option<WebhookSubscriber> {
         match &self.backend {
-            SubBackend::Memory(inner) => inner.read().expect("subscribers read").get(id).cloned(),
+            SubBackend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard.get(id).cloned(),
+                Err(err) => {
+                    tracing::error!(%err, "webhook subscriber read lock poisoned");
+                    None
+                }
+            },
             SubBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("subscribers pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber pool acquire failed");
+                        return None;
+                    }
+                };
                 conn.query_row(
                     "SELECT id, tenant_id, url, secret, active, created_at, updated_at \
                      FROM webhook_subscribers WHERE id = ?1",
@@ -284,7 +305,10 @@ impl SubscriberStore {
                     Self::row_to_subscriber,
                 )
                 .optional()
-                .expect("subscribers read")
+                .unwrap_or_else(|err| {
+                    tracing::error!(id, %err, "webhook subscriber read failed");
+                    None
+                })
             }
         }
     }
@@ -293,25 +317,45 @@ impl SubscriberStore {
     /// state. Used by the `GET /icp/v1/webhook_subscribers` endpoint.
     pub fn list_for_tenant(&self, tenant_id: &str) -> Vec<WebhookSubscriber> {
         match &self.backend {
-            SubBackend::Memory(inner) => inner
-                .read()
-                .expect("subscribers read")
-                .values()
-                .filter(|s| s.tenant_id == tenant_id)
-                .cloned()
-                .collect(),
+            SubBackend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard
+                    .values()
+                    .filter(|s| s.tenant_id == tenant_id)
+                    .cloned()
+                    .collect(),
+                Err(err) => {
+                    tracing::error!(tenant_id, %err, "webhook subscriber read lock poisoned");
+                    Vec::new()
+                }
+            },
             SubBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("subscribers pool acquire");
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, tenant_id, url, secret, active, created_at, updated_at \
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(tenant_id, %err, "webhook subscriber pool acquire failed");
+                        return Vec::new();
+                    }
+                };
+                let mut stmt = match conn.prepare(
+                    "SELECT id, tenant_id, url, secret, active, created_at, updated_at \
                          FROM webhook_subscribers WHERE tenant_id = ?1 \
                          ORDER BY created_at DESC",
-                    )
-                    .expect("prepare list_for_tenant");
-                let rows = stmt
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(err) => {
+                        tracing::error!(tenant_id, %err, "prepare webhook subscriber tenant list failed");
+                        return Vec::new();
+                    }
+                };
+                let rows = match stmt
                     .query_map(rusqlite::params![tenant_id], Self::row_to_subscriber)
-                    .expect("query list_for_tenant");
+                {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::error!(tenant_id, %err, "query webhook subscriber tenant list failed");
+                        return Vec::new();
+                    }
+                };
                 rows.filter_map(Result::ok).collect()
             }
         }
@@ -335,7 +379,13 @@ impl SubscriberStore {
     ) -> Option<WebhookSubscriber> {
         match &self.backend {
             SubBackend::Memory(inner) => {
-                let mut guard = inner.write().expect("subscribers write");
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber write lock poisoned");
+                        return None;
+                    }
+                };
                 let s = guard.get_mut(id)?;
                 s.active = active;
                 s.updated_at = now;
@@ -343,13 +393,24 @@ impl SubscriberStore {
             }
             SubBackend::Sqlite(pool) => {
                 let updated = {
-                    let conn = pool.get().expect("subscribers pool acquire");
-                    conn.execute(
+                    let conn = match pool.get() {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            tracing::error!(id, %err, "webhook subscriber pool acquire failed");
+                            return None;
+                        }
+                    };
+                    match conn.execute(
                         "UPDATE webhook_subscribers SET active = ?1, updated_at = ?2 \
                          WHERE id = ?3",
                         rusqlite::params![i64::from(active), now.to_rfc3339(), id],
-                    )
-                    .expect("subscribers set_active")
+                    ) {
+                        Ok(updated) => updated,
+                        Err(err) => {
+                            tracing::error!(id, %err, "webhook subscriber set_active failed");
+                            return None;
+                        }
+                    }
                 };
                 if updated == 0 {
                     None
@@ -376,7 +437,13 @@ impl SubscriberStore {
     ) -> Option<WebhookSubscriber> {
         match &self.backend {
             SubBackend::Memory(inner) => {
-                let mut guard = inner.write().expect("subscribers write");
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber write lock poisoned");
+                        return None;
+                    }
+                };
                 let s = guard.get_mut(id)?;
                 if let Some(u) = url {
                     s.url = u.to_string();
@@ -399,20 +466,30 @@ impl SubscriberStore {
                     current.secret = Some(sec.to_string());
                 }
                 current.updated_at = now;
-                let conn = pool.get().expect("subscribers pool acquire");
-                let n = conn
-                    .execute(
-                        "UPDATE webhook_subscribers \
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber pool acquire failed");
+                        return None;
+                    }
+                };
+                let n = match conn.execute(
+                    "UPDATE webhook_subscribers \
                          SET url = ?1, secret = ?2, updated_at = ?3 \
                          WHERE id = ?4",
-                        rusqlite::params![
-                            current.url,
-                            current.secret.clone().unwrap_or_default(),
-                            current.updated_at.to_rfc3339(),
-                            id,
-                        ],
-                    )
-                    .expect("subscribers patch");
+                    rusqlite::params![
+                        current.url,
+                        current.secret.clone().unwrap_or_default(),
+                        current.updated_at.to_rfc3339(),
+                        id,
+                    ],
+                ) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber patch failed");
+                        return None;
+                    }
+                };
                 if n == 0 {
                     None
                 } else {
@@ -424,33 +501,58 @@ impl SubscriberStore {
 
     pub fn delete(&self, id: &str) -> bool {
         match &self.backend {
-            SubBackend::Memory(inner) => inner
-                .write()
-                .expect("subscribers write")
-                .remove(id)
-                .is_some(),
+            SubBackend::Memory(inner) => match inner.write() {
+                Ok(mut guard) => guard.remove(id).is_some(),
+                Err(err) => {
+                    tracing::error!(id, %err, "webhook subscriber write lock poisoned");
+                    false
+                }
+            },
             SubBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("subscribers pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook subscriber pool acquire failed");
+                        return false;
+                    }
+                };
                 conn.execute(
                     "DELETE FROM webhook_subscribers WHERE id = ?1",
                     rusqlite::params![id],
                 )
-                .expect("subscribers delete")
-                    > 0
+                .unwrap_or_else(|err| {
+                    tracing::error!(id, %err, "webhook subscriber delete failed");
+                    0
+                }) > 0
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match &self.backend {
-            SubBackend::Memory(inner) => inner.read().expect("subscribers read").len(),
+            SubBackend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard.len(),
+                Err(err) => {
+                    tracing::error!(%err, "webhook subscriber read lock poisoned");
+                    0
+                }
+            },
             SubBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("subscribers pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook subscriber pool acquire failed");
+                        return 0;
+                    }
+                };
                 conn.query_row("SELECT COUNT(*) FROM webhook_subscribers", [], |r| {
                     r.get::<_, i64>(0)
                 })
                 .map(|n| n as usize)
-                .expect("subscribers count")
+                .unwrap_or_else(|err| {
+                    tracing::error!(%err, "webhook subscriber count failed");
+                    0
+                })
             }
         }
     }
@@ -520,15 +622,23 @@ impl WebhookOutbox {
 
     pub fn enqueue(&self, delivery: WebhookDelivery) {
         match &self.backend {
-            Backend::Memory(inner) => {
-                inner
-                    .write()
-                    .expect("outbox write")
-                    .insert(delivery.id.clone(), delivery);
-            }
+            Backend::Memory(inner) => match inner.write() {
+                Ok(mut guard) => {
+                    guard.insert(delivery.id.clone(), delivery);
+                }
+                Err(err) => {
+                    tracing::error!(%err, "webhook outbox write lock poisoned");
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
-                conn.execute(
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id = %delivery.id, %err, "webhook outbox pool acquire failed");
+                        return;
+                    }
+                };
+                if let Err(err) = conn.execute(
                     "INSERT INTO webhook_deliveries \
                          (id, event_id, event_type, url, payload_json, status, \
                           attempts, max_attempts, next_attempt_at, \
@@ -553,17 +663,30 @@ impl WebhookOutbox {
                         delivery.delivered_at.map(|d| d.to_rfc3339()),
                         delivery.tenant_id,
                     ],
-                )
-                .expect("outbox enqueue");
+                ) {
+                    tracing::error!(%err, "webhook outbox enqueue failed");
+                }
             }
         }
     }
 
     pub fn get(&self, id: &str) -> Option<WebhookDelivery> {
         match &self.backend {
-            Backend::Memory(inner) => inner.read().expect("outbox read").get(id).cloned(),
+            Backend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard.get(id).cloned(),
+                Err(err) => {
+                    tracing::error!(id, %err, "webhook outbox read lock poisoned");
+                    None
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook outbox pool acquire failed");
+                        return None;
+                    }
+                };
                 let row: Option<DeliveryRow> = conn
                     .query_row(
                         "SELECT id, event_id, event_type, url, payload_json, status, \
@@ -575,7 +698,10 @@ impl WebhookOutbox {
                         DeliveryRow::from_row,
                     )
                     .optional()
-                    .expect("outbox read");
+                    .unwrap_or_else(|err| {
+                        tracing::error!(id, %err, "webhook outbox read failed");
+                        None
+                    });
                 row.map(WebhookDelivery::from_row)
             }
         }
@@ -586,25 +712,34 @@ impl WebhookOutbox {
     pub fn list_due(&self, now: DateTime<Utc>, limit: usize) -> Vec<WebhookDelivery> {
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut due: Vec<_> = inner
-                    .read()
-                    .expect("outbox read")
-                    .values()
-                    .filter(|d| {
-                        matches!(d.status, DeliveryStatus::Pending | DeliveryStatus::Failed)
-                            && d.next_attempt_at <= now
-                    })
-                    .cloned()
-                    .collect();
+                let mut due: Vec<_> = match inner.read() {
+                    Ok(guard) => guard
+                        .values()
+                        .filter(|d| {
+                            matches!(d.status, DeliveryStatus::Pending | DeliveryStatus::Failed)
+                                && d.next_attempt_at <= now
+                        })
+                        .cloned()
+                        .collect(),
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox read lock poisoned");
+                        Vec::new()
+                    }
+                };
                 due.sort_by(|a, b| a.next_attempt_at.cmp(&b.next_attempt_at));
                 due.truncate(limit);
                 due
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, event_id, event_type, url, payload_json, status, \
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return Vec::new();
+                    }
+                };
+                let mut stmt = match conn.prepare(
+                    "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
                                 created_at, updated_at, delivered_at, tenant_id \
@@ -613,14 +748,23 @@ impl WebhookOutbox {
                            AND next_attempt_at <= ?1 \
                          ORDER BY next_attempt_at ASC \
                          LIMIT ?2",
-                    )
-                    .expect("prepare list_due");
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![now.to_rfc3339(), limit as i64],
-                        DeliveryRow::from_row,
-                    )
-                    .expect("query list_due");
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(err) => {
+                        tracing::error!(%err, "prepare webhook outbox due list failed");
+                        return Vec::new();
+                    }
+                };
+                let rows = match stmt.query_map(
+                    rusqlite::params![now.to_rfc3339(), limit as i64],
+                    DeliveryRow::from_row,
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::error!(%err, "query webhook outbox due list failed");
+                        return Vec::new();
+                    }
+                };
                 rows.filter_map(Result::ok)
                     .map(WebhookDelivery::from_row)
                     .collect()
@@ -631,31 +775,47 @@ impl WebhookOutbox {
     pub fn list_recent(&self, limit: usize) -> Vec<WebhookDelivery> {
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut all: Vec<_> = inner
-                    .read()
-                    .expect("outbox read")
-                    .values()
-                    .cloned()
-                    .collect();
+                let mut all: Vec<_> = match inner.read() {
+                    Ok(guard) => guard.values().cloned().collect(),
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox read lock poisoned");
+                        Vec::new()
+                    }
+                };
                 all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 all.truncate(limit);
                 all
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, event_id, event_type, url, payload_json, status, \
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return Vec::new();
+                    }
+                };
+                let mut stmt = match conn.prepare(
+                    "SELECT id, event_id, event_type, url, payload_json, status, \
                                 attempts, max_attempts, next_attempt_at, \
                                 last_status_code, last_error, \
                                 created_at, updated_at, delivered_at, tenant_id \
                          FROM webhook_deliveries \
                          ORDER BY created_at DESC LIMIT ?1",
-                    )
-                    .expect("prepare list_recent");
-                let rows = stmt
-                    .query_map(rusqlite::params![limit as i64], DeliveryRow::from_row)
-                    .expect("query list_recent");
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(err) => {
+                        tracing::error!(%err, "prepare webhook outbox recent list failed");
+                        return Vec::new();
+                    }
+                };
+                let rows =
+                    match stmt.query_map(rusqlite::params![limit as i64], DeliveryRow::from_row) {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            tracing::error!(%err, "query webhook outbox recent list failed");
+                            return Vec::new();
+                        }
+                    };
                 rows.filter_map(Result::ok)
                     .map(WebhookDelivery::from_row)
                     .collect()
@@ -676,57 +836,83 @@ impl WebhookOutbox {
     ) -> Vec<WebhookDelivery> {
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut all: Vec<_> = inner
-                    .read()
-                    .expect("outbox read")
-                    .values()
-                    .filter(|d| d.tenant_id == tenant_id)
-                    .filter(|d| status.is_none_or(|s| d.status == s))
-                    .cloned()
-                    .collect();
+                let mut all: Vec<_> = match inner.read() {
+                    Ok(guard) => guard
+                        .values()
+                        .filter(|d| d.tenant_id == tenant_id)
+                        .filter(|d| status.is_none_or(|s| d.status == s))
+                        .cloned()
+                        .collect(),
+                    Err(err) => {
+                        tracing::error!(tenant_id, %err, "webhook outbox read lock poisoned");
+                        Vec::new()
+                    }
+                };
                 all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                 all.truncate(limit);
                 all
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(tenant_id, %err, "webhook outbox pool acquire failed");
+                        return Vec::new();
+                    }
+                };
                 let rows: Vec<DeliveryRow> = if let Some(status) = status {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, event_id, event_type, url, payload_json, status, \
+                    let mut stmt = match conn.prepare(
+                        "SELECT id, event_id, event_type, url, payload_json, status, \
                                     attempts, max_attempts, next_attempt_at, \
                                     last_status_code, last_error, \
                                     created_at, updated_at, delivered_at, tenant_id \
                              FROM webhook_deliveries \
                              WHERE tenant_id = ?1 AND status = ?2 \
                              ORDER BY created_at DESC LIMIT ?3",
-                        )
-                        .expect("prepare list_recent_for_tenant_filtered");
-                    let mapped = stmt
-                        .query_map(
-                            rusqlite::params![tenant_id, status.wire_name(), limit as i64],
-                            DeliveryRow::from_row,
-                        )
-                        .expect("query list_recent_for_tenant_filtered");
+                    ) {
+                        Ok(stmt) => stmt,
+                        Err(err) => {
+                            tracing::error!(tenant_id, %err, "prepare webhook outbox tenant filtered list failed");
+                            return Vec::new();
+                        }
+                    };
+                    let mapped = match stmt.query_map(
+                        rusqlite::params![tenant_id, status.wire_name(), limit as i64],
+                        DeliveryRow::from_row,
+                    ) {
+                        Ok(mapped) => mapped,
+                        Err(err) => {
+                            tracing::error!(tenant_id, %err, "query webhook outbox tenant filtered list failed");
+                            return Vec::new();
+                        }
+                    };
                     mapped.filter_map(Result::ok).collect()
                 } else {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, event_id, event_type, url, payload_json, status, \
+                    let mut stmt = match conn.prepare(
+                        "SELECT id, event_id, event_type, url, payload_json, status, \
                                     attempts, max_attempts, next_attempt_at, \
                                     last_status_code, last_error, \
                                     created_at, updated_at, delivered_at, tenant_id \
                              FROM webhook_deliveries \
                              WHERE tenant_id = ?1 \
                              ORDER BY created_at DESC LIMIT ?2",
-                        )
-                        .expect("prepare list_recent_for_tenant");
-                    let mapped = stmt
-                        .query_map(
-                            rusqlite::params![tenant_id, limit as i64],
-                            DeliveryRow::from_row,
-                        )
-                        .expect("query list_recent_for_tenant");
+                    ) {
+                        Ok(stmt) => stmt,
+                        Err(err) => {
+                            tracing::error!(tenant_id, %err, "prepare webhook outbox tenant list failed");
+                            return Vec::new();
+                        }
+                    };
+                    let mapped = match stmt.query_map(
+                        rusqlite::params![tenant_id, limit as i64],
+                        DeliveryRow::from_row,
+                    ) {
+                        Ok(mapped) => mapped,
+                        Err(err) => {
+                            tracing::error!(tenant_id, %err, "query webhook outbox tenant list failed");
+                            return Vec::new();
+                        }
+                    };
                     mapped.filter_map(Result::ok).collect()
                 };
                 rows.into_iter().map(WebhookDelivery::from_row).collect()
@@ -848,14 +1034,32 @@ impl WebhookOutbox {
     {
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut guard = inner.write().expect("outbox write");
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook outbox write lock poisoned");
+                        return;
+                    }
+                };
                 if let Some(d) = guard.get_mut(id) {
                     f(d);
                 }
             }
             Backend::Sqlite(pool) => {
-                let mut conn = pool.get().expect("outbox pool acquire");
-                let tx = conn.transaction().expect("outbox tx");
+                let mut conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(id, %err, "webhook outbox pool acquire failed");
+                        return;
+                    }
+                };
+                let tx = match conn.transaction() {
+                    Ok(tx) => tx,
+                    Err(err) => {
+                        tracing::error!(id, %err, "begin webhook outbox transaction failed");
+                        return;
+                    }
+                };
                 let row: Option<DeliveryRow> = tx
                     .query_row(
                         "SELECT id, event_id, event_type, url, payload_json, status, \
@@ -867,11 +1071,14 @@ impl WebhookOutbox {
                         DeliveryRow::from_row,
                     )
                     .optional()
-                    .expect("outbox read-for-update");
+                    .unwrap_or_else(|err| {
+                        tracing::error!(id, %err, "webhook outbox read-for-update failed");
+                        None
+                    });
                 let Some(row) = row else { return };
                 let mut delivery = WebhookDelivery::from_row(row);
                 f(&mut delivery);
-                tx.execute(
+                if let Err(err) = tx.execute(
                     "UPDATE webhook_deliveries SET \
                          status = ?1, attempts = ?2, next_attempt_at = ?3, \
                          last_status_code = ?4, last_error = ?5, \
@@ -887,23 +1094,42 @@ impl WebhookOutbox {
                         delivery.delivered_at.map(|d| d.to_rfc3339()),
                         delivery.id,
                     ],
-                )
-                .expect("outbox update");
-                tx.commit().expect("outbox commit");
+                ) {
+                    tracing::error!(id, %err, "webhook outbox update failed");
+                    return;
+                }
+                if let Err(err) = tx.commit() {
+                    tracing::error!(id, %err, "webhook outbox commit failed");
+                }
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match &self.backend {
-            Backend::Memory(inner) => inner.read().expect("outbox read").len(),
+            Backend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard.len(),
+                Err(err) => {
+                    tracing::error!(%err, "webhook outbox read lock poisoned");
+                    0
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return 0;
+                    }
+                };
                 conn.query_row("SELECT COUNT(*) FROM webhook_deliveries", [], |r| {
                     r.get::<_, i64>(0)
                 })
                 .map(|n| n as usize)
-                .expect("outbox count")
+                .unwrap_or_else(|err| {
+                    tracing::error!(%err, "webhook outbox count failed");
+                    0
+                })
             }
         }
     }
@@ -915,7 +1141,13 @@ impl WebhookOutbox {
     pub fn status_counts(&self) -> StatusCounts {
         match &self.backend {
             Backend::Memory(inner) => {
-                let guard = inner.read().expect("outbox read");
+                let guard = match inner.read() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox read lock poisoned");
+                        return StatusCounts::default();
+                    }
+                };
                 let mut counts = StatusCounts::default();
                 for d in guard.values() {
                     match d.status {
@@ -929,17 +1161,33 @@ impl WebhookOutbox {
                 counts
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
-                let mut stmt = conn
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return StatusCounts::default();
+                    }
+                };
+                let mut stmt = match conn
                     .prepare("SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status")
-                    .expect("prepare status_counts");
-                let rows = stmt
-                    .query_map([], |row| {
-                        let s: String = row.get(0)?;
-                        let n: i64 = row.get(1)?;
-                        Ok((s, n))
-                    })
-                    .expect("query status_counts");
+                {
+                    Ok(stmt) => stmt,
+                    Err(err) => {
+                        tracing::error!(%err, "prepare webhook outbox status_counts failed");
+                        return StatusCounts::default();
+                    }
+                };
+                let rows = match stmt.query_map([], |row| {
+                    let s: String = row.get(0)?;
+                    let n: i64 = row.get(1)?;
+                    Ok((s, n))
+                }) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::error!(%err, "query webhook outbox status_counts failed");
+                        return StatusCounts::default();
+                    }
+                };
                 let mut counts = StatusCounts::default();
                 for r in rows.flatten() {
                     let (status, n) = r;
@@ -983,7 +1231,13 @@ impl WebhookOutbox {
         let mut report = PruneReport::default();
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut guard = inner.write().expect("outbox write");
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox write lock poisoned");
+                        return report;
+                    }
+                };
                 guard.retain(|_id, d| {
                     let drop_for_delivered = matches!(d.status, DeliveryStatus::Delivered)
                         && delivered_cutoff.is_some_and(|c| d.created_at < c);
@@ -999,7 +1253,13 @@ impl WebhookOutbox {
                 });
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("outbox pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return report;
+                    }
+                };
                 if let Some(cutoff) = delivered_cutoff {
                     let n = conn
                         .execute(
@@ -1007,7 +1267,10 @@ impl WebhookOutbox {
                              WHERE status = 'delivered' AND created_at < ?1",
                             rusqlite::params![cutoff.to_rfc3339()],
                         )
-                        .expect("prune delivered");
+                        .unwrap_or_else(|err| {
+                            tracing::error!(%err, "webhook outbox delivered prune failed");
+                            0
+                        });
                     report.delivered_pruned = n;
                 }
                 if let Some(cutoff) = dead_lettered_cutoff {
@@ -1017,7 +1280,10 @@ impl WebhookOutbox {
                              WHERE status = 'dead_lettered' AND created_at < ?1",
                             rusqlite::params![cutoff.to_rfc3339()],
                         )
-                        .expect("prune dead_lettered");
+                        .unwrap_or_else(|err| {
+                            tracing::error!(%err, "webhook outbox dead-letter prune failed");
+                            0
+                        });
                     report.dead_lettered_pruned = n;
                 }
             }

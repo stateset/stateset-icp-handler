@@ -8,7 +8,7 @@
 //! parsing. Mandate verification lives in `mandate.rs`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +40,11 @@ impl ApiKeyStore {
         }
     }
 
+    pub fn try_new(keys: Vec<ApiKeyInfo>) -> anyhow::Result<Self> {
+        validate_api_keys(&keys)?;
+        Ok(Self::new(keys))
+    }
+
     pub fn demo() -> Self {
         Self::new(vec![ApiKeyInfo {
             key: "icp_demo_key_123".to_string(),
@@ -57,6 +62,60 @@ impl ApiKeyStore {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+}
+
+pub fn validate_api_keys(keys: &[ApiKeyInfo]) -> anyhow::Result<()> {
+    let mut seen = HashSet::with_capacity(keys.len());
+    let mut issues = Vec::new();
+
+    for (idx, key) in keys.iter().enumerate() {
+        if key.key.trim().is_empty() {
+            issues.push(format!("entry {idx}: key must not be empty"));
+        } else if key.key.trim() != key.key {
+            issues.push(format!(
+                "entry {idx}: key must not have surrounding whitespace"
+            ));
+        }
+
+        if key.tenant_id.trim().is_empty() {
+            issues.push(format!("entry {idx}: tenant_id must not be empty"));
+        } else if key.tenant_id.trim() != key.tenant_id {
+            issues.push(format!(
+                "entry {idx}: tenant_id must not have surrounding whitespace"
+            ));
+        }
+
+        if key.name.trim().is_empty() {
+            issues.push(format!("entry {idx}: name must not be empty"));
+        }
+
+        if !seen.insert(key.key.as_str()) {
+            issues.push(format!("entry {idx}: duplicate API key"));
+        }
+
+        if let Some(agents) = key.allowed_agents.as_ref() {
+            for (agent_idx, agent) in agents.iter().enumerate() {
+                if agent.trim().is_empty() {
+                    issues.push(format!(
+                        "entry {idx}: allowed_agents[{agent_idx}] must not be empty"
+                    ));
+                } else if agent.trim() != agent {
+                    issues.push(format!(
+                        "entry {idx}: allowed_agents[{agent_idx}] must not have surrounding whitespace"
+                    ));
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "invalid API key configuration: {}",
+            issues.join("; ")
+        ))
     }
 }
 

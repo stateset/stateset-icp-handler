@@ -134,7 +134,7 @@ impl IcpHandler for GrpcHandler {
         let rx = self.service.events.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(move |evt| match evt {
             Ok(e) => {
-                if !event_belongs_to_tenant(service.as_ref(), &e, &tenant_id) {
+                if !service.event_belongs_to_tenant(&e, &tenant_id) {
                     return None;
                 }
                 let payload_json = serde_json::to_vec(&e.payload).unwrap_or_default();
@@ -261,7 +261,8 @@ impl IcpHandler for GrpcHandler {
         let usage = self
             .service
             .mandates
-            .usage_for_tenant(&mandate_jti, &tenant.tenant_id)
+            .try_usage_for_tenant(&mandate_jti, &tenant.tenant_id)
+            .map_err(|e| Status::unavailable(e.to_string()))?
             .ok_or_else(|| Status::not_found("mandate usage not found"))?;
         let payload = serde_json::json!({
             "spent_minor": usage.spent_minor,
@@ -292,36 +293,6 @@ fn ensure_agent_allowed(tenant: &ApiKeyInfo, agent: &AgentIdentifier) -> Result<
             agent.raw
         )))
     }
-}
-
-fn event_belongs_to_tenant(
-    service: &IcpService,
-    event: &crate::events::Event,
-    tenant_id: &str,
-) -> bool {
-    if let Some(txn_id) = event.transaction_id.as_deref() {
-        return service
-            .transactions
-            .get(txn_id)
-            .is_some_and(|t| t.tenant_id == tenant_id);
-    }
-    if let Some(sub_id) = event
-        .payload
-        .get("subscription_id")
-        .and_then(|v| v.as_str())
-    {
-        return service
-            .subscriptions
-            .get(sub_id)
-            .is_some_and(|s| s.tenant_id == tenant_id);
-    }
-    if let Some(peer_quote_id) = event.payload.get("peer_quote_id").and_then(|v| v.as_str()) {
-        return service
-            .peer_quotes
-            .get(peer_quote_id)
-            .is_some_and(|q| q.tenant_id == tenant_id);
-    }
-    false
 }
 
 fn extract_bearer_metadata(md: &tonic::metadata::MetadataMap) -> Option<String> {

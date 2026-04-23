@@ -126,14 +126,24 @@ impl IdempotencyStore {
         now: DateTime<Utc>,
     ) -> (LookupOutcome, Option<CachedResponse>) {
         let entry = match &self.backend {
-            Backend::Memory(inner) => inner
-                .read()
-                .expect("idempotency read")
-                .get(&(tenant_id.to_string(), idempotency_key.to_string()))
-                .cloned(),
+            Backend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard
+                    .get(&(tenant_id.to_string(), idempotency_key.to_string()))
+                    .cloned(),
+                Err(err) => {
+                    tracing::error!(%err, "idempotency read lock poisoned");
+                    None
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("idempotency pool acquire");
-                let row: rusqlite::Result<(String, i64, String, String)> = conn
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        return (LookupOutcome::Miss, None);
+                    }
+                };
+                let row: Option<(String, i64, String, String)> = conn
                     .query_row(
                         "SELECT request_digest, response_status, response_body, created_at \
                          FROM idempotency \
@@ -142,10 +152,12 @@ impl IdempotencyStore {
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .optional()
-                    .expect("idempotency read")
-                    .ok_or(rusqlite::Error::QueryReturnedNoRows);
+                    .unwrap_or_else(|err| {
+                        tracing::error!(%err, "idempotency read failed");
+                        None
+                    });
                 match row {
-                    Ok((digest, status, body, created)) => {
+                    Some((digest, status, body, created)) => {
                         let created_at = DateTime::parse_from_rfc3339(&created)
                             .map(|d| d.with_timezone(&Utc))
                             .unwrap_or(now);
@@ -158,7 +170,7 @@ impl IdempotencyStore {
                             created_at,
                         })
                     }
-                    Err(_) => None,
+                    None => None,
                 }
             }
         };
@@ -195,16 +207,24 @@ impl IdempotencyStore {
             created_at: now,
         };
         match &self.backend {
-            Backend::Memory(inner) => {
-                inner
-                    .write()
-                    .expect("idempotency write")
-                    .insert((tenant_id.to_string(), idempotency_key.to_string()), entry);
-            }
+            Backend::Memory(inner) => match inner.write() {
+                Ok(mut guard) => {
+                    guard.insert((tenant_id.to_string(), idempotency_key.to_string()), entry);
+                }
+                Err(err) => {
+                    tracing::error!(%err, "idempotency write lock poisoned");
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("idempotency pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        return;
+                    }
+                };
                 let body_str = String::from_utf8_lossy(&response.body_json).to_string();
-                conn.execute(
+                if let Err(err) = conn.execute(
                     "INSERT INTO idempotency \
                          (tenant_id, idempotency_key, request_digest, \
                           response_status, response_body, created_at) \
@@ -222,22 +242,38 @@ impl IdempotencyStore {
                         body_str,
                         now.to_rfc3339(),
                     ],
-                )
-                .expect("idempotency write");
+                ) {
+                    tracing::error!(%err, "idempotency write failed");
+                }
             }
         }
     }
 
     pub fn len(&self) -> usize {
         match &self.backend {
-            Backend::Memory(inner) => inner.read().expect("idempotency read").len(),
+            Backend::Memory(inner) => match inner.read() {
+                Ok(guard) => guard.len(),
+                Err(err) => {
+                    tracing::error!(%err, "idempotency read lock poisoned");
+                    0
+                }
+            },
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("idempotency pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        return 0;
+                    }
+                };
                 conn.query_row("SELECT COUNT(*) FROM idempotency", [], |r| {
                     r.get::<_, i64>(0)
                 })
                 .map(|n| n as usize)
-                .expect("idempotency count")
+                .unwrap_or_else(|err| {
+                    tracing::error!(%err, "idempotency count failed");
+                    0
+                })
             }
         }
     }
@@ -257,18 +293,33 @@ impl IdempotencyStore {
         let cutoff = now - self.ttl;
         match &self.backend {
             Backend::Memory(inner) => {
-                let mut guard = inner.write().expect("idempotency write");
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency write lock poisoned");
+                        return 0;
+                    }
+                };
                 let before = guard.len();
                 guard.retain(|_k, e| e.created_at >= cutoff);
                 before - guard.len()
             }
             Backend::Sqlite(pool) => {
-                let conn = pool.get().expect("idempotency pool acquire");
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        return 0;
+                    }
+                };
                 conn.execute(
                     "DELETE FROM idempotency WHERE created_at < ?1",
                     rusqlite::params![cutoff.to_rfc3339()],
                 )
-                .expect("idempotency prune")
+                .unwrap_or_else(|err| {
+                    tracing::error!(%err, "idempotency prune failed");
+                    0
+                })
             }
         }
     }

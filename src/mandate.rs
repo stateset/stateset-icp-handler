@@ -159,15 +159,30 @@ impl MandateLedger {
     }
 
     pub fn usage(&self, jti: &str) -> MandateUsage {
+        self.try_usage(jti).unwrap_or_else(|err| {
+            tracing::error!(jti, %err, "mandate ledger usage failed");
+            MandateUsage {
+                spent_minor: i64::MAX,
+                window_start: Some(Utc::now()),
+                tenant_id: String::new(),
+            }
+        })
+    }
+
+    pub fn try_usage(&self, jti: &str) -> Result<MandateUsage, ApiError> {
         match &self.backend {
-            MandateBackend::Memory(inner) => inner
-                .read()
-                .expect("mandate ledger read")
-                .get(jti)
-                .cloned()
-                .unwrap_or_default(),
+            MandateBackend::Memory(inner) => {
+                let guard = inner.read().map_err(|err| {
+                    tracing::error!(jti, %err, "mandate ledger read lock poisoned");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
+                Ok(guard.get(jti).cloned().unwrap_or_default())
+            }
             MandateBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("mandate ledger pool acquire");
+                let conn = pool.get().map_err(|err| {
+                    tracing::error!(jti, %err, "mandate ledger pool acquire failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
                 // tenant_id is fetched but defaulted on read so this query
                 // also works against pre-migration databases (the column
                 // wouldn't exist; `unwrap_or_default()` collapses both
@@ -178,15 +193,20 @@ impl MandateLedger {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok())),
                 );
                 match row {
-                    Ok((spent_minor, window_start_str, tenant_id)) => MandateUsage {
+                    Ok((spent_minor, window_start_str, tenant_id)) => Ok(MandateUsage {
                         spent_minor,
                         window_start: window_start_str
                             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&Utc)),
                         tenant_id: tenant_id.unwrap_or_default(),
-                    },
-                    Err(rusqlite::Error::QueryReturnedNoRows) => MandateUsage::default(),
-                    Err(e) => panic!("mandate ledger read: {e}"),
+                    }),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(MandateUsage::default()),
+                    Err(err) => {
+                        tracing::error!(jti, %err, "mandate ledger read failed");
+                        Err(ApiError::EngineUnavailable(
+                            "mandate ledger unavailable".into(),
+                        ))
+                    }
                 }
             }
         }
@@ -199,24 +219,51 @@ impl MandateLedger {
     /// Empty `tenant_id` rows are *not* matched by any real tenant —
     /// see schema migration notes for the legacy-row policy.
     pub fn usage_for_tenant(&self, jti: &str, tenant_id: &str) -> Option<MandateUsage> {
-        let usage = self.usage(jti);
+        self.try_usage_for_tenant(jti, tenant_id)
+            .unwrap_or_else(|err| {
+                tracing::error!(jti, tenant_id, %err, "mandate tenant usage failed");
+                None
+            })
+    }
+
+    pub fn try_usage_for_tenant(
+        &self,
+        jti: &str,
+        tenant_id: &str,
+    ) -> Result<Option<MandateUsage>, ApiError> {
+        let usage = self.try_usage(jti)?;
         // No spend recorded → no row → no tenant; treat as miss so
         // the route doesn't fabricate a "you own this empty bucket"
         // response for a jti the caller has never used.
         if usage.window_start.is_none() && usage.spent_minor == 0 && usage.tenant_id.is_empty() {
-            return None;
+            return Ok(None);
         }
         if usage.tenant_id == tenant_id {
-            Some(usage)
+            Ok(Some(usage))
         } else {
-            None
+            Ok(None)
         }
     }
 
     pub fn record_spend(&self, jti: &str, tenant_id: &str, amount_minor: i64, now: DateTime<Utc>) {
+        if let Err(err) = self.try_record_spend(jti, tenant_id, amount_minor, now) {
+            tracing::error!(jti, tenant_id, amount_minor, %err, "mandate spend record failed");
+        }
+    }
+
+    pub fn try_record_spend(
+        &self,
+        jti: &str,
+        tenant_id: &str,
+        amount_minor: i64,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApiError> {
         match &self.backend {
             MandateBackend::Memory(inner) => {
-                let mut guard = inner.write().expect("mandate ledger write");
+                let mut guard = inner.write().map_err(|err| {
+                    tracing::error!(jti, tenant_id, %err, "mandate ledger write lock poisoned");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
                 let entry = guard.entry(jti.to_string()).or_default();
                 if entry.window_start.is_none() {
                     entry.window_start = Some(now);
@@ -225,9 +272,13 @@ impl MandateLedger {
                     entry.tenant_id = tenant_id.to_string();
                 }
                 entry.spent_minor = entry.spent_minor.saturating_add(amount_minor);
+                Ok(())
             }
             MandateBackend::Sqlite(pool) => {
-                let conn = pool.get().expect("mandate ledger pool acquire");
+                let conn = pool.get().map_err(|err| {
+                    tracing::error!(jti, tenant_id, %err, "mandate ledger pool acquire failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
                 // UPSERT: preserve the original window_start AND
                 // tenant_id (only set on first spend for a given jti),
                 // saturating_add on spent_minor. Mirrors the in-memory
@@ -243,7 +294,11 @@ impl MandateLedger {
                          tenant_id = COALESCE(NULLIF(mandate_usage.tenant_id, ''), excluded.tenant_id)",
                     rusqlite::params![jti, amount_minor, now.to_rfc3339(), tenant_id],
                 )
-                .expect("mandate ledger write");
+                .map(|_| ())
+                .map_err(|err| {
+                    tracing::error!(jti, tenant_id, amount_minor, %err, "mandate ledger write failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })
             }
         }
     }
@@ -439,7 +494,7 @@ pub async fn evaluate(
         }
     }
 
-    let usage = ledger.usage(&payload.jti);
+    let usage = ledger.try_usage(&payload.jti)?;
     let window = parse_period(payload.icp.budget.period.as_deref()).unwrap_or(Duration::days(1));
     let window_has_elapsed = match usage.window_start {
         Some(start) => now - start > window,
