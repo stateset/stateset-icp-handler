@@ -76,6 +76,10 @@ pub struct AppState {
 /// it without going through `main`.
 pub async fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
     config.validate_runtime()?;
+    if let Some(url) = config.webhook_url.as_deref() {
+        crate::webhook::validate_destination_url(url, config.allow_insecure_urls)
+            .map_err(|e| anyhow::anyhow!("ICP_WEBHOOK_URL: {e}"))?;
+    }
 
     let engine = if config.commerce_enabled {
         match CommerceEngine::open(&config.commerce_db_path) {
@@ -519,6 +523,11 @@ pub async fn submit_intent(
     let request_digest = IdempotencyStore::digest_request(&canonical);
 
     let tenant_id = tenant.tenant_id.clone();
+    let _idempotency_guard = if let Some(key) = idempotency_key.as_deref() {
+        Some(state.service.lock_idempotency_key(&tenant_id, key).await)
+    } else {
+        None
+    };
     if let Some(key) = idempotency_key.as_deref() {
         let (outcome, cached) =
             state
@@ -1013,11 +1022,6 @@ pub async fn create_webhook_subscriber(
     let tenant = resolve_tenant(&headers, &state.keys)?;
     let url = body.url.trim();
     validate_webhook_url(url, state.config.allow_insecure_urls)?;
-    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(ApiError::InvalidRequest(
-            "url must be a non-empty http(s):// string".into(),
-        ));
-    }
     if body.secret.trim().is_empty() {
         return Err(ApiError::InvalidRequest(
             "secret must be non-empty — events are HMAC-signed and the receiver needs the same secret to verify".into(),
@@ -1139,11 +1143,6 @@ pub async fn update_webhook_subscriber(
     let url_trimmed = body.url.as_deref().map(str::trim);
     if let Some(u) = url_trimmed {
         validate_webhook_url(u, state.config.allow_insecure_urls)?;
-        if u.is_empty() || !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err(ApiError::InvalidRequest(
-                "url must be a non-empty http(s):// string".into(),
-            ));
-        }
     }
     let secret_trimmed = body.secret.as_deref().map(str::trim);
     if let Some(s) = secret_trimmed {
@@ -1529,17 +1528,7 @@ fn stamp_receipt_headers(out_headers: &mut HeaderMap, body_json: &serde_json::Va
 }
 
 fn validate_webhook_url(url: &str, allow_insecure: bool) -> Result<(), ApiError> {
-    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(ApiError::InvalidRequest(
-            "url must be a non-empty http(s):// string".into(),
-        ));
-    }
-    if !allow_insecure && !url.starts_with("https://") {
-        return Err(ApiError::InvalidRequest(
-            "url must use https:// when insecure URLs are disabled".into(),
-        ));
-    }
-    Ok(())
+    crate::webhook::validate_destination_url(url, allow_insecure).map_err(ApiError::InvalidRequest)
 }
 
 /// Extract a client identifier suitable for the pre-auth rate-limit
@@ -1643,6 +1632,7 @@ pub async fn serve(
             state.config.webhook_secret.clone(),
         )
         .with_subscribers(state.service.webhook_subscribers.clone())
+        .with_allow_insecure_urls(state.config.allow_insecure_urls)
         .with_retention(
             state.config.webhook_retain_delivered_days,
             state.config.webhook_retain_dead_lettered_days,

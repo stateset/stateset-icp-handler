@@ -23,6 +23,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, Verifier};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -112,6 +113,13 @@ pub struct MandateUsage {
     /// readable view. Subsequent spenders still consume the shared
     /// budget (protecting the principal) but cannot read the tally.
     pub tenant_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MandateSpendLimits {
+    pub budget_minor: i64,
+    pub per_transaction: Option<i64>,
+    pub window: Duration,
 }
 
 /// Mandate usage ledger. Backed either by an in-process `HashMap` (tests,
@@ -299,6 +307,134 @@ impl MandateLedger {
                     tracing::error!(jti, tenant_id, amount_minor, %err, "mandate ledger write failed");
                     ApiError::EngineUnavailable("mandate ledger unavailable".into())
                 })
+            }
+        }
+    }
+
+    /// Atomically verify that a new spend fits the mandate budget and
+    /// record it. This is the write-side budget gate used by the intent
+    /// pipeline, so concurrent workers cannot both observe the same
+    /// remaining balance and overspend it.
+    pub fn try_record_spend_checked(
+        &self,
+        jti: &str,
+        tenant_id: &str,
+        amount_minor: i64,
+        now: DateTime<Utc>,
+        limits: MandateSpendLimits,
+    ) -> Result<(), ApiError> {
+        if amount_minor <= 0 {
+            return Ok(());
+        }
+        if limits.budget_minor < 0 {
+            return Err(ApiError::MandateBudgetExceeded(format!(
+                "mandate budget {} is negative",
+                limits.budget_minor
+            )));
+        }
+        if let Some(per_txn) = limits.per_transaction {
+            if amount_minor > per_txn {
+                return Err(ApiError::MandateBudgetExceeded(format!(
+                    "intent amount {amount_minor} exceeds per-transaction cap {per_txn}"
+                )));
+            }
+        }
+
+        match &self.backend {
+            MandateBackend::Memory(inner) => {
+                let mut guard = inner.write().map_err(|err| {
+                    tracing::error!(jti, tenant_id, %err, "mandate ledger write lock poisoned");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
+                let entry = guard.entry(jti.to_string()).or_default();
+                if entry
+                    .window_start
+                    .is_none_or(|start| now - start > limits.window)
+                {
+                    entry.spent_minor = 0;
+                    entry.window_start = Some(now);
+                }
+                if entry.tenant_id.is_empty() {
+                    entry.tenant_id = tenant_id.to_string();
+                }
+                let remaining = limits.budget_minor.saturating_sub(entry.spent_minor);
+                if amount_minor > remaining {
+                    return Err(ApiError::MandateBudgetExceeded(format!(
+                        "intent amount {amount_minor} would exceed remaining budget {remaining}"
+                    )));
+                }
+                entry.spent_minor = entry.spent_minor.saturating_add(amount_minor);
+                Ok(())
+            }
+            MandateBackend::Sqlite(pool) => {
+                let mut conn = pool.get().map_err(|err| {
+                    tracing::error!(jti, tenant_id, %err, "mandate ledger pool acquire failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|err| {
+                        tracing::error!(jti, tenant_id, %err, "mandate ledger tx begin failed");
+                        ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                    })?;
+                let row: Option<(i64, Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT spent_minor, window_start, tenant_id \
+                         FROM mandate_usage WHERE jti = ?1",
+                        rusqlite::params![jti],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok())),
+                    )
+                    .optional()
+                    .map_err(|err| {
+                        tracing::error!(jti, tenant_id, %err, "mandate ledger read-for-update failed");
+                        ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                    })?;
+
+                let mut usage = row
+                    .map(|(spent_minor, window_start_str, owner)| MandateUsage {
+                        spent_minor,
+                        window_start: window_start_str
+                            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|dt| dt.with_timezone(&Utc)),
+                        tenant_id: owner.unwrap_or_default(),
+                    })
+                    .unwrap_or_default();
+                if usage
+                    .window_start
+                    .is_none_or(|start| now - start > limits.window)
+                {
+                    usage.spent_minor = 0;
+                    usage.window_start = Some(now);
+                }
+                if usage.tenant_id.is_empty() {
+                    usage.tenant_id = tenant_id.to_string();
+                }
+                let remaining = limits.budget_minor.saturating_sub(usage.spent_minor);
+                if amount_minor > remaining {
+                    return Err(ApiError::MandateBudgetExceeded(format!(
+                        "intent amount {amount_minor} would exceed remaining budget {remaining}"
+                    )));
+                }
+                usage.spent_minor = usage.spent_minor.saturating_add(amount_minor);
+                let window_start = usage.window_start.map(|w| w.to_rfc3339());
+                tx.execute(
+                    "INSERT INTO mandate_usage (jti, spent_minor, window_start, tenant_id) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(jti) DO UPDATE SET \
+                         spent_minor = excluded.spent_minor, \
+                         window_start = excluded.window_start, \
+                         tenant_id = COALESCE(NULLIF(mandate_usage.tenant_id, ''), excluded.tenant_id)",
+                    rusqlite::params![jti, usage.spent_minor, window_start, usage.tenant_id],
+                )
+                .map_err(|err| {
+                    tracing::error!(jti, tenant_id, amount_minor, %err, "mandate ledger checked write failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
+                tx.commit().map_err(|err| {
+                    tracing::error!(jti, tenant_id, %err, "mandate ledger checked commit failed");
+                    ApiError::EngineUnavailable("mandate ledger unavailable".into())
+                })?;
+                Ok(())
             }
         }
     }
@@ -528,7 +664,7 @@ pub async fn evaluate(
     })
 }
 
-fn parse_period(s: Option<&str>) -> Option<Duration> {
+pub(crate) fn parse_period(s: Option<&str>) -> Option<Duration> {
     // Very small ISO-8601 duration parser — supports the common forms we
     // actually emit: `PT<H>H`, `P<D>D`, `P<W>W`, `P1M` (approximated as 30d).
     let s = s?;

@@ -620,6 +620,24 @@ async fn validation_rejects_bad_inputs() {
 }
 
 #[tokio::test]
+async fn validation_blocks_private_webhook_hosts_when_insecure_urls_are_disabled() {
+    let mut cfg = Config::for_test();
+    cfg.enable_demo_keys = false;
+    cfg.allow_insecure_urls = false;
+    cfg.public_base_url = "https://icp.example".into();
+    cfg.api_keys_json = Some(serde_json::to_string(&vec![key("a", "tenant_a")]).unwrap());
+    let state = build_app_state(&cfg).await.expect("state");
+    let app = build_router(state);
+
+    let (status, body) = create_sub(&app, "k_a", "https://127.0.0.1/hook", "secret").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    let (status, _) = create_sub(&app, "k_a", "https://localhost/hook", "secret").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn unauthenticated_create_is_rejected() {
     let (_, app) = build(None, vec![key("a", "tenant_a")]).await;
 

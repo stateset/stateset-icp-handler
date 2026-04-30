@@ -28,10 +28,14 @@ fn key(name: &str, tenant: &str) -> ApiKeyInfo {
 
 async fn handler() -> GrpcHandler {
     let mut cfg = Config::for_test();
+    handler_with_config(&mut cfg).await
+}
+
+async fn handler_with_config(cfg: &mut Config) -> GrpcHandler {
     cfg.enable_demo_keys = false;
     cfg.api_keys_json =
         Some(serde_json::to_string(&vec![key("a", "tenant_a"), key("b", "tenant_b")]).unwrap());
-    let state = build_app_state(&cfg).await.expect("state");
+    let state = build_app_state(cfg).await.expect("state");
     GrpcHandler {
         service: state.service,
         keys: state.keys,
@@ -160,4 +164,109 @@ async fn grpc_reads_require_auth_and_are_tenant_scoped() {
         .expect("verify receipt")
         .into_inner();
     assert!(verified.valid, "receipt should verify: {}", verified.reason);
+}
+
+#[tokio::test]
+async fn grpc_submit_intent_replays_same_idempotency_key() {
+    let h = handler().await;
+    let body = json!({
+        "intent": "intent.quote",
+        "agent_id": AGENT,
+        "params": {
+            "items": [{
+                "sku": "WIDGET",
+                "quantity": 1,
+                "unit_price_hint": { "amount_minor": 100, "currency": "USD" }
+            }]
+        }
+    });
+    let mut env = envelope();
+    env.idempotency_key = "grpc-idem-1".into();
+    let request = IntentRequest {
+        envelope: Some(env.clone()),
+        payload_json: serde_json::to_vec(&body).unwrap(),
+    };
+
+    let first = h
+        .submit_intent(auth(Request::new(request.clone()), "k_a"))
+        .await
+        .expect("first")
+        .into_inner();
+    let second = h
+        .submit_intent(auth(Request::new(request), "k_a"))
+        .await
+        .expect("second")
+        .into_inner();
+    assert_eq!(first.payload_json, second.payload_json);
+    assert_eq!(first.receipt_jws, second.receipt_jws);
+
+    let first_body: Value = serde_json::from_slice(&first.payload_json).unwrap();
+    let second_body: Value = serde_json::from_slice(&second.payload_json).unwrap();
+    assert_eq!(
+        first_body["transaction"]["id"],
+        second_body["transaction"]["id"]
+    );
+    assert_eq!(h.service.transactions.len(), 1);
+}
+
+#[tokio::test]
+async fn grpc_submit_intent_rejects_reused_idempotency_key_with_different_body() {
+    let h = handler().await;
+    let mut env = envelope();
+    env.idempotency_key = "grpc-idem-conflict".into();
+    let body_a = json!({
+        "intent": "intent.quote",
+        "agent_id": AGENT,
+        "params": { "items": [{ "sku": "A", "quantity": 1 }] }
+    });
+    let body_b = json!({
+        "intent": "intent.quote",
+        "agent_id": AGENT,
+        "params": { "items": [{ "sku": "B", "quantity": 1 }] }
+    });
+    h.submit_intent(auth(
+        Request::new(IntentRequest {
+            envelope: Some(env.clone()),
+            payload_json: serde_json::to_vec(&body_a).unwrap(),
+        }),
+        "k_a",
+    ))
+    .await
+    .expect("first");
+
+    let err = h
+        .submit_intent(auth(
+            Request::new(IntentRequest {
+                envelope: Some(env),
+                payload_json: serde_json::to_vec(&body_b).unwrap(),
+            }),
+            "k_a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+}
+
+#[tokio::test]
+async fn grpc_requires_idempotency_key_when_configured() {
+    let mut cfg = Config::for_test();
+    cfg.require_idempotency_key = true;
+    let h = handler_with_config(&mut cfg).await;
+    let body = json!({
+        "intent": "intent.quote",
+        "agent_id": AGENT,
+        "params": { "items": [{ "sku": "A", "quantity": 1 }] }
+    });
+
+    let err = h
+        .submit_intent(auth(
+            Request::new(IntentRequest {
+                envelope: Some(envelope()),
+                payload_json: serde_json::to_vec(&body).unwrap(),
+            }),
+            "k_a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }

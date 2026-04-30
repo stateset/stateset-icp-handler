@@ -8,9 +8,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::{json, Value};
-use stateset_icp_handler::{build_app_state, build_router, config::Config};
+use stateset_icp_handler::{build_app_state, build_router, config::Config, AppState};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -26,8 +26,13 @@ async fn setup() -> Router {
 }
 
 async fn setup_with(config: Config) -> Router {
+    setup_state_with(config).await.1
+}
+
+async fn setup_state_with(config: Config) -> (AppState, Router) {
     let state = build_app_state(&config).await.expect("build_app_state");
-    build_router(state)
+    let router = build_router(state.clone());
+    (state, router)
 }
 
 /// Build a test config with the embedded iCommerce engine enabled at a
@@ -425,6 +430,110 @@ async fn full_intent_flow_quote_authorize_buy() {
     assert!(rcpt["body_digest"].as_str().unwrap().starts_with("sha256:"));
     assert_eq!(rcpt["claims"]["icp"]["intent"], "intent.buy");
     assert_eq!(rcpt["claims"]["icp"]["transaction_id"], txn_id);
+}
+
+#[tokio::test]
+async fn completed_transaction_cannot_be_reauthorized_and_bought_again() {
+    let app = setup().await;
+    let (_s, quote) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    let txn_id = quote["transaction"]["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.authorize",
+            "agent_id": DEMO_AGENT,
+            "params": { "transaction_id": txn_id },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, buy) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "tok_demo" },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(buy["transaction"]["state"], "completed");
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.authorize",
+            "agent_id": DEMO_AGENT,
+            "params": { "transaction_id": txn_id },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(body["error"]["code"], "precondition_failed");
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "tok_again" },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(body["error"]["code"], "precondition_failed");
+}
+
+#[tokio::test]
+async fn expired_quoted_transaction_cannot_be_authorized_or_bought() {
+    let (state, app) = setup_state_with(Config::for_test()).await;
+    let (_s, quote) = send(&app, req("POST", "/icp/v1/intents").json_body(quote_body())).await;
+    let txn_id = quote["transaction"]["id"].as_str().unwrap().to_string();
+    state.service.transactions.update(&txn_id, |t| {
+        t.quote_expires_at = Some(Utc::now() - Duration::minutes(1));
+    });
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.authorize",
+            "agent_id": DEMO_AGENT,
+            "params": { "transaction_id": txn_id },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("expired"));
+
+    let (status, txn) = send(&app, req("GET", &format!("/icp/v1/transactions/{txn_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(txn["state"], "expired");
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "tok_demo" },
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(body["error"]["code"], "precondition_failed");
 }
 
 #[tokio::test]
@@ -903,4 +1012,72 @@ async fn mandate_usage_records_spend_after_buy() {
         "spent_minor should be > 0 after buy, got {spent}"
     );
     assert!(spent >= 5998, "spent should include at least subtotal");
+}
+
+#[tokio::test]
+async fn mandate_budget_blocks_buy_when_final_total_exceeds_remaining() {
+    let mut cfg = Config::for_test();
+    cfg.require_mandate = true;
+    let app = setup_with(cfg).await;
+    let mandate = make_mandate_jws(&["quote", "buy"], 1_000, Some(2_000));
+
+    let quote_body = json!({
+        "intent": "intent.quote",
+        "agent_id": DEMO_AGENT,
+        "params": {
+            "items": [{
+                "sku": "BUDGET-CHECK",
+                "quantity": 1,
+                "unit_price_hint": { "amount_minor": 1000, "currency": "USD" }
+            }]
+        },
+        "context": { "currency": "USD" }
+    });
+    let (status, quote) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Mandate", mandate.clone())
+            .json_body(quote_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "quote body={quote}");
+    let txn_id = quote["transaction"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        quote["transaction"]["totals"]["total"]["amount_minor"],
+        1087
+    );
+
+    let (status, _) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Mandate", mandate.clone())
+            .json_body(json!({
+                "intent": "intent.authorize",
+                "agent_id": DEMO_AGENT,
+                "params": { "transaction_id": txn_id },
+            })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Mandate", mandate)
+            .json_body(json!({
+                "intent": "intent.buy",
+                "agent_id": DEMO_AGENT,
+                "params": {
+                    "transaction_id": txn_id,
+                    "payment": { "method": "card", "token": "tok_demo" }
+                },
+            })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(body["error"]["code"], "mandate_budget_exceeded");
+
+    let (status, txn) = send(&app, req("GET", &format!("/icp/v1/transactions/{txn_id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(txn["state"], "authorized");
 }

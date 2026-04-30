@@ -14,10 +14,12 @@
 //! deterministic. A production deployment will extend this with real
 //! tax/shipping/payment providers via the stub seams marked `TODO`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::Value;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::agent::{AgentIdentifier, ApiKeyInfo};
@@ -26,18 +28,20 @@ use crate::config::Config;
 use crate::errors::ApiError;
 use crate::events::{Event, EventBus};
 use crate::intent::Intent;
-use crate::mandate::{self, MandateEvaluation, MandateLedger};
+use crate::mandate::{self, MandateEvaluation, MandateLedger, MandateSpendLimits};
 use crate::models::{
-    A2aPayParams, A2aQuoteParams, BillingCadence, BuyParams, Buyer, ConfirmReceiptParams,
-    IntentEnvelope, IntentResponseBody, LineItem, Money, NegotiateParams, OrderSummary,
-    PaymentInstrument, PeerQuote, PeerQuoteStatus, QuoteParams, ReceiptStub, RenewParams,
-    RequestItem, ResponseEnvelope, SubscribeParams, Subscription, SubscriptionRefParams,
-    SubscriptionStatus, Totals, Transaction, TransactionState,
+    A2aPayParams, A2aQuoteParams, AuthorizeParams, BillingCadence, BuyParams, Buyer,
+    ConfirmReceiptParams, IntentEnvelope, IntentResponseBody, LineItem, Money, NegotiateParams,
+    OrderSummary, PaymentInstrument, PeerQuote, PeerQuoteStatus, QuoteParams, ReceiptStub,
+    RenewParams, RequestItem, ResponseEnvelope, SubscribeParams, Subscription,
+    SubscriptionRefParams, SubscriptionStatus, Totals, Transaction, TransactionState,
 };
 use crate::receipts::{ReceiptStore, StoredReceipt};
 use crate::resolver::{CompositeResolver, PrincipalResolver};
 use crate::signing::ReceiptSigner;
 use crate::state_store::{PeerQuoteStore, SubscriptionStore, TransactionStore};
+
+type KeyedLocks = Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>;
 
 #[derive(Clone)]
 pub struct IcpService {
@@ -69,6 +73,7 @@ pub struct IcpService {
     pub signer: Arc<ReceiptSigner>,
     pub events: EventBus,
     pub resolver: Arc<dyn PrincipalResolver>,
+    operation_locks: KeyedLocks,
 }
 
 pub struct IntentInput<'a> {
@@ -169,7 +174,49 @@ impl IcpService {
             signer: Arc::new(signer),
             events: EventBus::default(),
             resolver,
+            operation_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub async fn lock_idempotency_key(
+        &self,
+        tenant_id: &str,
+        idempotency_key: &str,
+    ) -> OwnedMutexGuard<()> {
+        self.lock_operation(format!(
+            "idem:{}:{}{}",
+            tenant_id.len(),
+            tenant_id,
+            idempotency_key
+        ))
+        .await
+    }
+
+    async fn lock_transaction(&self, transaction_id: &str) -> OwnedMutexGuard<()> {
+        self.lock_operation(format!("txn:{transaction_id}")).await
+    }
+
+    async fn lock_subscription(&self, subscription_id: &str) -> OwnedMutexGuard<()> {
+        self.lock_operation(format!("sub:{subscription_id}")).await
+    }
+
+    async fn lock_peer_quote(&self, peer_quote_id: &str) -> OwnedMutexGuard<()> {
+        self.lock_operation(format!("peer_quote:{peer_quote_id}"))
+            .await
+    }
+
+    async fn lock_operation(&self, key: String) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut guard = self
+                .operation_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     pub async fn handle_intent(
@@ -241,19 +288,6 @@ impl IcpService {
             Intent::Negotiate => self.do_negotiate(&input, mandate.as_ref()).await?,
             Intent::ConfirmReceipt => self.do_confirm_receipt(&input).await?,
         };
-
-        // Record mandate spend (for intents that spend budget).
-        if let Some(ev) = mandate.as_ref() {
-            let spend = outcome.recorded_spend_minor;
-            if spend > 0 {
-                self.mandates.try_record_spend(
-                    &ev.payload.jti,
-                    &input.tenant.tenant_id,
-                    spend,
-                    Utc::now(),
-                )?;
-            }
-        }
 
         let envelope = ResponseEnvelope {
             icp_version: self.config.icp_version.clone(),
@@ -412,7 +446,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -424,7 +457,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -451,51 +483,8 @@ impl IcpService {
             .clone()
             .unwrap_or_else(|| "USD".to_string());
 
-        // Price each line. In v0.1 we use the optional `unit_price_hint`
-        // when provided, else a flat $10.00 per unit placeholder. A real
-        // deployment would route this through the iCommerce pricing
-        // engine (products.price_for, promotions.apply, tax.calculate).
-        let mut line_items = Vec::with_capacity(params.items.len());
-        let mut subtotal_minor: i64 = 0;
-        for (idx, req) in params.items.iter().enumerate() {
-            if req.quantity <= 0 {
-                return Err(ApiError::InvalidRequest(format!(
-                    "quote.params.items[{idx}].quantity must be positive"
-                )));
-            }
-            let unit_minor = req
-                .unit_price_hint
-                .as_ref()
-                .map(|m| m.amount_minor)
-                .unwrap_or(1_000);
-            if unit_minor < 0 {
-                return Err(ApiError::InvalidRequest(format!(
-                    "quote.params.items[{idx}].unit_price_hint.amount_minor must be non-negative"
-                )));
-            }
-            let line_subtotal = unit_minor.saturating_mul(req.quantity);
-            subtotal_minor = subtotal_minor.saturating_add(line_subtotal);
-            line_items.push(LineItem {
-                id: format!("li_{:06}", idx),
-                sku: req.sku.clone(),
-                name: req.sku.clone(),
-                quantity: req.quantity,
-                unit_price: Money::new(unit_minor, &currency),
-                subtotal: Money::new(line_subtotal, &currency),
-                tax: None,
-                total: Money::new(line_subtotal, &currency),
-            });
-        }
-
-        let tax_minor = subtotal_minor * 875 / 10_000; // 8.75% placeholder
-        let total_minor = subtotal_minor.saturating_add(tax_minor);
-        let totals = Totals {
-            subtotal: Some(Money::new(subtotal_minor, &currency)),
-            discount: None,
-            shipping: None,
-            tax: Some(Money::new(tax_minor, &currency)),
-            total: Some(Money::new(total_minor, &currency)),
-        };
+        let (line_items, totals) =
+            price_request_items(&params.items, &currency, "quote.params.items")?;
 
         let mut txn = self.fresh_transaction(input, TransactionState::Quoted);
         txn.buyer = params.buyer.unwrap_or_default();
@@ -511,7 +500,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -522,16 +510,28 @@ impl IcpService {
         input: &IntentInput<'_>,
         _mandate: Option<&MandateEvaluation>,
     ) -> Result<Outcome, ApiError> {
-        let txn_id = require_transaction_id(&input.envelope.params)?;
-        self.ensure_transaction_owner(&txn_id, input)?;
+        let params: AuthorizeParams = serde_json::from_value(input.envelope.params.clone())
+            .map_err(|e| ApiError::InvalidRequest(format!("authorize.params: {e}")))?;
+        let txn_id = params.transaction_id.clone();
+        let _txn_guard = self.lock_transaction(&txn_id).await;
+        let txn = self.transaction_for_input(&txn_id, input)?;
+        if txn.state != TransactionState::Quoted {
+            return Err(ApiError::PreconditionFailed(format!(
+                "transaction in state {:?} cannot be authorized",
+                txn.state
+            )));
+        }
+        self.ensure_quote_open(&txn, Utc::now())?;
+
         let txn = self.transactions.update(&txn_id, |t| {
-            if let Some(buyer) = input
-                .envelope
-                .params
-                .get("buyer")
-                .and_then(|v| serde_json::from_value::<Buyer>(v.clone()).ok())
-            {
+            if let Some(buyer) = params.buyer {
                 t.buyer = buyer;
+            }
+            if let Some(ship_to) = params.ship_to {
+                t.ship_to = Some(ship_to);
+            }
+            if let Some(bill_to) = params.bill_to {
+                t.bill_to = Some(bill_to);
             }
             t.state = TransactionState::Authorized;
             t.updated_at = Utc::now();
@@ -543,7 +543,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -552,24 +551,32 @@ impl IcpService {
     async fn do_buy(
         &self,
         input: &IntentInput<'_>,
-        _mandate: Option<&MandateEvaluation>,
+        mandate: Option<&MandateEvaluation>,
     ) -> Result<Outcome, ApiError> {
         let params: BuyParams = serde_json::from_value(input.envelope.params.clone())
             .map_err(|e| ApiError::InvalidRequest(format!("buy.params: {e}")))?;
         validate_payment_instrument(&params.payment, &self.config.payment_execution_mode)?;
         let txn_id = params.transaction_id;
+        let _txn_guard = self.lock_transaction(&txn_id).await;
 
         // Load transaction.
         let txn = self.transaction_for_input(&txn_id, input)?;
-        if !matches!(
-            txn.state,
-            TransactionState::Authorized | TransactionState::Quoted
-        ) {
-            return Err(ApiError::PreconditionFailed(format!(
-                "transaction in state {:?} cannot be bought",
-                txn.state
-            )));
+        match txn.state {
+            TransactionState::Quoted => self.ensure_quote_open(&txn, Utc::now())?,
+            TransactionState::Authorized => {}
+            other => {
+                return Err(ApiError::PreconditionFailed(format!(
+                    "transaction in state {other:?} cannot be bought"
+                )));
+            }
         }
+        let spend_minor = txn
+            .totals
+            .total
+            .as_ref()
+            .map(|m| m.amount_minor)
+            .unwrap_or(0);
+        self.reserve_mandate_spend(mandate, &input.tenant.tenant_id, spend_minor, &txn.currency)?;
 
         // Persist order to the embedded engine when available.
         let order = if let Some(engine) = self.engine.as_ref() {
@@ -604,19 +611,11 @@ impl IcpService {
             total: o.total,
         });
 
-        let recorded_spend_minor = persisted
-            .totals
-            .total
-            .as_ref()
-            .map(|m| m.amount_minor)
-            .unwrap_or(0);
-
         Ok(Outcome {
             transaction: persisted,
             order: order_summary,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor,
         })
     }
 
@@ -636,7 +635,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -661,6 +659,7 @@ impl IcpService {
                     .and_then(|v| v.as_str())
             })
             .ok_or_else(|| ApiError::InvalidRequest("return: transaction_id required".into()))?;
+        let _txn_guard = self.lock_transaction(txn_id).await;
         self.ensure_transaction_owner(txn_id, input)?;
         let txn = self
             .transactions
@@ -674,7 +673,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -710,6 +708,10 @@ impl IcpService {
             .currency
             .clone()
             .unwrap_or_else(|| "USD".to_string());
+        let (_line_items, estimated_totals) =
+            price_request_items(&params.items, &currency, "subscribe.params.items")?;
+        let estimated_total = total_amount_minor(&estimated_totals);
+        self.reserve_mandate_spend(mandate, &input.tenant.tenant_id, estimated_total, &currency)?;
 
         // First charge — runs through the same quote+buy pipeline so it
         // produces a real Transaction with totals + receipt.
@@ -723,13 +725,6 @@ impl IcpService {
                 &currency,
             )
             .await?;
-        let charge_total = charge_txn
-            .totals
-            .total
-            .as_ref()
-            .map(|m| m.amount_minor)
-            .unwrap_or(0);
-
         let sub = Subscription {
             id: format!("sub_{}", Uuid::new_v4().simple()),
             status: SubscriptionStatus::Active,
@@ -760,7 +755,6 @@ impl IcpService {
             order: None,
             subscription: Some(sub),
             peer_quote: None,
-            recorded_spend_minor: charge_total,
         })
     }
 
@@ -772,6 +766,7 @@ impl IcpService {
         let params: RenewParams = serde_json::from_value(input.envelope.params.clone())
             .map_err(|e| ApiError::InvalidRequest(format!("renew.params: {e}")))?;
         validate_payment_instrument(&params.payment, &self.config.payment_execution_mode)?;
+        let _sub_guard = self.lock_subscription(&params.subscription_id).await;
         let sub = self.subscription_for_input(&params.subscription_id, input)?;
 
         match sub.status {
@@ -789,6 +784,15 @@ impl IcpService {
         }
 
         let now = Utc::now();
+        let (_line_items, estimated_totals) =
+            price_request_items(&sub.items, &sub.currency, "subscription.items")?;
+        let estimated_total = total_amount_minor(&estimated_totals);
+        self.reserve_mandate_spend(
+            mandate,
+            &input.tenant.tenant_id,
+            estimated_total,
+            &sub.currency,
+        )?;
         let charge_txn = self
             .run_subscription_charge(
                 input,
@@ -798,13 +802,6 @@ impl IcpService {
                 &sub.currency,
             )
             .await?;
-        let charge_total = charge_txn
-            .totals
-            .total
-            .as_ref()
-            .map(|m| m.amount_minor)
-            .unwrap_or(0);
-
         // Advance the period from the *previous* end so consecutive
         // renewals don't drift forward in time.
         let new_period_start = sub.current_period_end;
@@ -834,7 +831,6 @@ impl IcpService {
             order: None,
             subscription: Some(updated),
             peer_quote: None,
-            recorded_spend_minor: charge_total,
         })
     }
 
@@ -843,6 +839,7 @@ impl IcpService {
             serde_json::from_value(input.envelope.params.clone())
                 .map_err(|e| ApiError::InvalidRequest(format!("pause.params: {e}")))?;
 
+        let _sub_guard = self.lock_subscription(&params.subscription_id).await;
         let sub = self.subscription_for_input(&params.subscription_id, input)?;
         if sub.status.is_terminal() {
             return Err(ApiError::PreconditionFailed(format!(
@@ -871,7 +868,6 @@ impl IcpService {
             order: None,
             subscription: Some(updated),
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -881,6 +877,7 @@ impl IcpService {
             ApiError::InvalidRequest(format!("cancel_subscription.params: {e}"))
         })?;
 
+        let _sub_guard = self.lock_subscription(&params.subscription_id).await;
         let sub = self.subscription_for_input(&params.subscription_id, input)?;
         if sub.status == SubscriptionStatus::Canceled {
             return Err(ApiError::PreconditionFailed(
@@ -906,7 +903,6 @@ impl IcpService {
             order: None,
             subscription: Some(updated),
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -999,7 +995,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: Some(quote),
-            recorded_spend_minor: 0,
         })
     }
 
@@ -1015,6 +1010,10 @@ impl IcpService {
                 "a2a_pay: `from` is required".into(),
             ));
         }
+        let _quote_guard = match params.peer_quote_id.as_deref() {
+            Some(quote_id) => Some(self.lock_peer_quote(quote_id).await),
+            None => None,
+        };
 
         let now = Utc::now();
 
@@ -1075,6 +1074,12 @@ impl IcpService {
                 (peer_id, money, None)
             }
         };
+        self.reserve_mandate_spend(
+            mandate,
+            &input.tenant.tenant_id,
+            money.amount_minor,
+            &money.currency,
+        )?;
 
         // Build a single-line-item transaction representing the peer
         // payment. The line item describes what was bought/paid for so
@@ -1138,13 +1143,11 @@ impl IcpService {
             })
         });
 
-        let recorded_spend = money.amount_minor;
         Ok(Outcome {
             transaction: txn,
             order: None,
             subscription: None,
             peer_quote: updated_quote,
-            recorded_spend_minor: recorded_spend,
         })
     }
 
@@ -1171,6 +1174,7 @@ impl IcpService {
             }
         }
 
+        let _txn_guard = self.lock_transaction(&params.transaction_id).await;
         let txn = self.transaction_for_input(&params.transaction_id, input)?;
         if !matches!(txn.state, TransactionState::Quoted) {
             return Err(ApiError::PreconditionFailed(format!(
@@ -1243,7 +1247,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -1251,6 +1254,7 @@ impl IcpService {
         let params: ConfirmReceiptParams = serde_json::from_value(input.envelope.params.clone())
             .map_err(|e| ApiError::InvalidRequest(format!("confirm_receipt.params: {e}")))?;
 
+        let _txn_guard = self.lock_transaction(&params.transaction_id).await;
         let txn = self.transaction_for_input(&params.transaction_id, input)?;
         // Only post-payment states can be receipt-confirmed.
         if !matches!(
@@ -1292,7 +1296,6 @@ impl IcpService {
             order: None,
             subscription: None,
             peer_quote: None,
-            recorded_spend_minor: 0,
         })
     }
 
@@ -1686,49 +1689,7 @@ impl IcpService {
         items: &[RequestItem],
         currency: &str,
     ) -> Result<Transaction, ApiError> {
-        // Price the basket inline using the same pricing shape as
-        // `do_quote` — a $0.10 default per unit when no hint is given,
-        // 8.75% tax. Matches the rest of the v0.2 placeholder pricing.
-        let mut line_items = Vec::with_capacity(items.len());
-        let mut subtotal_minor: i64 = 0;
-        for (idx, req) in items.iter().enumerate() {
-            if req.quantity <= 0 {
-                return Err(ApiError::InvalidRequest(format!(
-                    "subscription.items[{idx}].quantity must be positive"
-                )));
-            }
-            let unit_minor = req
-                .unit_price_hint
-                .as_ref()
-                .map(|m| m.amount_minor)
-                .unwrap_or(1_000);
-            if unit_minor < 0 {
-                return Err(ApiError::InvalidRequest(format!(
-                    "subscription.items[{idx}].unit_price_hint.amount_minor must be non-negative"
-                )));
-            }
-            let line_subtotal = unit_minor.saturating_mul(req.quantity);
-            subtotal_minor = subtotal_minor.saturating_add(line_subtotal);
-            line_items.push(LineItem {
-                id: format!("li_{idx:06}"),
-                sku: req.sku.clone(),
-                name: req.sku.clone(),
-                quantity: req.quantity,
-                unit_price: Money::new(unit_minor, currency),
-                subtotal: Money::new(line_subtotal, currency),
-                tax: None,
-                total: Money::new(line_subtotal, currency),
-            });
-        }
-        let tax_minor = subtotal_minor * 875 / 10_000;
-        let total_minor = subtotal_minor.saturating_add(tax_minor);
-        let totals = Totals {
-            subtotal: Some(Money::new(subtotal_minor, currency)),
-            discount: None,
-            shipping: None,
-            tax: Some(Money::new(tax_minor, currency)),
-            total: Some(Money::new(total_minor, currency)),
-        };
+        let (line_items, totals) = price_request_items(items, currency, "subscription.items")?;
 
         let now = Utc::now();
         let txn = Transaction {
@@ -1854,6 +1815,71 @@ impl IcpService {
         }
     }
 
+    fn ensure_quote_open(
+        &self,
+        txn: &Transaction,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), ApiError> {
+        if txn
+            .quote_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            if matches!(
+                txn.state,
+                TransactionState::Draft | TransactionState::Quoted
+            ) {
+                self.transactions.update(&txn.id, |t| {
+                    if matches!(t.state, TransactionState::Draft | TransactionState::Quoted)
+                        && t.quote_expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
+                    {
+                        t.state = TransactionState::Expired;
+                        t.updated_at = now;
+                    }
+                });
+            }
+            return Err(ApiError::PreconditionFailed(format!(
+                "transaction {} quote has expired",
+                txn.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn reserve_mandate_spend(
+        &self,
+        mandate: Option<&MandateEvaluation>,
+        tenant_id: &str,
+        amount_minor: i64,
+        currency: &str,
+    ) -> Result<(), ApiError> {
+        let Some(ev) = mandate else {
+            return Ok(());
+        };
+        if amount_minor <= 0 {
+            return Ok(());
+        }
+        let budget = &ev.payload.icp.budget;
+        if !budget.currency.eq_ignore_ascii_case(currency) {
+            return Err(ApiError::MandateOutOfScope(format!(
+                "mandate budget currency `{}` does not match charge currency `{currency}`",
+                budget.currency
+            )));
+        }
+        let window = mandate::parse_period(budget.period.as_deref()).unwrap_or(Duration::days(1));
+        self.mandates.try_record_spend_checked(
+            &ev.payload.jti,
+            tenant_id,
+            amount_minor,
+            Utc::now(),
+            MandateSpendLimits {
+                budget_minor: budget.amount_minor,
+                per_transaction: budget.per_transaction,
+                window,
+            },
+        )
+    }
+
     /// Push an event onto the durable webhook outbox.
     ///
     /// Routing: when `tenant_id` has registered active subscribers,
@@ -1959,7 +1985,6 @@ struct Outcome {
     /// Set by `intent.a2a_quote` and `intent.a2a_pay` (when paying an
     /// existing quote). Drives `peer_quote.<status>` event emission.
     peer_quote: Option<PeerQuote>,
-    recorded_spend_minor: i64,
 }
 
 /// Result of one [`IcpService::tick_expiries`] sweep. Surfaced to
@@ -2007,14 +2032,6 @@ impl TransactionState {
             Self::Expired => "expired",
         }
     }
-}
-
-fn require_transaction_id(params: &Value) -> Result<String, ApiError> {
-    params
-        .get("transaction_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| ApiError::InvalidRequest("params.transaction_id required".into()))
 }
 
 fn validate_payment_instrument(
@@ -2090,6 +2107,66 @@ fn period_advance(start: chrono::DateTime<Utc>, cadence: BillingCadence) -> chro
             .checked_add_months(chrono::Months::new(12))
             .unwrap_or(start + chrono::Duration::days(365)),
     }
+}
+
+fn price_request_items(
+    items: &[RequestItem],
+    currency: &str,
+    field_prefix: &str,
+) -> Result<(Vec<LineItem>, Totals), ApiError> {
+    // Placeholder pricing: optional unit_price_hint or $10.00 per unit,
+    // with 8.75% tax. The helper is shared by quote and subscriptions so
+    // mandate reservation checks use exactly the same total the charge will
+    // record.
+    let mut line_items = Vec::with_capacity(items.len());
+    let mut subtotal_minor: i64 = 0;
+    for (idx, req) in items.iter().enumerate() {
+        if req.quantity <= 0 {
+            return Err(ApiError::InvalidRequest(format!(
+                "{field_prefix}[{idx}].quantity must be positive"
+            )));
+        }
+        let unit_minor = req
+            .unit_price_hint
+            .as_ref()
+            .map(|m| m.amount_minor)
+            .unwrap_or(1_000);
+        if unit_minor < 0 {
+            return Err(ApiError::InvalidRequest(format!(
+                "{field_prefix}[{idx}].unit_price_hint.amount_minor must be non-negative"
+            )));
+        }
+        let line_subtotal = unit_minor.saturating_mul(req.quantity);
+        subtotal_minor = subtotal_minor.saturating_add(line_subtotal);
+        line_items.push(LineItem {
+            id: format!("li_{idx:06}"),
+            sku: req.sku.clone(),
+            name: req.sku.clone(),
+            quantity: req.quantity,
+            unit_price: Money::new(unit_minor, currency),
+            subtotal: Money::new(line_subtotal, currency),
+            tax: None,
+            total: Money::new(line_subtotal, currency),
+        });
+    }
+    let tax_minor = subtotal_minor * 875 / 10_000;
+    let total_minor = subtotal_minor.saturating_add(tax_minor);
+    let totals = Totals {
+        subtotal: Some(Money::new(subtotal_minor, currency)),
+        discount: None,
+        shipping: None,
+        tax: Some(Money::new(tax_minor, currency)),
+        total: Some(Money::new(total_minor, currency)),
+    };
+    Ok((line_items, totals))
+}
+
+fn total_amount_minor(totals: &Totals) -> i64 {
+    totals
+        .total
+        .as_ref()
+        .map(|money| money.amount_minor)
+        .unwrap_or(0)
 }
 
 /// Estimate the amount (in minor units) that an intent would put on the

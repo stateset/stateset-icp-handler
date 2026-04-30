@@ -26,6 +26,7 @@
 //! can manually re-enqueue via a future admin endpoint.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration as StdDuration;
 
@@ -41,6 +42,65 @@ use crate::state_db::StatePool;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_TICK_SECS: u64 = 5;
+
+pub fn validate_destination_url(url: &str, allow_insecure: bool) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| "url must be a valid absolute http(s) URL".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("url must use http:// or https://".into()),
+    }
+    if parsed.host_str().is_none() {
+        return Err("url must include a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not include credentials".into());
+    }
+    if !allow_insecure && parsed.scheme() != "https" {
+        return Err("url must use https:// when insecure URLs are disabled".into());
+    }
+    if !allow_insecure {
+        let host = parsed.host_str().expect("host checked");
+        if is_forbidden_host(host) {
+            return Err("url host must not resolve to localhost or a private network".into());
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_host(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "localhost" | "ip6-localhost" | "ip6-loopback"
+    ) || normalized.ends_with(".localhost")
+        || normalized.ends_with(".local")
+    {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(is_forbidden_ip)
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1322,6 +1382,7 @@ pub struct WebhookWorker {
     subscribers: Option<SubscriberStore>,
     client: reqwest::Client,
     timeout: StdDuration,
+    allow_insecure_urls: bool,
     /// Retain `delivered` rows for this many days. `None` disables
     /// pruning of delivered rows entirely.
     retain_delivered: Option<Duration>,
@@ -1338,6 +1399,7 @@ impl WebhookWorker {
     pub fn new_with_optional_secret(outbox: WebhookOutbox, global_secret: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(StdDuration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build webhook reqwest client");
         Self {
@@ -1346,6 +1408,7 @@ impl WebhookWorker {
             subscribers: None,
             client,
             timeout: StdDuration::from_secs(DEFAULT_TIMEOUT_SECS),
+            allow_insecure_urls: true,
             retain_delivered: None,
             retain_dead_lettered: None,
         }
@@ -1358,6 +1421,11 @@ impl WebhookWorker {
 
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    pub fn with_allow_insecure_urls(mut self, allow_insecure_urls: bool) -> Self {
+        self.allow_insecure_urls = allow_insecure_urls;
         self
     }
 
@@ -1443,6 +1511,11 @@ impl WebhookWorker {
     }
 
     async fn send_one(&self, delivery: &WebhookDelivery) -> anyhow::Result<u16> {
+        validate_destination_url(&delivery.url, self.allow_insecure_urls)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if !self.allow_insecure_urls {
+            self.ensure_public_resolution(&delivery.url).await?;
+        }
         let now_unix = Utc::now().timestamp();
         let secret = self
             .secret_for_delivery(delivery)
@@ -1462,6 +1535,34 @@ impl WebhookWorker {
             .send()
             .await?;
         Ok(resp.status().as_u16())
+    }
+
+    async fn ensure_public_resolution(&self, url: &str) -> anyhow::Result<()> {
+        let parsed = reqwest::Url::parse(url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("url must include a host"))?;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if is_forbidden_ip(ip) {
+                anyhow::bail!("url host must not resolve to localhost or a private network");
+            }
+            return Ok(());
+        }
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("url must include a resolvable port"))?;
+        let mut addrs = tokio::net::lookup_host((host, port)).await?;
+        let mut saw_addr = false;
+        for addr in addrs.by_ref() {
+            saw_addr = true;
+            if is_forbidden_ip(addr.ip()) {
+                anyhow::bail!("url host must not resolve to localhost or a private network");
+            }
+        }
+        if !saw_addr {
+            anyhow::bail!("url host did not resolve to any address");
+        }
+        Ok(())
     }
 
     fn secret_for_delivery(&self, delivery: &WebhookDelivery) -> Option<String> {
@@ -1637,6 +1738,18 @@ mod tests {
     fn verify_rejects_wrong_secret() {
         let header = sign("k1", 1_000, b"x");
         assert!(!verify("k2", &header, b"x"));
+    }
+
+    #[test]
+    fn destination_validation_blocks_ssrf_targets_when_insecure_urls_are_disabled() {
+        assert!(validate_destination_url("https://hooks.example/webhook", false).is_ok());
+        assert!(validate_destination_url("http://hooks.example/webhook", false).is_err());
+        assert!(validate_destination_url("https://127.0.0.1/webhook", false).is_err());
+        assert!(validate_destination_url("https://10.0.0.8/webhook", false).is_err());
+        assert!(validate_destination_url("https://localhost/webhook", false).is_err());
+        assert!(validate_destination_url("http://localhost/webhook", true).is_ok());
+        assert!(validate_destination_url("ftp://hooks.example/webhook", true).is_err());
+        assert!(validate_destination_url("https://user:pass@hooks.example/webhook", true).is_err());
     }
 
     #[test]
