@@ -1,7 +1,10 @@
 [package]
 name = "stateset-icp-handler"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
+# Matches the sibling stateset-icommerce workspace so both publish from a
+# single coherent toolchain. Bumps require a CHANGELOG entry.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Reference implementation of the Intelligent Commerce Protocol (ICP), backed by the StateSet iCommerce engine"
 repository = "https://github.com/stateset/stateset-icp-handler"
@@ -57,15 +60,12 @@ anyhow = "1"
 # Tracing + metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-prometheus = "0.13"
+prometheus = "0.14"
 lazy_static = "1.4"
 
 # Config
 config = "0.14"
 dotenvy = "0.15"
-
-# Validation
-validator = { version = "0.18", features = ["derive"] }
 
 # HTTP client (egress: webhooks, profile resolution)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -107,9 +107,11 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "decimal"
 
 # StateSet iCommerce — embedded engine of record.
 # Pointed at the sibling checkout of the engine workspace so the handler
-# consumes the same source tree we develop against.
-stateset-embedded = { path = "../stateset-icommerce/crates/stateset-embedded", features = ["sqlite", "events"] }
-stateset-core = { path = "../stateset-icommerce/crates/stateset-core" }
+# consumes the same source tree we develop against. Explicit version pins
+# track the sibling workspace and let `cargo publish` resolve the path
+# dep to crates.io if/when we ever cut a public release.
+stateset-embedded = { path = "../stateset-icommerce/crates/stateset-embedded", version = "1.0.3", features = ["sqlite", "events"] }
+stateset-core = { path = "../stateset-icommerce/crates/stateset-core", version = "1.0.3" }
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -119,6 +121,7 @@ chrono = "0.4"
 tokio-stream = "0.1"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+proptest = "1"
 
 [features]
 default = []

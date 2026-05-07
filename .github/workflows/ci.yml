@@ -66,6 +66,125 @@ jobs:
         working-directory: stateset-icp-handler
         run: cargo test --all-targets
 
+  # Verify the crate still builds + tests on its declared MSRV. The version
+  # mirrors `rust-version` in Cargo.toml and the sibling workspace.
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout handler
+        uses: actions/checkout@v4
+        with:
+          path: stateset-icp-handler
+
+      - name: Checkout iCommerce engine
+        uses: actions/checkout@v4
+        with:
+          repository: stateset/stateset-icommerce
+          path: stateset-icommerce
+          ref: main
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stateset-icp-handler
+          key: msrv
+
+      - name: cargo build (MSRV)
+        working-directory: stateset-icp-handler
+        run: cargo build --all-targets
+
+      - name: cargo test (MSRV)
+        working-directory: stateset-icp-handler
+        run: cargo test --all-targets
+
+  # Supply-chain checks: advisories, license allowlist, banned deps, source
+  # registries. Configured in deny.toml.
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout handler
+        uses: actions/checkout@v4
+        with:
+          path: stateset-icp-handler
+
+      - name: Checkout iCommerce engine
+        uses: actions/checkout@v4
+        with:
+          repository: stateset/stateset-icommerce
+          path: stateset-icommerce
+          ref: main
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: stateset-icp-handler/Cargo.toml
+          command: check
+          arguments: --all-features
+
+  # Test-suite line coverage with cargo-llvm-cov. Uploads an lcov report as
+  # a build artifact and prints summary to the job log; no external coverage
+  # service required.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout handler
+        uses: actions/checkout@v4
+        with:
+          path: stateset-icp-handler
+
+      - name: Checkout iCommerce engine
+        uses: actions/checkout@v4
+        with:
+          repository: stateset/stateset-icommerce
+          path: stateset-icommerce
+          ref: main
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stateset-icp-handler
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Run coverage
+        working-directory: stateset-icp-handler
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --summary-only
+
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: stateset-icp-handler/lcov.info
+          if-no-files-found: error
+
   # Verify the Dockerfile still builds from a fresh parent directory.
   docker-build:
     name: docker build

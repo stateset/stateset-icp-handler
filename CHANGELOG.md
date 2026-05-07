@@ -16,6 +16,52 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-07
+
+### Security
+- Removed three transitive vulnerabilities by dropping the unused
+  `validator` crate and bumping `prometheus 0.13 → 0.14`:
+  - **RUSTSEC-2024-0421** — `idna 0.5.0` Punycode label confusion
+    (reachable via `validator → idna`).
+  - **RUSTSEC-2024-0370** — unmaintained `proc-macro-error 1.0.4`
+    (reachable via `validator_derive`).
+  - **RUSTSEC-2024-0437** — `protobuf 2.28.0` stack overflow on
+    untrusted unknown fields (reachable via `prometheus → protobuf`).
+
+### Added
+- **MSRV declared** as `rust-version = "1.85"`, matching the sibling
+  `stateset-icommerce` workspace. New CI job builds and tests against
+  the pinned MSRV so consumer toolchains are no longer guesswork.
+- **`cargo deny` policy** (`deny.toml`) covering advisories, license
+  allowlist, banned/duplicate crates, and source registries — wired
+  into CI as a required check on every PR.
+- **Coverage CI job** using `cargo-llvm-cov`; uploads an `lcov.info`
+  build artifact and prints a summary on each run.
+- **Property-test suite** (`tests/properties.rs`, 9 properties) covering
+  JCS canonicalization invariants (determinism, key-order independence,
+  parser round-trip stability) and `MandateLedger` budget arithmetic
+  (sum-of-spends conservation, no-overspend, per-transaction cap,
+  no-op semantics for non-positive amounts, window-reset behavior).
+
+### Changed
+- `prometheus` bumped `0.13 → 0.14`.
+- `stateset-embedded` / `stateset-core` path deps now carry an explicit
+  `version = "1.0.3"` so the crate is publishable to crates.io and
+  `cargo deny` no longer flags them as wildcard deps.
+- **`src/service.rs` (2,197 LOC) split into `src/service/`** by intent
+  family — `mod.rs` (dispatcher + types), `catalog.rs`,
+  `purchase.rs`, `orders.rs`, `subscriptions.rs`, `a2a.rs`,
+  `negotiate.rs`, `lifecycle.rs` (scheduler ticks), and `helpers.rs`
+  (shared helpers). No file over 504 LOC. Public API
+  (`service::IcpService`, `service::IntentInput`,
+  `service::ExpiryTickReport`, `service::SchedulerTickReport`,
+  `IcpService::MAX_RENEWAL_FAILURES`) is unchanged.
+
+### Removed
+- Unused `validator` dependency. Cuts six transitive crates from the
+  graph (`idna`, `validator_derive`, `proc-macro-error`,
+  `proc-macro-error-attr`, `unicode-bidi`, `unicode-normalization`).
+
 ## [0.3.1] — 2026-04-23
 
 ### Changed
