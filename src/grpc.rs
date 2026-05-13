@@ -66,7 +66,11 @@ impl IcpHandler for GrpcHandler {
         if let crate::rate_limit::RateLimitDecision::Denied {
             limit,
             retry_after_secs,
-        } = self.service.pre_auth_limiter.check(&pre_auth_bucket, None)
+        } = self
+            .service
+            .check_pre_auth_rate_limit(&pre_auth_bucket)
+            .await
+            .map_err(api_error_to_status)?
         {
             return Err(Status::resource_exhausted(format!(
                 "pre-auth rate limited: limit {limit}/min, retry after {retry_after_secs}s"
@@ -81,8 +85,9 @@ impl IcpHandler for GrpcHandler {
             retry_after_secs,
         } = self
             .service
-            .rate_limiter
-            .check(&tenant.tenant_id, tenant.rate_limit_per_minute)
+            .check_tenant_rate_limit(&tenant)
+            .await
+            .map_err(api_error_to_status)?
         {
             return Err(Status::resource_exhausted(format!(
                 "rate limited: limit {limit}/min, retry after {retry_after_secs}s"

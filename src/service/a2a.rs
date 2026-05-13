@@ -13,11 +13,11 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::mandate::MandateEvaluation;
 use crate::models::{
-    A2aPayParams, A2aQuoteParams, LineItem, PeerQuote, PeerQuoteStatus, Totals, Transaction,
-    TransactionState,
+    A2aPayParams, A2aQuoteParams, LineItem, PaymentInstrument, PeerQuote, PeerQuoteStatus, Totals,
+    Transaction, TransactionState,
 };
 
-use super::{IcpService, IntentInput, Outcome};
+use super::{helpers::validate_payment_instrument, IcpService, IntentInput, Outcome};
 
 impl IcpService {
     pub(super) async fn do_a2a_quote(
@@ -122,9 +122,17 @@ impl IcpService {
                 "a2a_pay: `from` is required".into(),
             ));
         }
-        if self.config.is_production() {
+        let payment_execution_mode = if self.config.is_production() {
+            "external_required"
+        } else {
+            self.config.payment_execution_mode.as_str()
+        };
+        if let Some(payment) = params.payment.as_ref() {
+            validate_payment_instrument(payment, payment_execution_mode)?;
+        } else if payment_execution_mode == "external_required" {
             return Err(ApiError::PreconditionFailed(
-                "a2a_pay requires a production settlement adapter before it can complete".into(),
+                "a2a_pay requires payment.method=external_authorization in external_required mode"
+                    .into(),
             ));
         }
         let _quote_guard = match params.peer_quote_id.as_deref() {
@@ -226,6 +234,24 @@ impl IcpService {
         }
         if let Some(memo) = params.memo.as_deref() {
             external_refs.insert("memo".to_string(), memo.to_string());
+        }
+        if let Some(PaymentInstrument::ExternalAuthorization {
+            provider,
+            authorization_id,
+            instrument_hint,
+        }) = params.payment.as_ref()
+        {
+            external_refs.insert("settlement_provider".to_string(), provider.clone());
+            external_refs.insert(
+                "settlement_authorization_id".to_string(),
+                authorization_id.clone(),
+            );
+            if let Some(instrument_hint) = instrument_hint.as_deref() {
+                external_refs.insert(
+                    "settlement_instrument_hint".to_string(),
+                    instrument_hint.to_string(),
+                );
+            }
         }
         external_refs.insert("a2a_from".to_string(), params.from);
 

@@ -13,16 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# The handler has a `path = ../stateset-icommerce/...` dependency on the
-# iCommerce workspace. The build context is expected to be the parent of
-# the two checkouts, so that both are reachable.
-#
-#     docker build -f stateset-icp-handler/Dockerfile -t stateset-icp-handler .
-#
-COPY stateset-icommerce ./stateset-icommerce
-COPY stateset-icp-handler ./stateset-icp-handler
-
-WORKDIR /build/stateset-icp-handler
+# Build with the handler repository as the Docker context. The iCommerce
+# engine crates are fetched from the pinned Git revision in Cargo.toml.
+COPY . .
 RUN cargo build --release --bin stateset-icp-handler
 
 # --- runtime ------------------------------------------------------------
@@ -36,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd  --system --uid 1000 --gid icp --shell /usr/sbin/nologin icp
 
 WORKDIR /app
-COPY --from=builder /build/stateset-icp-handler/target/release/stateset-icp-handler \
+COPY --from=builder /build/target/release/stateset-icp-handler \
      /usr/local/bin/stateset-icp-handler
 
 USER icp

@@ -1,9 +1,9 @@
 [package]
 name = "stateset-icp-handler"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
-# Matches the sibling stateset-icommerce workspace so both publish from a
-# single coherent toolchain. Bumps require a CHANGELOG entry.
+# Matches the pinned stateset-icommerce engine release. Bumps require a
+# CHANGELOG entry.
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Reference implementation of the Intelligent Commerce Protocol (ICP), backed by the StateSet iCommerce engine"
@@ -106,12 +106,11 @@ r2d2_sqlite = "0.25"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "decimal"] }
 
 # StateSet iCommerce — embedded engine of record.
-# Pointed at the sibling checkout of the engine workspace so the handler
-# consumes the same source tree we develop against. Explicit version pins
-# track the sibling workspace and let `cargo publish` resolve the path
-# dep to crates.io if/when we ever cut a public release.
-stateset-embedded = { path = "../stateset-icommerce/crates/stateset-embedded", version = "1.5.0", features = ["sqlite", "events"] }
-stateset-core = { path = "../stateset-icommerce/crates/stateset-core", version = "1.5.0" }
+# Pinned to the v1.5.0 engine release commit this handler is validated
+# against; this keeps CI/Docker builds reproducible without requiring a
+# sibling checkout.
+stateset-embedded = { git = "https://github.com/stateset/stateset-icommerce", rev = "d5059c02a6c85aa3459afd1978dc70b275f791da", package = "stateset-embedded", version = "1.5.0", features = ["sqlite", "events"] }
+stateset-core = { git = "https://github.com/stateset/stateset-icommerce", rev = "d5059c02a6c85aa3459afd1978dc70b275f791da", package = "stateset-core", version = "1.5.0" }
 
 [build-dependencies]
 tonic-build = "0.12"

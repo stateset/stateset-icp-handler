@@ -97,9 +97,8 @@ See the full spec in [`docs/specification/ICP_SPEC.md`](./docs/specification/ICP
 ## Quickstart
 
 ```bash
-# 1. Clone alongside the iCommerce engine checkout
+# 1. Clone the handler
 git clone https://github.com/stateset/stateset-icp-handler
-# (expects ../stateset-icommerce/ at the same directory level)
 
 # 2. Build
 cd stateset-icp-handler
@@ -259,7 +258,13 @@ Since v0.1:
 - ✅ **A2A peer commerce** — `intent.a2a_quote` and `intent.a2a_pay`
   let agents transact directly. Pay-against-quote consumes a `PeerQuote`
   and produces a signed receipt; direct-pay skips the quote step.
-  Mandate scope `pay_peer` enforced.
+  Production `external_required` mode requires
+  `payment.method=external_authorization` and records the settlement
+  reference on the transaction. Mandate scope `pay_peer` enforced.
+- ✅ **Distributed rate limiting** — local fixed-window counters for
+  development/tests, with Redis-backed per-tenant and pre-auth counters
+  for production fleets (`REDIS_URL` required when production limits are
+  enabled).
 - ✅ **`icp-conformance` harness** — implementation-independent test
   suite that validates any ICP handler URL against the spec
   (see `src/bin/icp_conformance.rs`). Run

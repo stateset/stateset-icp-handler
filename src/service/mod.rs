@@ -60,10 +60,12 @@ pub struct IcpService {
     pub mandates: MandateLedger,
     pub idempotency: crate::idempotency::IdempotencyStore,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub distributed_rate_limiter: Option<crate::rate_limit::RedisRateLimiter>,
     /// Per-IP pre-auth limiter. Fires *before* bearer resolution, so a
     /// flood of fake API keys can't burn unbounded CPU on keystore
     /// lookups. Disabled when the configured capacity is 0.
     pub pre_auth_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub distributed_pre_auth_limiter: Option<crate::rate_limit::RedisRateLimiter>,
     pub webhook_outbox: crate::webhook::WebhookOutbox,
     /// Per-tenant webhook subscriber registry. Production deployments
     /// register one or more rows per tenant via the admin endpoints;
@@ -172,7 +174,9 @@ impl IcpService {
             mandates: MandateLedger::new(),
             idempotency: crate::idempotency::IdempotencyStore::default(),
             rate_limiter,
+            distributed_rate_limiter: None,
             pre_auth_limiter,
+            distributed_pre_auth_limiter: None,
             webhook_outbox: crate::webhook::WebhookOutbox::default(),
             webhook_subscribers: crate::webhook::SubscriberStore::default(),
             webhook_url,
@@ -223,6 +227,62 @@ impl IcpService {
                 .clone()
         };
         lock.lock_owned().await
+    }
+
+    pub async fn check_pre_auth_rate_limit(
+        &self,
+        bucket_id: &str,
+    ) -> Result<crate::rate_limit::RateLimitDecision, ApiError> {
+        self.check_rate_limit(
+            "pre-auth",
+            bucket_id,
+            None,
+            &self.pre_auth_limiter,
+            self.distributed_pre_auth_limiter.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn check_tenant_rate_limit(
+        &self,
+        tenant: &ApiKeyInfo,
+    ) -> Result<crate::rate_limit::RateLimitDecision, ApiError> {
+        self.check_rate_limit(
+            "tenant",
+            &tenant.tenant_id,
+            tenant.rate_limit_per_minute,
+            &self.rate_limiter,
+            self.distributed_rate_limiter.as_ref(),
+        )
+        .await
+    }
+
+    async fn check_rate_limit(
+        &self,
+        scope: &str,
+        bucket_id: &str,
+        bucket_capacity: Option<u32>,
+        local: &crate::rate_limit::RateLimiter,
+        distributed: Option<&crate::rate_limit::RedisRateLimiter>,
+    ) -> Result<crate::rate_limit::RateLimitDecision, ApiError> {
+        let Some(distributed) = distributed else {
+            return Ok(local.check(bucket_id, bucket_capacity));
+        };
+
+        match distributed.check(bucket_id, bucket_capacity).await {
+            Ok(decision) => Ok(decision),
+            Err(err) if self.config.is_production() => Err(ApiError::EngineUnavailable(format!(
+                "distributed {scope} rate limiter unavailable: {err}"
+            ))),
+            Err(err) => {
+                tracing::warn!(
+                    scope,
+                    error = %err,
+                    "distributed rate limiter unavailable; falling back to local limiter"
+                );
+                Ok(local.check(bucket_id, bucket_capacity))
+            }
+        }
     }
 
     pub async fn handle_intent(

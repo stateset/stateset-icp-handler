@@ -17,14 +17,16 @@
 //! `Config.rate_limit_per_minute` default applies. A `capacity` of 0
 //! disables the limit entirely (useful for trusted internal clients).
 //!
-//! State is in-memory and per-instance. A multi-instance deployment
-//! will see N× the per-tenant budget across the fleet — for v1.0
-//! that's accepted; distributed rate limiting (Redis-backed counters)
-//! is a v1.1 concern.
+//! State is in-memory by default for local/test runs. Production can
+//! attach a Redis-backed limiter so the same fixed window is enforced
+//! across every handler instance in the fleet.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use redis::aio::ConnectionManager;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitDecision {
@@ -58,6 +60,115 @@ pub struct RateLimiter {
     pub default_capacity: u32,
     pub window: Duration,
     buckets: Mutex<HashMap<String, Bucket>>,
+}
+
+/// Redis-backed fixed-window rate limiter.
+///
+/// Keys are minute-bucketed and TTL'd slightly past the window reset.
+/// The caller's bucket id is SHA-256 hashed before it becomes part of
+/// the Redis key so raw bearer-derived tenant ids, IPs, or proxy header
+/// values are never written directly into shared infrastructure.
+#[derive(Clone)]
+pub struct RedisRateLimiter {
+    pub default_capacity: u32,
+    pub window: Duration,
+    prefix: String,
+    manager: ConnectionManager,
+}
+
+impl RedisRateLimiter {
+    pub async fn new(
+        redis_url: &str,
+        prefix: impl Into<String>,
+        default_capacity: u32,
+        window: Duration,
+    ) -> redis::RedisResult<Self> {
+        let client = redis::Client::open(redis_url)?;
+        let manager = client.get_connection_manager().await?;
+        Ok(Self {
+            default_capacity,
+            window,
+            prefix: prefix.into(),
+            manager,
+        })
+    }
+
+    pub async fn per_minute(
+        redis_url: &str,
+        prefix: impl Into<String>,
+        default_capacity: u32,
+    ) -> redis::RedisResult<Self> {
+        Self::new(redis_url, prefix, default_capacity, Duration::from_secs(60)).await
+    }
+
+    pub async fn check(
+        &self,
+        bucket_id: &str,
+        bucket_capacity: Option<u32>,
+    ) -> redis::RedisResult<RateLimitDecision> {
+        let cap = bucket_capacity.unwrap_or(self.default_capacity);
+        if cap == 0 {
+            return Ok(RateLimitDecision::Allowed {
+                limit: 0,
+                remaining: u32::MAX,
+                reset_in_secs: self.window.as_secs(),
+            });
+        }
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.check_at_epoch(bucket_id, cap, now_secs).await
+    }
+
+    async fn check_at_epoch(
+        &self,
+        bucket_id: &str,
+        capacity: u32,
+        now_secs: u64,
+    ) -> redis::RedisResult<RateLimitDecision> {
+        let window_secs = self.window.as_secs().max(1);
+        let window_index = now_secs / window_secs;
+        let reset_in_secs = (window_secs - (now_secs % window_secs)).max(1);
+        let key = self.key(bucket_id, window_index);
+
+        let mut con = self.manager.clone();
+        let count: i64 = redis::cmd("EVAL")
+            .arg(
+                "local current = redis.call('INCRBY', KEYS[1], 1)\n\
+                 if current == 1 then\n\
+                   redis.call('EXPIRE', KEYS[1], ARGV[1])\n\
+                 end\n\
+                 return current",
+            )
+            .arg(1)
+            .arg(&key)
+            .arg((window_secs + 1) as i64)
+            .query_async(&mut con)
+            .await?;
+
+        if count > i64::from(capacity) {
+            return Ok(RateLimitDecision::Denied {
+                limit: capacity,
+                retry_after_secs: reset_in_secs,
+            });
+        }
+
+        let used = u32::try_from(count).unwrap_or(u32::MAX);
+        Ok(RateLimitDecision::Allowed {
+            limit: capacity,
+            remaining: capacity.saturating_sub(used),
+            reset_in_secs,
+        })
+    }
+
+    fn key(&self, bucket_id: &str, window_index: u64) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bucket_id.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        format!("{}:{}:{}", self.prefix, window_index, digest)
+    }
 }
 
 impl RateLimiter {

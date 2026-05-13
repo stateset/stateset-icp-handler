@@ -16,6 +16,27 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-13
+
+### Security
+- Added Redis-backed distributed fixed-window rate limiting for both
+  per-tenant and pre-auth buckets, shared by HTTP and gRPC intent
+  submission.
+- Production validation now requires `REDIS_URL` whenever production
+  rate limits are enabled, preventing multi-instance deployments from
+  multiplying caller budgets.
+
+### Changed
+- Production `intent.a2a_pay` now completes only with
+  `payment.method=external_authorization` and records the settlement
+  provider, authorization id, and optional instrument hint on the
+  transaction audit trail.
+- Replaced local sibling iCommerce path dependencies with a pinned
+  `stateset-icommerce` Git revision so CI and Docker builds are
+  reproducible from a standalone handler checkout.
+- Simplified CI and Docker build setup now that a side-by-side engine
+  checkout is no longer required.
+
 ## [0.4.1] — 2026-05-13
 
 ### Security

@@ -31,6 +31,7 @@ fn production_ready_config() -> Config {
         "/tmp/icp_prod_commerce_{}.db",
         uuid::Uuid::new_v4().simple()
     );
+    cfg.redis_url = Some("redis://127.0.0.1:6379".into());
     cfg.payment_execution_mode = "external_required".into();
     cfg
 }
@@ -44,6 +45,7 @@ fn production_profile_rejects_dev_defaults() {
     assert!(err.contains("ICP_ALLOW_INSECURE_URLS must be false"));
     assert!(err.contains("ICP_REQUIRE_REQUEST_ID must be true"));
     assert!(err.contains("ICP_PAYMENT_EXECUTION_MODE must be external_required"));
+    assert!(err.contains("REDIS_URL is required"));
 }
 
 #[test]
@@ -140,7 +142,7 @@ async fn production_subscribe_fails_closed_without_commerce_engine() {
 }
 
 #[tokio::test]
-async fn production_a2a_pay_fails_closed_without_settlement_adapter() {
+async fn production_a2a_pay_requires_external_authorization() {
     let service = production_service_without_engine();
     let envelope: IntentEnvelope = serde_json::from_value(json!({
         "intent": "intent.a2a_pay",
@@ -157,6 +159,46 @@ async fn production_a2a_pay_fails_closed_without_settlement_adapter() {
     let err = service.handle_intent(input(envelope)).await.unwrap_err();
     assert!(
         matches!(err, ApiError::PreconditionFailed(_)),
-        "production a2a_pay must not synthesize completed settlement, got {err:?}"
+        "production a2a_pay must require external authorization, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn production_a2a_pay_accepts_external_authorization() {
+    let service = production_service_without_engine();
+    let envelope: IntentEnvelope = serde_json::from_value(json!({
+        "intent": "intent.a2a_pay",
+        "agent_id": AGENT,
+        "params": {
+            "peer_agent_id": "did:stateset:agent:peer",
+            "amount": { "amount_minor": 2500, "currency": "USD" },
+            "from": "acct_prod_123",
+            "payment": {
+                "method": "external_authorization",
+                "provider": "stripe",
+                "authorization_id": "auth_a2a_prod_123",
+                "instrument_hint": "card_4242"
+            }
+        },
+        "context": { "currency": "USD" }
+    }))
+    .unwrap();
+
+    let body = service.handle_intent(input(envelope)).await.unwrap();
+    assert_eq!(
+        body.transaction.external_refs.get("settlement_provider"),
+        Some(&"stripe".to_string())
+    );
+    assert_eq!(
+        body.transaction
+            .external_refs
+            .get("settlement_authorization_id"),
+        Some(&"auth_a2a_prod_123".to_string())
+    );
+    assert_eq!(
+        body.transaction
+            .external_refs
+            .get("settlement_instrument_hint"),
+        Some(&"card_4242".to_string())
     );
 }

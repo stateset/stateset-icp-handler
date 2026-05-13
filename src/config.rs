@@ -63,8 +63,9 @@ pub struct Config {
     /// independently of the commerce engine's schema. Use `:memory:` for
     /// ephemeral tests.
     pub state_db_path: String,
-    /// Reserved for a future distributed mandate ledger. Read but not yet
-    /// wired — SQLite persistence is the v0.1 story.
+    /// Redis URL for distributed fixed-window rate limiting. Optional
+    /// for local/test runs; required in production when rate limits are
+    /// enabled so multi-instance deployments do not multiply budgets.
     pub redis_url: Option<String>,
 
     // Outbound webhooks
@@ -297,6 +298,14 @@ impl Config {
         }
         if self.payment_execution_mode != "external_required" {
             issues.push("ICP_PAYMENT_EXECUTION_MODE must be external_required");
+        }
+        if (self.rate_limit_per_minute > 0 || self.pre_auth_rate_limit_per_minute > 0)
+            && self
+                .redis_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            issues.push("REDIS_URL is required when production rate limits are enabled");
         }
 
         if issues.is_empty() {

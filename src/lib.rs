@@ -130,6 +130,49 @@ pub async fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
     service.idempotency = crate::idempotency::IdempotencyStore::with_pool(state_pool.clone());
     service.webhook_outbox = crate::webhook::WebhookOutbox::with_pool(state_pool.clone());
     service.webhook_subscribers = crate::webhook::SubscriberStore::with_pool(state_pool);
+    if let Some(redis_url) = config.redis_url.as_deref() {
+        match crate::rate_limit::RedisRateLimiter::per_minute(
+            redis_url,
+            "icp:rate_limit:tenant",
+            config.rate_limit_per_minute,
+        )
+        .await
+        {
+            Ok(limiter) => {
+                service.distributed_rate_limiter = Some(limiter);
+                info!("tenant rate limiting backed by Redis");
+            }
+            Err(err) if config.is_production() => {
+                return Err(anyhow::anyhow!(
+                    "connect REDIS_URL for tenant rate limiting: {err}"
+                ));
+            }
+            Err(err) => {
+                warn!("Redis tenant rate limiter unavailable; using local limiter: {err}");
+            }
+        }
+
+        match crate::rate_limit::RedisRateLimiter::per_minute(
+            redis_url,
+            "icp:rate_limit:pre_auth",
+            config.pre_auth_rate_limit_per_minute,
+        )
+        .await
+        {
+            Ok(limiter) => {
+                service.distributed_pre_auth_limiter = Some(limiter);
+                info!("pre-auth rate limiting backed by Redis");
+            }
+            Err(err) if config.is_production() => {
+                return Err(anyhow::anyhow!(
+                    "connect REDIS_URL for pre-auth rate limiting: {err}"
+                ));
+            }
+            Err(err) => {
+                warn!("Redis pre-auth rate limiter unavailable; using local limiter: {err}");
+            }
+        }
+    }
 
     let keys = load_api_keys(config)?;
     if keys.is_empty() {
@@ -403,7 +446,7 @@ pub async fn submit_intent(
     if let crate::rate_limit::RateLimitDecision::Denied {
         limit,
         retry_after_secs,
-    } = state.service.pre_auth_limiter.check(&client_ip, None)
+    } = state.service.check_pre_auth_rate_limit(&client_ip).await?
     {
         let mut response = ApiError::RateLimited.into_response();
         let h = response.headers_mut();
@@ -445,10 +488,7 @@ pub async fn submit_intent(
     // Per-tenant rate limit. Per-tenant override via the API key entry's
     // `rate_limit_per_minute` (a value of 0 disables); falls back to
     // the handler-wide config default.
-    let rl_decision = state
-        .service
-        .rate_limiter
-        .check(&tenant.tenant_id, tenant.rate_limit_per_minute);
+    let rl_decision = state.service.check_tenant_rate_limit(&tenant).await?;
     let mut rl_headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
     match rl_decision {
         crate::rate_limit::RateLimitDecision::Allowed {

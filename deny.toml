@@ -36,8 +36,8 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Path deps to the sibling stateset-icommerce workspace are intentionally
-# wildcard-versioned — cargo-deny still flags them, so opt out for paths.
+# The handler itself has no wildcard dependency versions; keep this true
+# so local path overrides can still be checked during engine development.
 allow-wildcard-paths = true
 highlight = "all"
 # Crates we explicitly disallow (e.g. unmaintained, license-incompatible).
@@ -51,4 +51,4 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/stateset/stateset-icommerce"]

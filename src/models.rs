@@ -609,6 +609,11 @@ pub struct A2aPayParams {
     pub amount: Option<Money>,
     /// Wallet/account paying — required for both flows.
     pub from: String,
+    /// Settlement instrument. Production `external_required` mode
+    /// requires `method=external_authorization`, matching `intent.buy`
+    /// and subscription charges.
+    #[serde(default)]
+    pub payment: Option<PaymentInstrument>,
     #[serde(default)]
     pub memo: Option<String>,
 }
