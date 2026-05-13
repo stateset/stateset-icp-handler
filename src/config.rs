@@ -107,6 +107,12 @@ pub struct Config {
     // Rate limiting
     pub rate_limit_per_minute: u32,
     pub pre_auth_rate_limit_per_minute: u32,
+    /// Trust proxy-supplied client IP headers (`X-Forwarded-For`,
+    /// `X-Real-IP`) for pre-auth rate-limit buckets. Leave false for
+    /// directly exposed handlers because callers can spoof these
+    /// headers; set true only behind a trusted edge proxy that strips
+    /// inbound client copies and writes its own.
+    pub trust_proxy_headers: bool,
 
     // Subscription auto-billing scheduler
     pub subscription_scheduler_enabled: bool,
@@ -210,6 +216,7 @@ impl Config {
             )
             .parse()
             .unwrap_or(120),
+            trust_proxy_headers: env_bool("ICP_TRUST_PROXY_HEADERS", false),
             subscription_scheduler_enabled: env_bool("ICP_SUBSCRIPTION_SCHEDULER_ENABLED", true),
             subscription_scheduler_interval_secs: env_default(
                 "ICP_SUBSCRIPTION_SCHEDULER_INTERVAL_SECS",
@@ -276,11 +283,17 @@ impl Config {
         if self.state_db_path == ":memory:" {
             issues.push("ICP_STATE_DB_PATH must be durable");
         }
+        if let Some(issue) = validate_sqlite_file_path("ICP_STATE_DB_PATH", &self.state_db_path) {
+            issues.push(issue);
+        }
         if !self.commerce_enabled {
             issues.push("COMMERCE_ENABLED must be true");
         }
         if self.commerce_db_path == ":memory:" {
             issues.push("COMMERCE_DB_PATH must be durable");
+        }
+        if let Some(issue) = validate_sqlite_file_path("COMMERCE_DB_PATH", &self.commerce_db_path) {
+            issues.push(issue);
         }
         if self.payment_execution_mode != "external_required" {
             issues.push("ICP_PAYMENT_EXECUTION_MODE must be external_required");
@@ -349,6 +362,7 @@ impl Config {
             ucp_compat_enabled: true,
             rate_limit_per_minute: 10_000,
             pre_auth_rate_limit_per_minute: 10_000,
+            trust_proxy_headers: true,
             // Tests drive `tick_subscriptions` directly for determinism;
             // the background loop is off unless the test opts in.
             subscription_scheduler_enabled: false,
@@ -382,6 +396,32 @@ fn require_https(name: &str, url: &str) -> anyhow::Result<()> {
             "{name} must use https:// when insecure URLs are disabled"
         ))
     }
+}
+
+fn validate_sqlite_file_path(name: &'static str, path: &str) -> Option<&'static str> {
+    if path == ":memory:" || path.starts_with("postgres://") || path.starts_with("postgresql://") {
+        return None;
+    }
+    let path = std::path::Path::new(path);
+    if path.is_dir() {
+        return Some(match name {
+            "ICP_STATE_DB_PATH" => {
+                "ICP_STATE_DB_PATH must be a database file path, not a directory"
+            }
+            "COMMERCE_DB_PATH" => "COMMERCE_DB_PATH must be a database file path, not a directory",
+            _ => "database path must be a file path, not a directory",
+        });
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Some(match name {
+                "ICP_STATE_DB_PATH" => "ICP_STATE_DB_PATH parent directory must exist",
+                "COMMERCE_DB_PATH" => "COMMERCE_DB_PATH parent directory must exist",
+                _ => "database path parent directory must exist",
+            });
+        }
+    }
+    None
 }
 
 fn env_default(key: &str, default: &str) -> String {

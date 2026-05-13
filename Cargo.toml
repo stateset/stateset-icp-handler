@@ -1,6 +1,6 @@
 [package]
 name = "stateset-icp-handler"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # Matches the sibling stateset-icommerce workspace so both publish from a
 # single coherent toolchain. Bumps require a CHANGELOG entry.
@@ -110,8 +110,8 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid", "decimal"
 # consumes the same source tree we develop against. Explicit version pins
 # track the sibling workspace and let `cargo publish` resolve the path
 # dep to crates.io if/when we ever cut a public release.
-stateset-embedded = { path = "../stateset-icommerce/crates/stateset-embedded", version = "1.0.3", features = ["sqlite", "events"] }
-stateset-core = { path = "../stateset-icommerce/crates/stateset-core", version = "1.0.3" }
+stateset-embedded = { path = "../stateset-icommerce/crates/stateset-embedded", version = "1.5.0", features = ["sqlite", "events"] }
+stateset-core = { path = "../stateset-icommerce/crates/stateset-core", version = "1.5.0" }
 
 [build-dependencies]
 tonic-build = "0.12"

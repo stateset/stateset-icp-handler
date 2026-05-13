@@ -34,6 +34,13 @@ async fn build(pre_auth_per_minute: u32) -> Router {
     build_router(state)
 }
 
+async fn build_with_config(mut cfg: Config, pre_auth_per_minute: u32) -> Router {
+    cfg.pre_auth_rate_limit_per_minute = pre_auth_per_minute;
+    cfg.rate_limit_per_minute = 1000;
+    let state = build_app_state(&cfg).await.expect("state");
+    build_router(state)
+}
+
 async fn post_intent(
     app: &Router,
     bearer: Option<&str>,
@@ -293,6 +300,25 @@ async fn missing_xff_lumps_into_direct_bucket() {
         StatusCode::TOO_MANY_REQUESTS,
         "no-XFF callers all share one bucket"
     );
+    assert_eq!(
+        h.get("x-ratelimit-scope").unwrap().to_str().unwrap(),
+        "pre-auth"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_headers_are_ignored_unless_explicitly_trusted() {
+    let mut cfg = Config::for_test();
+    cfg.trust_proxy_headers = false;
+    let app = build_with_config(cfg, 1).await;
+
+    let (s1, _) = post_intent(&app, Some(DEMO_KEY), Some("198.51.100.10")).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    // Different spoofed XFF, but proxy trust is off, so both requests
+    // share the direct bucket and the second request is denied.
+    let (s2, h) = post_intent(&app, Some(DEMO_KEY), Some("198.51.100.11")).await;
+    assert_eq!(s2, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         h.get("x-ratelimit-scope").unwrap().to_str().unwrap(),
         "pre-auth"

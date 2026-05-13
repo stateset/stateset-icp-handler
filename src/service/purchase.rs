@@ -9,7 +9,7 @@ use chrono::Utc;
 
 use crate::errors::ApiError;
 use crate::mandate::MandateEvaluation;
-use crate::models::{AuthorizeParams, BuyParams, OrderSummary, TransactionState};
+use crate::models::{AuthorizeParams, BuyParams, OrderSummary, Transaction, TransactionState};
 
 use super::helpers::validate_payment_instrument;
 use super::{IcpService, IntentInput, Outcome};
@@ -86,38 +86,16 @@ impl IcpService {
             .unwrap_or(0);
         self.reserve_mandate_spend(mandate, &input.tenant.tenant_id, spend_minor, &txn.currency)?;
 
-        // Persist order to the embedded engine when available.
-        let order = if let Some(engine) = self.engine.as_ref() {
-            match engine.persist_order(&txn.buyer, &txn.currency, &txn.line_items, &txn.totals) {
-                Ok(order) => order,
-                Err(err) => {
-                    // Engine persistence is best-effort in v0.1 — the
-                    // transaction still completes and we still sign a
-                    // receipt. Surface the failure so operators can see it.
-                    tracing::warn!(error = %err, "engine persist_order failed");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let order_summary = self.persist_order_for_transaction(&txn)?;
 
         let persisted = self
             .transactions
             .update(&txn_id, |t| {
                 t.state = TransactionState::Completed;
-                t.order_id = order.as_ref().map(|o| o.id.clone());
+                t.order_id = order_summary.as_ref().map(|o| o.id.clone());
                 t.updated_at = Utc::now();
             })
             .ok_or_else(|| ApiError::ResourceNotFound(format!("transaction {txn_id}")))?;
-
-        let order_summary = order.map(|o| OrderSummary {
-            id: o.id,
-            order_number: o.order_number,
-            status: "created".into(),
-            permalink_url: None,
-            total: o.total,
-        });
 
         Ok(Outcome {
             transaction: persisted,
@@ -125,5 +103,46 @@ impl IcpService {
             subscription: None,
             peer_quote: None,
         })
+    }
+
+    pub(super) fn persist_order_for_transaction(
+        &self,
+        txn: &Transaction,
+    ) -> Result<Option<OrderSummary>, ApiError> {
+        let order = if let Some(engine) = self.engine.as_ref() {
+            match engine.persist_order(&txn.buyer, &txn.currency, &txn.line_items, &txn.totals) {
+                Ok(Some(order)) => Some(order),
+                Ok(None) if self.config.is_production() => {
+                    return Err(ApiError::PreconditionFailed(
+                        "buyer email is required to persist a production order".into(),
+                    ));
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    if self.config.is_production() {
+                        return Err(err);
+                    }
+                    // Non-production compatibility/demo mode keeps the
+                    // protocol flow usable even when a local engine call
+                    // fails. Production returns above.
+                    tracing::warn!(error = %err, "engine persist_order failed");
+                    None
+                }
+            }
+        } else if self.config.is_production() {
+            return Err(ApiError::EngineUnavailable(
+                "iCommerce engine unavailable".into(),
+            ));
+        } else {
+            None
+        };
+
+        Ok(order.map(|o| OrderSummary {
+            id: o.id,
+            order_number: o.order_number,
+            status: "created".into(),
+            permalink_url: None,
+            total: o.total,
+        }))
     }
 }

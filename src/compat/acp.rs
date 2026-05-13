@@ -215,6 +215,9 @@ pub async fn get_session(
         .transactions
         .get(&id)
         .ok_or_else(|| ApiError::ResourceNotFound(format!("checkout_session {id}")))?;
+    if txn.tenant_id != ctx.tenant.tenant_id {
+        return Err(ApiError::ResourceNotFound(format!("checkout_session {id}")));
+    }
     let v = serde_json::to_value(&txn)?;
     Ok(acp_response(
         StatusCode::OK,

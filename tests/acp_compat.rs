@@ -30,10 +30,20 @@ async fn send_json(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, http::HeaderMap, Value) {
+    send_json_as(app, DEMO_KEY, method, path, body).await
+}
+
+async fn send_json_as(
+    app: &Router,
+    bearer: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, http::HeaderMap, Value) {
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header("Authorization", format!("Bearer {DEMO_KEY}"));
+        .header("Authorization", format!("Bearer {bearer}"));
     let body = match body {
         Some(b) => {
             builder = builder.header("content-type", "application/json");
@@ -168,6 +178,55 @@ async fn acp_get_session_returns_current_state() {
         headers.get("api-version").unwrap().to_str().unwrap(),
         "2025-09-29"
     );
+}
+
+#[tokio::test]
+async fn acp_get_session_is_tenant_scoped() {
+    let app = setup(|cfg| {
+        cfg.enable_demo_keys = false;
+        cfg.api_keys_json = Some(
+            json!([
+                { "key": "k_a", "tenant_id": "tenant_a", "name": "Tenant A" },
+                { "key": "k_b", "tenant_id": "tenant_b", "name": "Tenant B" }
+            ])
+            .to_string(),
+        );
+    })
+    .await;
+    let (_s, _h, created) = send_json_as(
+        &app,
+        "k_a",
+        "POST",
+        "/checkout_sessions",
+        Some(create_body()),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (status, _h, _body) = send_json_as(
+        &app,
+        "k_b",
+        "GET",
+        &format!("/checkout_sessions/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-tenant compat reads must not leak checkout sessions"
+    );
+
+    let (status, _h, body) = send_json_as(
+        &app,
+        "k_a",
+        "GET",
+        &format!("/checkout_sessions/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id);
 }
 
 #[tokio::test]

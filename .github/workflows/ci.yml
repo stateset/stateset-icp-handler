@@ -32,8 +32,8 @@ jobs:
         with:
           repository: stateset/stateset-icommerce
           path: stateset-icommerce
-          # Pin the sibling checkout to main; bump when cutting a release.
-          ref: main
+          # Pin the sibling checkout to the engine release this handler builds against.
+          ref: v1.5.0
 
       - name: Install protoc
         run: |
@@ -82,7 +82,7 @@ jobs:
         with:
           repository: stateset/stateset-icommerce
           path: stateset-icommerce
-          ref: main
+          ref: v1.5.0
 
       - name: Install protoc
         run: |
@@ -122,7 +122,7 @@ jobs:
         with:
           repository: stateset/stateset-icommerce
           path: stateset-icommerce
-          ref: main
+          ref: v1.5.0
 
       - name: Install protoc
         run: |
@@ -153,7 +153,7 @@ jobs:
         with:
           repository: stateset/stateset-icommerce
           path: stateset-icommerce
-          ref: main
+          ref: v1.5.0
 
       - name: Install protoc
         run: |
@@ -200,7 +200,7 @@ jobs:
         with:
           repository: stateset/stateset-icommerce
           path: stateset-icommerce
-          ref: main
+          ref: v1.5.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::mandate::MandateEvaluation;
 use crate::models::{
-    Buyer, RenewParams, RequestItem, SubscribeParams, Subscription, SubscriptionRefParams,
-    SubscriptionStatus, Totals, Transaction, TransactionState,
+    Buyer, OrderSummary, RenewParams, RequestItem, SubscribeParams, Subscription,
+    SubscriptionRefParams, SubscriptionStatus, Totals, Transaction, TransactionState,
 };
 
 use super::helpers::{
@@ -47,10 +47,10 @@ impl IcpService {
         let estimated_total = total_amount_minor(&estimated_totals);
         self.reserve_mandate_spend(mandate, &input.tenant.tenant_id, estimated_total, &currency)?;
 
-        // First charge — runs through the same quote+buy pipeline so it
-        // produces a real Transaction with totals + receipt.
+        // First charge — priced with the shared helper and persisted to
+        // the engine in production before a completed transaction is stored.
         let buyer = params.buyer.clone().unwrap_or_default();
-        let charge_txn = self
+        let (charge_txn, order_summary) = self
             .run_subscription_charge(
                 input,
                 &buyer,
@@ -86,7 +86,7 @@ impl IcpService {
 
         Ok(Outcome {
             transaction: charge_txn,
-            order: None,
+            order: order_summary,
             subscription: Some(sub),
             peer_quote: None,
         })
@@ -127,7 +127,7 @@ impl IcpService {
             estimated_total,
             &sub.currency,
         )?;
-        let charge_txn = self
+        let (charge_txn, order_summary) = self
             .run_subscription_charge(
                 input,
                 &sub.buyer,
@@ -162,7 +162,7 @@ impl IcpService {
 
         Ok(Outcome {
             transaction: charge_txn,
-            order: None,
+            order: order_summary,
             subscription: Some(updated),
             peer_quote: None,
         })
@@ -243,9 +243,9 @@ impl IcpService {
         })
     }
 
-    /// Run a subscription charge as if it were a `quote → authorize →
-    /// buy` triplet collapsed into one step. Returns the resulting
-    /// completed transaction (already inserted into the txn store).
+    /// Run a subscription charge as a collapsed renewal payment. In
+    /// production this fails closed unless the commerce engine persists an
+    /// order; non-production keeps the demo-compatible synthetic charge.
     pub(super) async fn run_subscription_charge(
         &self,
         input: &IntentInput<'_>,
@@ -253,11 +253,11 @@ impl IcpService {
         ship_to: Option<crate::models::Address>,
         items: &[RequestItem],
         currency: &str,
-    ) -> Result<Transaction, ApiError> {
+    ) -> Result<(Transaction, Option<OrderSummary>), ApiError> {
         let (line_items, totals) = price_request_items(items, currency, "subscription.items")?;
 
         let now = Utc::now();
-        let txn = Transaction {
+        let mut txn = Transaction {
             id: format!("txn_{}", Uuid::new_v4().simple()),
             state: TransactionState::Completed,
             agent_id: input.agent.raw.clone(),
@@ -276,8 +276,10 @@ impl IcpService {
             updated_at: now,
             external_refs: Default::default(),
         };
+        let order_summary = self.persist_order_for_transaction(&txn)?;
+        txn.order_id = order_summary.as_ref().map(|o| o.id.clone());
         self.transactions.insert(txn.clone());
-        Ok(txn)
+        Ok((txn, order_summary))
     }
 
     /// Synthesize a placeholder transaction for `pause` /

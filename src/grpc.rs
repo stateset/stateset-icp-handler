@@ -61,9 +61,33 @@ impl IcpHandler for GrpcHandler {
         &self,
         req: Request<IntentRequest>,
     ) -> Result<Response<IntentResponse>, Status> {
+        let pre_auth_bucket =
+            grpc_client_id_for_rate_limit(req.metadata(), self.service.config.trust_proxy_headers);
+        if let crate::rate_limit::RateLimitDecision::Denied {
+            limit,
+            retry_after_secs,
+        } = self.service.pre_auth_limiter.check(&pre_auth_bucket, None)
+        {
+            return Err(Status::resource_exhausted(format!(
+                "pre-auth rate limited: limit {limit}/min, retry after {retry_after_secs}s"
+            )));
+        }
+
         let api_key = extract_bearer_metadata(req.metadata())
             .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
         let tenant = authenticate_bearer(&self.keys, &api_key)?;
+        if let crate::rate_limit::RateLimitDecision::Denied {
+            limit,
+            retry_after_secs,
+        } = self
+            .service
+            .rate_limiter
+            .check(&tenant.tenant_id, tenant.rate_limit_per_minute)
+        {
+            return Err(Status::resource_exhausted(format!(
+                "rate limited: limit {limit}/min, retry after {retry_after_secs}s"
+            )));
+        }
 
         let inner = req.into_inner();
         let envelope = inner
@@ -355,6 +379,29 @@ fn extract_bearer_metadata(md: &tonic::metadata::MetadataMap) -> Option<String> 
         .or_else(|| md.get("x-api-key"))
         .and_then(|v| v.to_str().ok())
         .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).to_string())
+}
+
+fn grpc_client_id_for_rate_limit(
+    md: &tonic::metadata::MetadataMap,
+    trust_proxy_headers: bool,
+) -> String {
+    if trust_proxy_headers {
+        if let Some(xff) = md.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                let trimmed = first.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        if let Some(real_ip) = md.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            let trimmed = real_ip.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "grpc".to_string()
 }
 
 fn receipt_fields_from_body(payload_json: &[u8]) -> Result<(String, String), Status> {

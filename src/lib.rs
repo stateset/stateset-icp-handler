@@ -91,6 +91,12 @@ pub async fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
                 Some(engine)
             }
             Err(err) => {
+                if config.is_production() {
+                    return Err(anyhow::anyhow!(
+                        "failed to open iCommerce engine at `{}`: {err}",
+                        config.commerce_db_path
+                    ));
+                }
                 warn!("failed to open iCommerce engine: {err}");
                 None
             }
@@ -390,11 +396,10 @@ pub async fn submit_intent(
 
     // Pre-auth per-IP rate limit. Fires BEFORE bearer resolution so a
     // flood of fake API keys can't burn unbounded CPU on keystore
-    // lookups + 401 logging. Keyed by `X-Forwarded-For` first segment
-    // (production deployments are always behind a proxy that sets
-    // this); falls back to a sentinel for the rare direct-connect
-    // case so all unknown clients share a single bucket.
-    let client_ip = client_ip_for_rate_limit(&headers);
+    // lookups + 401 logging. When explicitly configured to trust proxy
+    // headers, keys by the first `X-Forwarded-For` segment; otherwise all
+    // direct/unknown clients share a single bucket.
+    let client_ip = client_ip_for_rate_limit(&headers, state.config.trust_proxy_headers);
     if let crate::rate_limit::RateLimitDecision::Denied {
         limit,
         retry_after_secs,
@@ -1538,19 +1543,21 @@ fn validate_webhook_url(url: &str, allow_insecure: bool) -> Result<(), ApiError>
 /// neither is present, all requests share a single `direct` bucket;
 /// that's the right behavior for a directly-exposed handler since you
 /// can't distinguish callers anyway.
-fn client_ip_for_rate_limit(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let trimmed = first.trim();
+fn client_ip_for_rate_limit(headers: &HeaderMap, trust_proxy_headers: bool) -> String {
+    if trust_proxy_headers {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                let trimmed = first.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            let trimmed = real_ip.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
             }
-        }
-    }
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let trimmed = real_ip.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
         }
     }
     "direct".to_string()

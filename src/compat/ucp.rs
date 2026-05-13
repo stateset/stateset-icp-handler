@@ -279,6 +279,9 @@ pub async fn get_checkout(
         .transactions
         .get(&id)
         .ok_or_else(|| ApiError::ResourceNotFound(format!("checkout-session {id}")))?;
+    if txn.tenant_id != ctx.tenant.tenant_id {
+        return Err(ApiError::ResourceNotFound(format!("checkout-session {id}")));
+    }
     let v = serde_json::to_value(&txn)?;
     Ok(ucp_response(
         StatusCode::OK,

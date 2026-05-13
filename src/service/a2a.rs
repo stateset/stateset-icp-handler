@@ -122,6 +122,11 @@ impl IcpService {
                 "a2a_pay: `from` is required".into(),
             ));
         }
+        if self.config.is_production() {
+            return Err(ApiError::PreconditionFailed(
+                "a2a_pay requires a production settlement adapter before it can complete".into(),
+            ));
+        }
         let _quote_guard = match params.peer_quote_id.as_deref() {
             Some(quote_id) => Some(self.lock_peer_quote(quote_id).await),
             None => None,

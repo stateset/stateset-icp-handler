@@ -60,17 +60,7 @@ fn envelope() -> Envelope {
 }
 
 async fn grpc_quote(h: &GrpcHandler, key: &str) -> Value {
-    let body = json!({
-        "intent": "intent.quote",
-        "agent_id": AGENT,
-        "params": {
-            "items": [{
-                "sku": "WIDGET",
-                "quantity": 1,
-                "unit_price_hint": { "amount_minor": 100, "currency": "USD" }
-            }]
-        }
-    });
+    let body = quote_body("WIDGET");
     let resp = h
         .submit_intent(auth(
             Request::new(IntentRequest {
@@ -83,6 +73,20 @@ async fn grpc_quote(h: &GrpcHandler, key: &str) -> Value {
         .expect("submit")
         .into_inner();
     serde_json::from_slice(&resp.payload_json).unwrap()
+}
+
+fn quote_body(sku: &str) -> Value {
+    json!({
+        "intent": "intent.quote",
+        "agent_id": AGENT,
+        "params": {
+            "items": [{
+                "sku": sku,
+                "quantity": 1,
+                "unit_price_hint": { "amount_minor": 100, "currency": "USD" }
+            }]
+        }
+    })
 }
 
 #[tokio::test]
@@ -269,4 +273,49 @@ async fn grpc_requires_idempotency_key_when_configured() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn grpc_submit_intent_is_tenant_rate_limited() {
+    let mut cfg = Config::for_test();
+    cfg.rate_limit_per_minute = 1;
+    cfg.pre_auth_rate_limit_per_minute = 100;
+    let h = handler_with_config(&mut cfg).await;
+
+    let _first = grpc_quote(&h, "k_a").await;
+    let err = h
+        .submit_intent(auth(
+            Request::new(IntentRequest {
+                envelope: Some(envelope()),
+                payload_json: serde_json::to_vec(&quote_body("WIDGET-2")).unwrap(),
+            }),
+            "k_a",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn grpc_fake_bearer_floods_are_pre_auth_limited() {
+    let mut cfg = Config::for_test();
+    cfg.rate_limit_per_minute = 100;
+    cfg.pre_auth_rate_limit_per_minute = 1;
+    let h = handler_with_config(&mut cfg).await;
+
+    let request = || {
+        auth(
+            Request::new(IntentRequest {
+                envelope: Some(envelope()),
+                payload_json: serde_json::to_vec(&quote_body("WIDGET")).unwrap(),
+            }),
+            "does_not_exist",
+        )
+    };
+
+    let first = h.submit_intent(request()).await.unwrap_err();
+    assert_eq!(first.code(), tonic::Code::Unauthenticated);
+
+    let second = h.submit_intent(request()).await.unwrap_err();
+    assert_eq!(second.code(), tonic::Code::ResourceExhausted);
 }

@@ -16,6 +16,26 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-13
+
+### Security
+- Tenant-scoped ACP and UCP checkout-session reads so authenticated
+  tenants cannot retrieve another tenant's compatibility session by id.
+- Applied the same pre-auth and per-tenant rate limits to gRPC
+  `SubmitIntent` that already protect the HTTP intent endpoint.
+
+### Fixed
+- Subscription charges now use the same production fail-closed order
+  persistence path as one-time buys before storing a completed
+  transaction.
+- Production `intent.a2a_pay` now fails closed until a real settlement
+  adapter is configured, instead of synthesizing completed peer-payment
+  transactions.
+
+### Changed
+- Pinned CI's sibling `stateset-icommerce` checkout to `v1.5.0` and
+  aligned the handler's path dependency version requirements.
+
 ## [0.4.0] — 2026-05-07
 
 ### Security

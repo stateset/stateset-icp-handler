@@ -91,11 +91,15 @@ impl IcpService {
             let charge = self.scheduler_charge(&sub).await;
 
             match charge {
-                Ok(txn) => {
+                Ok((txn, order_summary)) => {
                     let new_period_start = sub.current_period_end;
                     let new_period_end = period_advance(new_period_start, sub.cadence);
                     let new_charges_completed = sub.charges_completed.saturating_add(1);
                     let txn_id_for_event = txn.id.clone();
+                    let order_id_for_event = order_summary
+                        .as_ref()
+                        .map(|o| o.id.clone())
+                        .or_else(|| txn.order_id.clone());
                     let total_amount_minor = txn.totals.total.as_ref().map(|m| m.amount_minor);
                     let total_currency = txn
                         .totals
@@ -116,7 +120,7 @@ impl IcpService {
                         id: format!("evt_{}", Uuid::new_v4().simple()),
                         r#type: "subscription.renewed".into(),
                         transaction_id: Some(txn.id),
-                        order_id: None,
+                        order_id: order_id_for_event,
                         agent_id: Some(sub.agent_id.clone()),
                         occurred_at: now,
                         payload: serde_json::json!({
@@ -351,8 +355,12 @@ impl IcpService {
     }
 
     /// Run a single scheduler-initiated charge using the subscription's
-    /// stored payment instrument. Returns the completed transaction.
-    async fn scheduler_charge(&self, sub: &Subscription) -> Result<Transaction, ApiError> {
+    /// stored payment instrument. Returns the completed transaction and
+    /// any order persisted for it.
+    async fn scheduler_charge(
+        &self,
+        sub: &Subscription,
+    ) -> Result<(Transaction, Option<crate::models::OrderSummary>), ApiError> {
         // Synthesize an IntentInput just to reuse the existing
         // line-item pricing path.
         let envelope = IntentEnvelope {
