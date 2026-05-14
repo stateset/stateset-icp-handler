@@ -16,6 +16,12 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-05-14
+
+### Changed
+- Patch release metadata bump after the A+ handler review. No runtime
+  behavior changes from `0.4.2`.
+
 ## [0.4.2] — 2026-05-13
 
 ### Security

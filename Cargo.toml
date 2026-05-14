@@ -1,6 +1,6 @@
 [package]
 name = "stateset-icp-handler"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 # Matches the pinned stateset-icommerce engine release. Bumps require a
 # CHANGELOG entry.
