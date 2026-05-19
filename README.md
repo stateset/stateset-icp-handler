@@ -213,81 +213,80 @@ ICP is a superset of ACP and UCP. The mapping is normative:
 | `POST /api/checkout-sessions` (UCP) | `intent.quote` + `intent.authorize` |
 | `POST /api/checkout-sessions/:id/complete` (UCP) | `intent.buy` |
 
-The compatibility paths are not yet wired in v0.1 but the spec-level mapping
-is defined in [`docs/interop.md`](./docs/interop.md) and the handler is
-structured so compatibility paths forward into the same intent service.
+The compatibility paths are live: ACP at `/checkout_sessions/*`, UCP at
+`/checkout-sessions/*` + `/.well-known/ucp`. The spec-level mapping is
+documented in [`docs/interop.md`](./docs/interop.md); both routes forward
+into the same intent pipeline so receipts, mandate enforcement, and
+audit trails are identical across surfaces.
 
 ---
 
-## Status (v0.1)
+## Status (v0.4)
 
-This is the **cornerstone release**: it establishes the spec, the wire
-contract, and a working Rust handler skeleton that:
+All 17 catalog intents are implemented end-to-end and exercised by the
+test suite. The handler:
 
 - ✅ Serves `/.well-known/icp` with accurate capability advertisement
 - ✅ Publishes Ed25519 receipt signing keys at `/.well-known/icp/jwks.json`
-- ✅ Validates mandates (scope, budget, window, merchant)
-- ✅ Persists buy-flow orders into embedded iCommerce
+- ✅ Validates mandates (scope, budget, window, merchant) with real
+  Ed25519 signature verification against `did:key` and `did:web`
+  principals via the pluggable
+  [`PrincipalResolver`](./src/resolver.rs) trait
+- ✅ Persists buy-flow orders into embedded iCommerce, with the
+  protocol-level state (mandates, receipts, transactions, subscriptions,
+  peer quotes, idempotency cache, webhook outbox) on a separate SQLite
+  database so the two schemas evolve independently
 - ✅ Emits signed receipts over JCS-canonicalized responses
 - ✅ Streams transaction events via SSE + gRPC
-- ✅ Exposes Prometheus metrics on `/metrics`
-
-Since v0.1:
-
-- ✅ **ACP compatibility path** — `/checkout_sessions/*` maps to ICP
-  intents one-to-one (see `src/compat/acp.rs`).
-- ✅ **UCP compatibility path** — `/checkout-sessions/*` + `/.well-known/ucp`
-  (see `src/compat/ucp.rs`).
-- ✅ **MCP surface** — `POST /mcp` serves JSON-RPC 2.0; every ICP intent
-  is advertised as a discoverable tool (see `src/mcp.rs`).
-- ✅ **MCP stdio transport** — second binary `icp-mcp-stdio` for Claude
-  Desktop, Cursor, and other clients that spawn MCP servers as
-  subprocesses (see [`docs/claude-desktop.md`](./docs/claude-desktop.md)).
-- ✅ **Mandate signature verification** — real Ed25519 verification
-  against `did:key` *and* `did:web` principals via a pluggable
-  [`PrincipalResolver`](./src/resolver.rs) trait. On by default
-  (`ICP_VERIFY_MANDATE_SIGNATURES=true`); set to `false` only for local
-  development against `alg:none` test fixtures.
-- ✅ **Subscriptions** — `intent.subscribe` / `renew` / `pause` /
-  `cancel_subscription` shipped, with weekly/monthly/annual cadences,
-  charge-on-subscribe, signed receipts on every state change, and an
-  **automatic billing scheduler** ([`src/scheduler.rs`](./src/scheduler.rs))
-  that runs renewals on a tokio interval. Three consecutive scheduler
-  failures transition a sub to `past_due`; manual `intent.renew` clears
-  the failure counter and reactivates.
-- ✅ **A2A peer commerce** — `intent.a2a_quote` and `intent.a2a_pay`
-  let agents transact directly. Pay-against-quote consumes a `PeerQuote`
-  and produces a signed receipt; direct-pay skips the quote step.
-  Production `external_required` mode requires
-  `payment.method=external_authorization` and records the settlement
-  reference on the transaction. Mandate scope `pay_peer` enforced.
-- ✅ **Distributed rate limiting** — local fixed-window counters for
-  development/tests, with Redis-backed per-tenant and pre-auth counters
-  for production fleets (`REDIS_URL` required when production limits are
-  enabled).
-- ✅ **`icp-conformance` harness** — implementation-independent test
-  suite that validates any ICP handler URL against the spec
-  (see `src/bin/icp_conformance.rs`). Run
-  `./demo_conformance.sh` for a one-command self-test.
+- ✅ Exposes Prometheus metrics on `/metrics` and an OpenAPI 3.1
+  document at `/openapi.json` (+ `/docs` viewer)
+- ✅ Enforces tenant-scoped reads across transactions, subscriptions,
+  peer quotes, idempotency, receipts, and ACP/UCP compat sessions
+- ✅ Routes compatibility traffic through the same pipeline as native
+  ICP: ACP `/checkout_sessions/*`, UCP `/checkout-sessions/*`,
+  MCP `POST /mcp` (HTTP) and the `icp-mcp-stdio` binary for Claude
+  Desktop / Cursor (see [`docs/claude-desktop.md`](./docs/claude-desktop.md))
+- ✅ Runs an automatic subscription billing scheduler with
+  weekly/monthly/annual cadences, charge-on-subscribe, dunning that
+  transitions a subscription to `past_due` after three consecutive
+  failures, and manual `intent.renew` recovery
+- ✅ Supports A2A peer commerce (`intent.a2a_quote`, `intent.a2a_pay`)
+  with production `external_required` mode that gates settlement on a
+  `payment.method=external_authorization` block carrying the provider,
+  authorization id, and optional instrument hint
+- ✅ Implements `intent.negotiate` (counter-offer + revised quote) and
+  `intent.confirm_receipt` (buyer-side fulfillment acknowledgement)
+- ✅ Distributed rate limiting via Redis for both per-tenant and
+  per-IP pre-auth buckets, with production validation that refuses to
+  silently fall back to a local limiter when `REDIS_URL` is configured
+- ✅ Durable webhook outbox with exponential backoff, dead-lettering,
+  SSRF-guarded destination validation, and HMAC-SHA256 signatures
+  (Stripe-style `t=…,v1=…`) — synchronous enqueue so the response
+  body is never returned before the event is committed
+- ✅ Idempotency cache per ICP §13: replay on byte-equivalent retry,
+  409 `idempotency_conflict` on divergent body, with a TTL sweeper
+- ✅ Conformance harness (`icp-conformance` binary, also published as
+  `npx @stateset/icp-conformance`) that validates any handler URL
+  against the spec — see `./demo_conformance.sh`
 - ✅ CI on every push/PR: `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo test`, Docker build.
-- ✅ 110+ integration tests locking in ICP, ACP, UCP, MCP (HTTP and
-  stdio), `did:key` and `did:web` mandate verification, engine
-  persistence, subscription lifecycle, scheduler-driven auto-billing,
-  and A2A peer-commerce wire contracts.
+  `cargo test`, `cargo deny check`, Docker build, MSRV (1.85) gate
+- ✅ 348 tests across 36 integration files plus property tests via
+  proptest — see `tests/`
 
-15 of 17 catalog intents are now implemented end-to-end; only
-`intent.negotiate` and `intent.confirm_receipt` remain.
+Language clients ship from this repo:
 
-Planned for v0.3+:
+- **Rust** — this crate
+- **Python** — [`clients/python/stateset_icp`](./clients/python)
+  (published as `stateset-icp` on PyPI)
+- **Go** — [`clients/go/stateset-icp-go`](./clients/go/stateset-icp-go)
+- **TypeScript / npm** — [`@stateset/icp-conformance`](./clients/npm/icp-conformance)
+  and [`@stateset/create-icp-commerce`](./clients/npm/create-icp-commerce)
 
-- [ ] `intent.negotiate`, `intent.confirm_receipt` (catalog completion)
+On the roadmap toward v1.0:
+
 - [ ] Additional DID resolver methods (`did:stateset:buyer`)
 - [ ] Full engine routing for tax, promotions, shipping
-- [ ] Subscription dunning, prorated mid-cycle changes, trial periods
-- [ ] Language bindings (Node, Python, Go) — mirrored from the ACP/UCP
-  handlers
-- [ ] Publish `icp-conformance` as `npx icp-conformance` (Node shim)
+- [ ] Subscription mid-cycle proration and trial periods
 
 Consult [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
 

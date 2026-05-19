@@ -7,9 +7,26 @@
 //! transactions are currently quoted/authorized/captured. It must survive
 //! handler restarts independently of commerce-engine schema evolution.
 //!
-//! Schema is applied idempotently on every pool open via `CREATE TABLE IF
-//! NOT EXISTS`. When the first breaking schema change lands, introduce a
-//! `schema_version` table and per-version migration steps.
+//! # Migration model
+//!
+//! Migrations are an *ordered list* of [`Migration`] entries in
+//! [`MIGRATIONS`]. On every pool open we read the `schema_migrations`
+//! table to see which versions have already been applied, then run any
+//! that haven't. Each step is wrapped in a transaction so a partial
+//! apply rolls back cleanly. The applied set is queryable at runtime
+//! via [`applied_versions`] — useful for operators verifying a deploy.
+//!
+//! Steps stay strictly additive (new tables, new columns with
+//! `DEFAULT`, new indexes). Breaking changes (`DROP COLUMN`, type
+//! changes, complex backfills) get a fresh migration version and a
+//! transactional body that can fail closed without leaving the DB
+//! half-migrated.
+//!
+//! Legacy DBs created before this versioning landed are detected by
+//! probing for the columns the early migrations added: the runner
+//! tolerates "duplicate column name" so a re-run on a fully-migrated
+//! DB is a no-op, and stamps the version table on first success so
+//! subsequent opens skip straight to the unapplied versions.
 
 use anyhow::Context;
 use r2d2::Pool;
@@ -54,86 +71,156 @@ pub fn open(path: &str) -> anyhow::Result<StatePool> {
 }
 
 fn migrate(pool: &StatePool) -> anyhow::Result<()> {
-    let conn = pool.get().context("acquire state conn for migration")?;
-    conn.execute_batch(SCHEMA).context("apply state schema")?;
-    apply_column_additions(&conn).context("apply additive column migrations")?;
+    let mut conn = pool.get().context("acquire state conn for migration")?;
+    run_migrations(&mut conn).context("apply state migrations")?;
     Ok(())
 }
 
-/// Idempotent additive column migrations + dependent index creation.
-///
-/// `CREATE TABLE IF NOT EXISTS` covers fresh DBs but doesn't touch a
-/// table that already exists with a stale shape. For each column added
-/// post-1.0 we issue an `ALTER TABLE ... ADD COLUMN` that tolerates the
-/// "duplicate column name" error a second-run will produce. SQLite has
-/// no native `ADD COLUMN IF NOT EXISTS`, so this is the supported
-/// pattern. Every column added here must have a `DEFAULT` so existing
-/// rows backfill cleanly without a separate UPDATE pass.
-///
-/// Indexes that reference newly-added columns live here too — they
-/// can't go in the static `SCHEMA` block because on a legacy DB that
-/// block runs *before* the column is added, and the bare
-/// `CREATE INDEX` would fail with `no such column`.
-///
-/// Keep this list strictly additive — never reorder, never alter,
-/// never drop. Breaking schema changes get a real `schema_version` /
-/// per-version migration ladder.
-fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    // 1) Add columns. Tolerate "duplicate column name" so a second run
-    //    is a no-op. Tolerate "no such table" so a partial / aborted
-    //    earlier migration doesn't wedge subsequent runs.
-    const COLUMN_ADDITIONS: &[&str] = &[
-        // Denormalized metadata for indexed tenant list endpoints.
-        // The JSON payload remains the source of truth; these columns
-        // are maintained on insert/update so list endpoints don't need
-        // to materialize every row in production.
-        "ALTER TABLE transactions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE transactions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE transactions ADD COLUMN state TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE transactions ADD COLUMN quote_expires_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE subscriptions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE subscriptions ADD COLUMN status TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE subscriptions ADD COLUMN next_charge_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE subscriptions ADD COLUMN payment_present INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE peer_quotes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE peer_quotes ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE peer_quotes ADD COLUMN status TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE peer_quotes ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''",
-        // tenant_id added so list/get/retry endpoints can scope by
-        // tenant and avoid leaking other tenants' webhook payloads.
-        // Existing pre-multi-tenant rows backfill to '' — invisible to
-        // any real tenant_id but still queryable for ops by string
-        // comparison, which is the desired isolation property.
-        "ALTER TABLE webhook_deliveries ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-        // tenant_id on mandate_usage records the *first* tenant to
-        // spend against this mandate (the owner). The
-        // `GET /icp/v1/mandates/:jti/usage` endpoint scopes reads by
-        // this column so cross-tenant probes return 404. Spend
-        // recording from any tenant continues to count toward the
-        // shared budget — that protects the principal who issued the
-        // mandate. Pre-multi-tenant rows backfill to '', invisible to
-        // any real tenant.
-        "ALTER TABLE mandate_usage ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-    ];
-    for stmt in COLUMN_ADDITIONS {
-        match conn.execute(stmt, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") || msg.starts_with("no such table") => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("additive column migration failed: {stmt}")))
-            }
-        }
-    }
+/// One migration step. `body` runs inside a transaction; `version` is
+/// the monotonic id stamped into `schema_migrations` on success.
+pub struct Migration {
+    pub version: u32,
+    pub name: &'static str,
+    body: fn(&rusqlite::Transaction<'_>) -> anyhow::Result<()>,
+}
 
-    // 2) Indexes that depend on the columns above. `IF NOT EXISTS`
-    //    makes these safely idempotent.
+/// Ordered migration ladder. Versions are monotonic; never reorder or
+/// renumber, even if a step turns out to be wrong — supersede it with
+/// a higher version.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        body: migration_v1_initial_schema,
+    },
+    Migration {
+        version: 2,
+        name: "tenant_id_columns",
+        body: migration_v2_tenant_id_columns,
+    },
+    Migration {
+        version: 3,
+        name: "denormalized_query_columns_and_indexes",
+        body: migration_v3_query_columns_and_indexes,
+    },
+];
+
+fn run_migrations(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (\
+             version    INTEGER PRIMARY KEY,\
+             name       TEXT NOT NULL,\
+             applied_at TEXT NOT NULL\
+         );",
+    )
+    .context("create schema_migrations")?;
+
+    let applied = applied_versions_inner(conn)?;
+    for m in MIGRATIONS {
+        if applied.contains(&m.version) {
+            continue;
+        }
+        let tx = conn
+            .transaction()
+            .with_context(|| format!("begin tx for migration v{}", m.version))?;
+        (m.body)(&tx).with_context(|| format!("run migration v{}: {}", m.version, m.name))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![m.version as i64, m.name, chrono::Utc::now().to_rfc3339()],
+        )
+        .with_context(|| format!("stamp schema_migrations for v{}", m.version))?;
+        tx.commit()
+            .with_context(|| format!("commit migration v{}", m.version))?;
+        tracing::info!(
+            version = m.version,
+            name = m.name,
+            "state migration applied"
+        );
+    }
+    Ok(())
+}
+
+/// Returns the set of migration versions recorded in `schema_migrations`.
+/// Empty when the table is absent, which happens on a brand-new DB
+/// before the first migration runs.
+pub fn applied_versions(pool: &StatePool) -> anyhow::Result<Vec<u32>> {
+    let conn = pool.get().context("acquire conn")?;
+    applied_versions_inner(&conn)
+}
+
+fn applied_versions_inner(conn: &rusqlite::Connection) -> anyhow::Result<Vec<u32>> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='schema_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .context("probe schema_migrations existence")?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT version FROM schema_migrations ORDER BY version ASC")
+        .context("prepare applied_versions")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .context("query applied_versions")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("read applied version row")? as u32);
+    }
+    Ok(out)
+}
+
+// -- Migration bodies ------------------------------------------------------
+
+fn migration_v1_initial_schema(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute_batch(SCHEMA_V1)
+        .context("apply initial schema")?;
+    Ok(())
+}
+
+fn migration_v2_tenant_id_columns(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    // tenant_id was added across several tables in lockstep so list/
+    // get/retry endpoints can scope by tenant without leaking other
+    // tenants' rows. Pre-multi-tenant rows backfill to '' — invisible
+    // to any real tenant_id but still queryable by string comparison,
+    // which is the desired conservative-default isolation property.
+    add_columns_idempotent(
+        tx,
+        &[
+            "ALTER TABLE transactions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE peer_quotes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE webhook_deliveries ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE mandate_usage ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
+        ],
+    )
+}
+
+fn migration_v3_query_columns_and_indexes(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    // Denormalized columns the list endpoints filter on, kept in sync
+    // by the write path. The JSON payload remains the source of truth;
+    // these columns let the index pruner skip cold rows on a tenanted
+    // scan.
+    add_columns_idempotent(
+        tx,
+        &[
+            "ALTER TABLE transactions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN state TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE transactions ADD COLUMN quote_expires_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE subscriptions ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE subscriptions ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE subscriptions ADD COLUMN next_charge_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE subscriptions ADD COLUMN payment_present INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE peer_quotes ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE peer_quotes ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE peer_quotes ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''",
+        ],
+    )?;
+
     const INDEX_ADDITIONS: &[&str] = &[
-        // Per-tenant list/get/retry queries scope by (tenant_id,
-        // created_at DESC). A composite index keeps the scan from
-        // touching cold rows as the table grows.
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_created \
              ON webhook_deliveries(tenant_id, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_transactions_tenant_created \
@@ -156,13 +243,34 @@ fn apply_column_additions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
              ON peer_quotes(status, expires_at)",
     ];
     for stmt in INDEX_ADDITIONS {
-        conn.execute(stmt, [])
-            .with_context(|| format!("additive index migration failed: {stmt}"))?;
+        tx.execute(stmt, [])
+            .with_context(|| format!("create index: {stmt}"))?;
     }
     Ok(())
 }
 
-const SCHEMA: &str = r#"
+/// Apply `ALTER TABLE ADD COLUMN` statements, tolerating
+/// "duplicate column name" so a step is safely re-runnable on a DB
+/// where an older handler already issued the same ALTERs.
+fn add_columns_idempotent(
+    tx: &rusqlite::Transaction<'_>,
+    stmts: &[&'static str],
+) -> anyhow::Result<()> {
+    for stmt in stmts {
+        match tx.execute(stmt, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") || msg.starts_with("no such table") => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("additive column migration failed: {stmt}")))
+            }
+        }
+    }
+    Ok(())
+}
+
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS mandate_usage (
     jti          TEXT PRIMARY KEY,
     spent_minor  INTEGER NOT NULL DEFAULT 0,
@@ -341,31 +449,33 @@ mod tests {
         }
     }
 
-    /// Verifies the additive `tenant_id` migration backfills cleanly
-    /// onto a DB created by an older handler that didn't have the
-    /// column. Simulates the upgrade path: open a fresh pool, drop
-    /// `tenant_id` (post-condition: schema looks pre-migration),
-    /// insert a legacy row, then reopen — `apply_column_additions`
-    /// must run idempotently and the legacy row must remain queryable
-    /// with `tenant_id = ''`.
+    /// Verifies the migration ladder backfills cleanly onto a DB
+    /// created by an older handler that didn't carry a
+    /// `schema_migrations` table. Simulates the upgrade path: drop
+    /// `tenant_id` (post-condition: schema looks pre-multi-tenant)
+    /// AND drop the `schema_migrations` table itself (post-condition:
+    /// the runner can't see which versions already ran), insert a
+    /// legacy row, then reopen — v2 must re-run and backfill the
+    /// column.
     #[test]
-    fn additive_migration_backfills_tenant_id_on_legacy_db() {
+    fn legacy_db_without_schema_migrations_applies_all_steps() {
         let dir = tempdir();
         let path = dir.join("legacy.db");
         let path_str = path.to_string_lossy().to_string();
 
-        // First open: full schema (current version) is applied.
+        // First open: full ladder runs and stamps schema_migrations.
         {
             let pool = open(&path_str).expect("open 1");
             let conn = pool.get().expect("acquire");
-            // Simulate "this DB was created before tenant_id existed"
-            // by dropping the column (and the index that references
-            // it). SQLite ≥ 3.35 supports DROP COLUMN.
             conn.execute("DROP INDEX idx_webhook_deliveries_tenant_created", [])
                 .expect("drop tenant index");
             conn.execute("ALTER TABLE webhook_deliveries DROP COLUMN tenant_id", [])
                 .expect("drop tenant_id to simulate legacy schema");
-            // Insert a legacy row without a tenant_id.
+            // Drop schema_migrations so the runner can't see that v2 +
+            // v3 already applied — this is what a *truly* pre-versioning
+            // DB looks like to a freshly-deployed handler.
+            conn.execute("DROP TABLE schema_migrations", [])
+                .expect("drop schema_migrations to simulate pre-versioning DB");
             conn.execute(
                 "INSERT INTO webhook_deliveries \
                      (id, event_id, event_type, url, payload_json, status, \
@@ -380,10 +490,12 @@ mod tests {
             .expect("insert legacy row");
         }
 
-        // Second open: additive migration must run + the legacy row
-        // must still be readable, with tenant_id defaulted to ''.
+        // Second open: ladder re-runs from scratch. Idempotent inside
+        // each step keeps it from blowing up on the v1 CREATE TABLE
+        // IF NOT EXISTS, the v2 ADD COLUMN, etc. The legacy row must
+        // remain readable with tenant_id defaulted to ''.
         {
-            let pool = open(&path_str).expect("open 2 (after schema upgrade)");
+            let pool = open(&path_str).expect("open 2 (legacy schema upgrade)");
             let conn = pool.get().expect("acquire");
             let tenant_id: String = conn
                 .query_row(
@@ -396,13 +508,31 @@ mod tests {
                 tenant_id, "",
                 "legacy rows must backfill to empty string, not NULL"
             );
+            let versions = applied_versions(&pool).expect("applied_versions");
+            assert_eq!(
+                versions,
+                MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
+                "all migrations stamped after legacy upgrade"
+            );
         }
 
-        // Third open: rerunning the migration must be a no-op (no
-        // duplicate-column error escapes).
+        // Third open: re-running with schema_migrations fully populated
+        // applies nothing new.
         {
-            let _pool = open(&path_str).expect("open 3 (idempotent re-migration)");
+            let pool = open(&path_str).expect("open 3 (idempotent re-migration)");
+            let versions = applied_versions(&pool).expect("applied_versions");
+            assert_eq!(versions.len(), MIGRATIONS.len());
         }
+    }
+
+    #[test]
+    fn applied_versions_lists_every_migration_after_fresh_open() {
+        let dir = tempdir();
+        let path = dir.join("fresh.db");
+        let pool = open(&path.to_string_lossy()).expect("open");
+        let versions = applied_versions(&pool).expect("applied_versions");
+        let expected: Vec<u32> = MIGRATIONS.iter().map(|m| m.version).collect();
+        assert_eq!(versions, expected, "fresh DB stamps every migration");
     }
 
     fn tempdir() -> std::path::PathBuf {

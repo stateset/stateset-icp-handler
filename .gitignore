@@ -22,6 +22,7 @@ release/
 
 # local Claude Code state
 .claude/
+.codex
 
 # npm / python package build output
 node_modules/

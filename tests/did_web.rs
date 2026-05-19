@@ -345,6 +345,7 @@ async fn end_to_end_did_web_signed_mandate_accepted_by_handler() {
         service: Arc::new(new_service),
         keys: state.keys.clone(),
         config: state.config.clone(),
+        state_pool: state.state_pool.clone(),
     };
     let app = build_router(new_state);
 

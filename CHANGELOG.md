@@ -16,6 +16,48 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-19
+
+### Breaking
+- `AppState` gained a public `state_pool: StatePool` field so the
+  `/health` endpoint can surface applied migration versions without a
+  back-channel through every store. Callers that construct `AppState`
+  directly (rather than through `build_app_state`) must populate the
+  new field — the in-repo test fixtures in `tests/did_web.rs` have
+  been updated as a reference.
+
+### Changed
+- **Module split.** `src/lib.rs` (1,761 lines) reduced to 60 lines of
+  re-exports + module declarations. Construction, routing, and `serve`
+  now live in `src/app.rs`; HTTP handlers are grouped under
+  `src/handlers/` by concern (`ops`, `discovery`, `intents`, `queries`,
+  `webhook_admin`, `events`) with shared helpers in `handlers/mod.rs`.
+  No behavior or wire-contract change; the previously top-level
+  handler symbols are re-exported from the crate root so existing
+  imports and the OpenAPI derive continue to work.
+- **Webhook split.** `src/webhook.rs` (1,829 lines) split into a
+  module: `webhook/{mod,url,types,signing,subscribers,outbox,worker}.rs`.
+  Public API unchanged.
+- **State DB migrations.** Schema management replaced with a versioned
+  ladder (`MIGRATIONS` in `state_db.rs`) tracked by a new
+  `schema_migrations` table. Each step runs in a transaction, is
+  stamped on success, and skips on subsequent opens. Legacy databases
+  without `schema_migrations` apply the full ladder idempotently. The
+  set of applied versions is queryable at runtime via
+  `state_db::applied_versions` and surfaced under `state_schema` in
+  `GET /health` so operators can confirm a deploy actually rolled the
+  schema forward.
+- README `Status` section refreshed to match `v0.4.x` reality — all 17
+  catalog intents are implemented, compatibility paths are wired, and
+  webhook DLQ replay (`POST /icp/v1/webhook_deliveries/:id/retry`)
+  exists. The `v0.1` framing is gone.
+
+### Fixed
+- Rate-limiter mutex no longer panics on poison. A poisoned bucket is
+  cleared under the poisoned guard, the request is denied with a
+  short retry-after, and an error is logged — consistent with the
+  graceful fallback the JSON state stores already use.
+
 ## [0.4.3] — 2026-05-14
 
 ### Changed

@@ -204,7 +204,28 @@ impl RateLimiter {
     /// Same as `check`, but with a caller-supplied `now` so tests can
     /// drive deterministic windows without sleeping.
     pub fn check_at(&self, tenant_id: &str, capacity: u32, now: Instant) -> RateLimitDecision {
-        let mut guard = self.buckets.lock().expect("rate limiter poisoned");
+        // A poisoned mutex means a previous thread panicked while
+        // holding the lock and bucket state may be inconsistent.
+        // Fail closed: deny with a short retry-after rather than
+        // propagating the panic, so a poisoned bucket doesn't take
+        // down the whole intent pipeline. The poisoned guard still
+        // gives us mutable access, so we also reset the offending
+        // entry under it before returning.
+        let mut guard = match self.buckets.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    tenant_id,
+                    "rate limiter mutex poisoned; failing closed for this request and clearing bucket"
+                );
+                let mut guard = poisoned.into_inner();
+                guard.remove(tenant_id);
+                return RateLimitDecision::Denied {
+                    limit: capacity,
+                    retry_after_secs: 1,
+                };
+            }
+        };
         let bucket = guard.entry(tenant_id.to_string()).or_insert(Bucket {
             used: 0,
             window_start: now,
@@ -237,12 +258,24 @@ impl RateLimiter {
     }
 
     pub fn clear(&self) {
-        self.buckets.lock().expect("rate limiter poisoned").clear();
+        match self.buckets.lock() {
+            Ok(mut guard) => guard.clear(),
+            Err(poisoned) => {
+                tracing::error!("rate limiter mutex poisoned; clearing under poisoned guard");
+                poisoned.into_inner().clear();
+            }
+        }
     }
 
     /// Test helper — number of distinct tenants with active buckets.
     pub fn tracked_tenants(&self) -> usize {
-        self.buckets.lock().expect("rate limiter poisoned").len()
+        match self.buckets.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => {
+                tracing::error!("rate limiter mutex poisoned; reading length under poisoned guard");
+                poisoned.into_inner().len()
+            }
+        }
     }
 }
 
