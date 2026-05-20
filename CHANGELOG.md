@@ -16,6 +16,18 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-19
+
+### Added
+- **Go Anthropic agent example.** `clients/go/stateset-icp-go/examples/anthropic-agent/`
+  ships a self-contained demo where Claude drives an ICP merchant
+  end-to-end via tool use. Hits the Anthropic Messages API directly
+  over HTTP (no SDK dependency) to preserve the Go module's zero-non-stdlib
+  discipline and expose the exact tool_use / tool_result wire format.
+  Parallels `clients/python/examples/anthropic_agent.py`. Registers five
+  ICP intents as tools (search / quote / authorize / buy / track), signs
+  the mandate once at startup, and reuses it across writes.
+
 ## [0.5.0] — 2026-05-19
 
 ### Breaking
