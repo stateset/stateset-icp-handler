@@ -29,6 +29,15 @@ use sha2::{Digest, Sha256};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+/// ICP spec version this conformance suite targets, sent as the
+/// `ICP-Version` request header (the handler requires it on every intent
+/// request for version negotiation). Deliberately a local constant rather
+/// than an import from `stateset-icp-handler` — see the module docs: the
+/// suite re-derives everything from the spec/wire so passing it is
+/// evidence a *foreign* handler conforms, not that it shares our types.
+/// Bump this when testing against a newer spec revision.
+const SPEC_ICP_VERSION: &str = "2026-04-21";
+
 // --------------------------------------------------------------------------
 // CLI
 // --------------------------------------------------------------------------
@@ -153,6 +162,9 @@ impl Runner {
             format!("Bearer {}", self.args.api_key).parse().unwrap(),
         );
         h.insert("ICP-Agent-Id", self.args.agent_id.parse().unwrap());
+        // The handler requires ICP-Version on every intent request (spec
+        // version negotiation). Send the spec version this suite targets.
+        h.insert("ICP-Version", SPEC_ICP_VERSION.parse().unwrap());
         h.insert("Content-Type", "application/json".parse().unwrap());
         if let Some(m) = self.args.mandate.as_deref() {
             h.insert("ICP-Mandate", m.parse().unwrap());
