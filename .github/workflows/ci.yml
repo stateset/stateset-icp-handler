@@ -53,6 +53,13 @@ jobs:
         working-directory: stateset-icp-handler
         run: cargo build --all-targets
 
+      # The `postgres` feature is off by default, so the steps above never
+      # compile it. Check it explicitly here so the opt-in backend can't
+      # bit-rot against the pinned engine API.
+      - name: cargo clippy (postgres feature)
+        working-directory: stateset-icp-handler
+        run: cargo clippy --all-targets --features postgres -- -D warnings
+
       - name: cargo test
         working-directory: stateset-icp-handler
         run: cargo test --all-targets

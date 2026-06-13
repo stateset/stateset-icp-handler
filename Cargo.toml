@@ -124,8 +124,10 @@ proptest = "1"
 
 [features]
 default = []
-# Opt-in PostgreSQL backend for the embedded iCommerce engine.
-postgres = []
+# Opt-in PostgreSQL backend for the embedded iCommerce engine. Forwards to the
+# engine's own `postgres` feature so `Commerce::with_postgres` is compiled in;
+# an empty feature here would gate the call site without enabling the API.
+postgres = ["stateset-embedded/postgres"]
 
 # Release profile — same defaults as the sibling handlers for parity of
 # binary size and latency characteristics.
