@@ -57,12 +57,38 @@ impl ApiKeyStore {
     }
 
     pub fn lookup(&self, bearer: &str) -> Option<ApiKeyInfo> {
-        self.inner.get(bearer).cloned()
+        // Compare against every stored key in constant time rather than a
+        // `HashMap::get`, so request latency does not become a comparison
+        // oracle for the bearer token. API keys are high-entropy, but we mirror
+        // the webhook HMAC check (`webhook::signing`) for defense-in-depth.
+        // No early exit: we scan all entries even after a match.
+        let bearer = bearer.as_bytes();
+        let mut found: Option<&ApiKeyInfo> = None;
+        for info in self.inner.values() {
+            if constant_time_eq(info.key.as_bytes(), bearer) {
+                found = Some(info);
+            }
+        }
+        found.cloned()
     }
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+}
+
+/// Length-then-bitwise comparison with no early exit, so timing does not reveal
+/// how many leading bytes matched. Differing lengths short-circuit (the length
+/// of a secret is not itself secret here).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn validate_api_keys(keys: &[ApiKeyInfo]) -> anyhow::Result<()> {
