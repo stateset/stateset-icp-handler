@@ -172,14 +172,13 @@ pub async fn submit_intent(
         None
     };
     if let Some(key) = idempotency_key.as_deref() {
-        let (outcome, cached) =
+        let outcome =
             state
                 .service
                 .idempotency
                 .lookup(&tenant_id, key, &request_digest, chrono::Utc::now());
         match outcome {
-            LookupOutcome::Replay => {
-                let body = cached.expect("Replay always carries a cached response");
+            LookupOutcome::Replay(body) => {
                 let status =
                     http::StatusCode::from_u16(body.status).unwrap_or(http::StatusCode::OK);
                 let body_json: serde_json::Value = serde_json::from_slice(&body.body_json)

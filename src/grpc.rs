@@ -131,15 +131,14 @@ impl IcpHandler for GrpcHandler {
             )
         };
         if !idempotency_key.is_empty() {
-            let (outcome, cached) = self.service.idempotency.lookup(
+            let outcome = self.service.idempotency.lookup(
                 &tenant_id,
                 &idempotency_key,
                 &request_digest,
                 chrono::Utc::now(),
             );
             match outcome {
-                LookupOutcome::Replay => {
-                    let cached = cached.expect("Replay always carries a cached response");
+                LookupOutcome::Replay(cached) => {
                     let (receipt_jws, receipt_kid) = receipt_fields_from_body(&cached.body_json)?;
                     return Ok(Response::new(IntentResponse {
                         payload_json: cached.body_json,

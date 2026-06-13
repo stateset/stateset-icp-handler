@@ -53,12 +53,11 @@ fn prune_in_memory_deletes_only_expired_entries() {
 
     // Fresh still replays; stale is now a miss.
     let fresh_digest = IdempotencyStore::digest_request(b"world");
-    let (out, body) = store.lookup("tenant_a", "fresh", &fresh_digest, now);
-    assert!(matches!(out, LookupOutcome::Replay));
-    assert!(body.is_some());
+    let out = store.lookup("tenant_a", "fresh", &fresh_digest, now);
+    assert!(matches!(out, LookupOutcome::Replay(_)));
 
     let stale_digest = IdempotencyStore::digest_request(b"hello");
-    let (out, _) = store.lookup("tenant_a", "stale", &stale_digest, now);
+    let out = store.lookup("tenant_a", "stale", &stale_digest, now);
     assert!(
         matches!(out, LookupOutcome::Miss),
         "pruned stale key behaves as Miss on lookup"
@@ -113,7 +112,7 @@ fn pruned_then_relookup_returns_miss_not_conflict() {
 
     // Now a fresh request with a totally different body succeeds.
     let new_digest = IdempotencyStore::digest_request(b"changed");
-    let (out, _) = store.lookup("tenant_a", "k", &new_digest, now);
+    let out = store.lookup("tenant_a", "k", &new_digest, now);
     assert!(matches!(out, LookupOutcome::Miss));
 }
 

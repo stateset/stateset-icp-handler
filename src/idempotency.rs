@@ -47,15 +47,17 @@ pub struct CachedResponse {
     pub body_json: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum LookupOutcome {
     /// No entry — caller should process the request normally and call
     /// `store` with the result.
     Miss,
     /// Cached response found AND the request body digest matches —
-    /// replay the cached response verbatim with `Idempotent-Replayed:
-    /// true`.
-    Replay,
+    /// replay the carried response verbatim with `Idempotent-Replayed:
+    /// true`. The response is bound to the variant so a `Replay` can
+    /// never exist without its body (the invariant is enforced by the
+    /// type, not by a runtime `expect` at every call site).
+    Replay(CachedResponse),
     /// Cached response found but the request body digest differs from
     /// the original — caller MUST return `idempotency_conflict` (409)
     /// per ICP spec §12 / §13.
@@ -116,15 +118,15 @@ impl IdempotencyStore {
     }
 
     /// Decide what to do with a request bearing this idempotency key.
-    /// Returns the cached response on `Replay` so the caller can return
-    /// it verbatim.
+    /// Returns `LookupOutcome::Replay(response)` carrying the cached
+    /// response so the caller can return it verbatim.
     pub fn lookup(
         &self,
         tenant_id: &str,
         idempotency_key: &str,
         request_digest: &str,
         now: DateTime<Utc>,
-    ) -> (LookupOutcome, Option<CachedResponse>) {
+    ) -> LookupOutcome {
         let entry = match &self.backend {
             Backend::Memory(inner) => match inner.read() {
                 Ok(guard) => guard
@@ -140,7 +142,7 @@ impl IdempotencyStore {
                     Ok(conn) => conn,
                     Err(err) => {
                         tracing::error!(%err, "idempotency pool acquire failed");
-                        return (LookupOutcome::Miss, None);
+                        return LookupOutcome::Miss;
                     }
                 };
                 let row: Option<(String, i64, String, String)> = conn
@@ -176,18 +178,18 @@ impl IdempotencyStore {
         };
 
         let Some(entry) = entry else {
-            return (LookupOutcome::Miss, None);
+            return LookupOutcome::Miss;
         };
 
         // TTL eviction is lazy — expired entries behave as Miss.
         if now - entry.created_at > self.ttl {
-            return (LookupOutcome::Miss, None);
+            return LookupOutcome::Miss;
         }
 
         if entry.request_digest == request_digest {
-            (LookupOutcome::Replay, Some(entry.response))
+            LookupOutcome::Replay(entry.response)
         } else {
-            (LookupOutcome::Conflict, None)
+            LookupOutcome::Conflict
         }
     }
 
@@ -359,9 +361,8 @@ mod tests {
         let digest = IdempotencyStore::digest_request(b"hello");
 
         // First call: miss.
-        let (outcome, body) = store.lookup("t1", "k1", &digest, now);
+        let outcome = store.lookup("t1", "k1", &digest, now);
         assert!(matches!(outcome, LookupOutcome::Miss));
-        assert!(body.is_none());
 
         // Store the response.
         let resp = CachedResponse {
@@ -370,10 +371,11 @@ mod tests {
         };
         store.store("t1", "k1", &digest, resp.clone(), now);
 
-        // Second call with same body: replay.
-        let (outcome, body) = store.lookup("t1", "k1", &digest, now);
-        assert!(matches!(outcome, LookupOutcome::Replay));
-        let body = body.unwrap();
+        // Second call with same body: replay carries the cached body.
+        let outcome = store.lookup("t1", "k1", &digest, now);
+        let LookupOutcome::Replay(body) = outcome else {
+            panic!("expected Replay, got {outcome:?}");
+        };
         assert_eq!(body.status, 200);
         assert_eq!(body.body_json, b"{\"ok\":true}");
     }
@@ -394,9 +396,8 @@ mod tests {
             },
             now,
         );
-        let (outcome, body) = store.lookup("t1", "same-key", &d2, now);
+        let outcome = store.lookup("t1", "same-key", &d2, now);
         assert!(matches!(outcome, LookupOutcome::Conflict));
-        assert!(body.is_none());
     }
 
     #[test]
@@ -414,7 +415,7 @@ mod tests {
             },
             now,
         );
-        let (outcome, _) = store.lookup("tenant_b", "k1", &d, now);
+        let outcome = store.lookup("tenant_b", "k1", &d, now);
         assert!(matches!(outcome, LookupOutcome::Miss));
     }
 
@@ -435,7 +436,7 @@ mod tests {
         );
         // 2 seconds later — past TTL.
         let later = now + Duration::seconds(2);
-        let (outcome, _) = store.lookup("t", "k", &d, later);
+        let outcome = store.lookup("t", "k", &d, later);
         assert!(matches!(outcome, LookupOutcome::Miss));
     }
 }
