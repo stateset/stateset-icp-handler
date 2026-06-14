@@ -631,10 +631,24 @@ pub struct ReturnParams {
 
 pub fn decimal_to_minor(amount: Decimal, currency: &str) -> i64 {
     let scale = minor_unit_scale(currency);
-    (amount * Decimal::from(scale))
-        .round()
-        .try_into()
-        .unwrap_or(0)
+    let scaled = (amount * Decimal::from(scale)).round();
+    scaled.try_into().unwrap_or_else(|_| {
+        // Saturate on overflow rather than collapsing to 0 — a wildly large
+        // amount is far less dangerous (and far more obvious) as i64::MAX
+        // than as a silent zero charge.
+        let saturated = if scaled.is_sign_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        };
+        tracing::error!(
+            %amount,
+            currency,
+            saturated,
+            "decimal_to_minor overflowed i64; saturating"
+        );
+        saturated
+    })
 }
 
 pub fn minor_unit_scale(currency: &str) -> i64 {

@@ -61,8 +61,10 @@ impl IcpService {
             pt.amount_minor
         } else {
             let pct = params.discount_pct.unwrap_or(0.0);
-            // Round half-up via i64 arithmetic — avoids float drift on
-            // currency values.
+            // Apply the discount in widened integer space to avoid float
+            // drift on currency values. The final division truncates toward
+            // zero (floor for non-negative totals), i.e. any fractional
+            // minor unit is resolved in the buyer's favor.
             let scaled = (original_total_minor as i128) * ((10_000.0 - pct * 100.0) as i128);
             (scaled / 10_000) as i64
         };

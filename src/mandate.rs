@@ -569,12 +569,14 @@ pub async fn verify_signature(
 /// When `None`, the structural checks still run but the signature is
 /// trusted — this is dev mode, intended only for local testing with
 /// `alg:none` mandates.
+#[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
     compact_jws: &str,
     intent_scope: &str,
     candidate_amount_minor: i64,
     now: DateTime<Utc>,
     tenant_id: &str,
+    jurisdiction: Option<&str>,
     ledger: &MandateLedger,
     resolver: Option<&dyn PrincipalResolver>,
 ) -> Result<MandateEvaluation, ApiError> {
@@ -620,7 +622,43 @@ pub async fn evaluate(
         )));
     }
 
-    // 5. Budget (global + per-txn, windowed).
+    // 5. Jurisdiction (spec §6.1 step 6). When the mandate constrains
+    // jurisdictions (non-empty and not the `*` wildcard), the intent's
+    // fulfillment jurisdiction MUST be one of them. A mandate that bounds
+    // jurisdictions but on an intent that declares none cannot be proven
+    // in-bounds, so it is refused rather than silently allowed.
+    let allows_any_jurisdiction =
+        payload.icp.jurisdictions.is_empty() || payload.icp.jurisdictions.iter().any(|j| j == "*");
+    if !allows_any_jurisdiction {
+        match jurisdiction {
+            Some(j)
+                if payload
+                    .icp
+                    .jurisdictions
+                    .iter()
+                    .any(|allowed| jurisdiction_authorizes(allowed, j)) => {}
+            Some(j) => {
+                return Err(ApiError::MandateOutOfScope(format!(
+                    "mandate does not authorize jurisdiction `{j}`"
+                )));
+            }
+            None => {
+                return Err(ApiError::MandateOutOfScope(
+                    "mandate constrains jurisdictions but the intent declares none".into(),
+                ));
+            }
+        }
+    }
+
+    // 6. Policies (spec §6.1 step 7). Honor the declared mandate policies.
+    // `prohibit_subscriptions` blocks any subscription-scoped intent.
+    if payload.icp.policies.prohibit_subscriptions && intent_scope == "subscribe" {
+        return Err(ApiError::MandateOutOfScope(
+            "mandate policy prohibits subscriptions".into(),
+        ));
+    }
+
+    // 7. Budget (global + per-txn, windowed).
     let budget_minor = payload.icp.budget.amount_minor;
     if let Some(per_txn) = payload.icp.budget.per_transaction {
         if candidate_amount_minor > per_txn {
@@ -648,7 +686,7 @@ pub async fn evaluate(
         )));
     }
 
-    // 6. Signature verification (optional; gated by caller).
+    // 8. Signature verification (optional; gated by caller).
     let signature_verified = if let Some(r) = resolver {
         verify_signature(compact_jws, &payload.iss, r).await?;
         true
@@ -662,6 +700,28 @@ pub async fn evaluate(
         spend_room_minor: remaining,
         signature_verified,
     })
+}
+
+/// Whether a mandate's `allowed` jurisdiction code authorizes an intent's
+/// `actual` fulfillment jurisdiction.
+///
+/// Mandates are conventionally scoped by ISO 3166-1 country code (`"US"`),
+/// while an intent's `context.jurisdiction` is typically the more specific
+/// ISO 3166-2 subdivision (`"US-CA"`). A listed country therefore
+/// authorizes any of its subdivisions: `"US"` covers `"US-CA"`. The match
+/// is case-insensitive and also accepts an exact subdivision listing
+/// (`"US-CA"` authorizes `"US-CA"`). It is deliberately one-directional —
+/// a mandate scoped to the narrower `"US-CA"` does NOT authorize a broader
+/// `"US"` fulfillment, since that could not be proven in-bounds.
+fn jurisdiction_authorizes(allowed: &str, actual: &str) -> bool {
+    if allowed.eq_ignore_ascii_case(actual) {
+        return true;
+    }
+    // `allowed` is a country; `actual` is `<country>-<subdivision>`.
+    match actual.split_once('-') {
+        Some((country, _)) => allowed.eq_ignore_ascii_case(country),
+        None => false,
+    }
 }
 
 pub(crate) fn parse_period(s: Option<&str>) -> Option<Duration> {
@@ -726,9 +786,178 @@ mod tests {
         };
         let jws = make_jws(&payload);
         let ledger = MandateLedger::new();
-        let err = evaluate(&jws, "buy", 1_000, now, "merchant_demo", &ledger, None)
-            .await
-            .unwrap_err();
+        let err = evaluate(
+            &jws,
+            "buy",
+            1_000,
+            now,
+            "merchant_demo",
+            None,
+            &ledger,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::MandateOutOfScope(_)));
+    }
+
+    /// Builds a wide-open `buy` mandate, then lets the caller tighten
+    /// jurisdictions/policies for a specific assertion.
+    fn buy_payload(
+        now: DateTime<Utc>,
+        jurisdictions: Vec<String>,
+        policies: MandatePolicies,
+        scope: Vec<String>,
+    ) -> MandatePayload {
+        MandatePayload {
+            iss: "did:buyer:alice".into(),
+            sub: "did:stateset:agent:a".into(),
+            iat: now.timestamp() - 60,
+            nbf: now.timestamp() - 60,
+            exp: now.timestamp() + 3600,
+            jti: "m_jur".into(),
+            icp: MandateTerms {
+                version: "2026-04-21".into(),
+                scope,
+                budget: MandateBudget {
+                    currency: "USD".into(),
+                    amount_minor: 10_000,
+                    per_transaction: None,
+                    period: Some("P1D".into()),
+                },
+                merchants: vec!["*".into()],
+                categories: vec![],
+                jurisdictions,
+                policies,
+                linked_payment_methods: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_enforces_jurisdiction() {
+        let now = Utc::now();
+        let ledger = MandateLedger::new();
+        let payload = buy_payload(
+            now,
+            vec!["US".into(), "CA".into()],
+            MandatePolicies::default(),
+            vec!["buy".into()],
+        );
+        let jws = make_jws(&payload);
+
+        // In-jurisdiction succeeds — and crucially the intent declares the
+        // ISO-3166-2 *subdivision* `US-CA` while the mandate lists the
+        // *country* `US`. A listed country must authorize its subdivisions,
+        // or every real buy (whose context.jurisdiction is `US-CA`) against
+        // a country-scoped mandate would be wrongly rejected.
+        assert!(evaluate(
+            &jws,
+            "buy",
+            1_000,
+            now,
+            "merchant_demo",
+            Some("US-CA"),
+            &ledger,
+            None
+        )
+        .await
+        .is_ok());
+
+        // Out-of-jurisdiction is refused.
+        let err = evaluate(
+            &jws,
+            "buy",
+            1_000,
+            now,
+            "merchant_demo",
+            Some("GB"),
+            &ledger,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::MandateOutOfScope(_)));
+
+        // A jurisdiction-bounded mandate on an intent that declares none
+        // cannot be proven in-bounds and is refused.
+        let err = evaluate(
+            &jws,
+            "buy",
+            1_000,
+            now,
+            "merchant_demo",
+            None,
+            &ledger,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::MandateOutOfScope(_)));
+    }
+
+    #[test]
+    fn jurisdiction_authorizes_country_over_subdivision() {
+        // Country authorizes its subdivisions, case-insensitively.
+        assert!(jurisdiction_authorizes("US", "US-CA"));
+        assert!(jurisdiction_authorizes("us", "US-CA"));
+        assert!(jurisdiction_authorizes("US", "US"));
+        assert!(jurisdiction_authorizes("US-CA", "US-CA"));
+        // But NOT the reverse: a subdivision-scoped mandate doesn't
+        // authorize the broader country, and unrelated codes don't match.
+        assert!(!jurisdiction_authorizes("US-CA", "US"));
+        assert!(!jurisdiction_authorizes("US", "GB"));
+        assert!(!jurisdiction_authorizes("US", "CA"));
+        assert!(!jurisdiction_authorizes("US-CA", "US-NY"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_wildcard_jurisdiction_allows_any() {
+        let now = Utc::now();
+        let ledger = MandateLedger::new();
+        let payload = buy_payload(
+            now,
+            vec!["*".into()],
+            MandatePolicies::default(),
+            vec!["buy".into()],
+        );
+        let jws = make_jws(&payload);
+        assert!(evaluate(
+            &jws,
+            "buy",
+            1_000,
+            now,
+            "merchant_demo",
+            Some("ZZ"),
+            &ledger,
+            None
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn evaluate_enforces_prohibit_subscriptions_policy() {
+        let now = Utc::now();
+        let ledger = MandateLedger::new();
+        let policies = MandatePolicies {
+            prohibit_subscriptions: true,
+            ..Default::default()
+        };
+        let payload = buy_payload(now, vec![], policies, vec!["subscribe".into()]);
+        let jws = make_jws(&payload);
+        let err = evaluate(
+            &jws,
+            "subscribe",
+            1_000,
+            now,
+            "merchant_demo",
+            None,
+            &ledger,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ApiError::MandateOutOfScope(_)));
     }
 }

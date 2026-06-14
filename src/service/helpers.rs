@@ -135,7 +135,13 @@ pub(super) fn price_request_items(
             total: Money::new(line_subtotal, currency),
         });
     }
-    let tax_minor = subtotal_minor * 875 / 10_000;
+    // 8.75% tax. Widen to i128 for the multiply: `subtotal_minor` can reach
+    // i64::MAX (the line math above saturates), and a plain `i64 * 875`
+    // would overflow — panicking under overflow-checks or silently wrapping
+    // to a corrupt (even negative) tax that then flows into the charged
+    // total and the signed receipt. The result is < subtotal, so the
+    // narrowing back to i64 cannot truncate.
+    let tax_minor = (i128::from(subtotal_minor) * 875 / 10_000) as i64;
     let total_minor = subtotal_minor.saturating_add(tax_minor);
     let totals = Totals {
         subtotal: Some(Money::new(subtotal_minor, currency)),

@@ -153,6 +153,32 @@ fn make_mandate_jws(scopes: &[&str], amount_minor: i64, per_txn: Option<i64>) ->
     format!("{header}.{payload_b64}.")
 }
 
+fn make_mandate_jws_with_jurisdictions(
+    scopes: &[&str],
+    amount_minor: i64,
+    jurisdictions: &[&str],
+) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let now = Utc::now().timestamp();
+    let payload = json!({
+        "iss": "did:buyer:alice",
+        "sub": DEMO_AGENT,
+        "iat": now,
+        "nbf": now - 60,
+        "exp": now + 3600,
+        "jti": format!("m_{}", Uuid::new_v4().simple()),
+        "icp": {
+            "version": "2026-04-21",
+            "scope": scopes,
+            "budget": { "currency": "USD", "amount_minor": amount_minor, "period": "P1D" },
+            "merchants": ["*"],
+            "jurisdictions": jurisdictions,
+        },
+    });
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    format!("{header}.{payload_b64}.")
+}
+
 fn quote_body() -> Value {
     json!({
         "intent": "intent.quote",
@@ -1080,4 +1106,109 @@ async fn mandate_budget_blocks_buy_when_final_total_exceeds_remaining() {
     let (status, txn) = send(&app, req("GET", &format!("/icp/v1/transactions/{txn_id}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(txn["state"], "authorized");
+}
+
+#[tokio::test]
+async fn country_scoped_mandate_authorizes_subdivision_jurisdiction() {
+    // The realistic shape: mandate scoped to country `US`, intent context
+    // jurisdiction `US-CA` (the canonical quote_body value). A country must
+    // authorize its subdivisions, otherwise every real buy is rejected.
+    let mut cfg = Config::for_test();
+    cfg.require_mandate = true;
+    let app = setup_with(cfg).await;
+    let mandate = make_mandate_jws_with_jurisdictions(&["quote"], 100_000, &["US"]);
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Mandate", mandate)
+            .json_body(quote_body()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "US mandate must allow US-CA: {body}"
+    );
+    assert_eq!(body["transaction"]["state"], "quoted");
+}
+
+#[tokio::test]
+async fn mandate_scoped_to_other_country_rejects_jurisdiction() {
+    let mut cfg = Config::for_test();
+    cfg.require_mandate = true;
+    let app = setup_with(cfg).await;
+    // Mandate authorizes only GB; the intent's US-CA fulfillment is out of
+    // bounds and must be refused (spec §6.1 step 6).
+    let mandate = make_mandate_jws_with_jurisdictions(&["quote"], 100_000, &["GB"]);
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents")
+            .header("ICP-Mandate", mandate)
+            .json_body(quote_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "mandate_out_of_scope");
+}
+
+#[tokio::test]
+async fn quote_with_huge_amount_does_not_overflow_tax() {
+    // A crafted unit price near i64::MAX must not overflow the 8.75% tax
+    // multiply (which previously used a plain `i64 * 875`): in debug builds
+    // that panicked the request thread; in release it silently wrapped to a
+    // corrupt/negative tax that then flowed into the charged total. The
+    // request must succeed with non-negative, saturated money values.
+    let app = setup().await;
+    let body = json!({
+        "intent": "intent.quote",
+        "agent_id": DEMO_AGENT,
+        "params": {
+            "items": [{
+                "sku": "WIDGET-001",
+                "quantity": 1,
+                "unit_price_hint": { "amount_minor": i64::MAX, "currency": "USD" }
+            }]
+        },
+        "context": { "currency": "USD" }
+    });
+    let (status, resp) = send(&app, req("POST", "/icp/v1/intents").json_body(body)).await;
+    assert_eq!(status, StatusCode::OK, "huge amount must not panic: {resp}");
+    let tax = resp["transaction"]["totals"]["tax"]["amount_minor"]
+        .as_i64()
+        .expect("tax amount");
+    let total = resp["transaction"]["totals"]["total"]["amount_minor"]
+        .as_i64()
+        .expect("total amount");
+    assert!(tax >= 0, "tax must not wrap negative, got {tax}");
+    assert!(total >= 0, "total must not wrap negative, got {total}");
+}
+
+#[tokio::test]
+async fn intent_error_carries_intent_id_for_correlation() {
+    // Spec §12: an error SHOULD carry `intent_id` so the caller can
+    // correlate it to the failing intent. A buy against a nonexistent
+    // transaction fails inside the pipeline; the response must echo the
+    // client-supplied intent_id.
+    let app = setup().await;
+    let (status, body) = send(
+        &app,
+        req("POST", "/icp/v1/intents").json_body(json!({
+            "intent": "intent.buy",
+            "intent_id": "int_correlate_me",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": "txn_does_not_exist",
+                "payment": { "method": "card", "token": "tok_x" }
+            }
+        })),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "expected a client error, got {status}"
+    );
+    assert_eq!(
+        body["error"]["intent_id"], "int_correlate_me",
+        "error must echo the failing intent's intent_id"
+    );
 }

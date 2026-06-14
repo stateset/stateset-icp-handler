@@ -132,13 +132,22 @@ impl CommerceEngine {
             });
         }
 
+        // The engine maps an unrecognized currency to its default (USD). Log
+        // it rather than silently persisting an order in the wrong currency.
+        let parsed_currency = currency.parse().ok();
+        if parsed_currency.is_none() {
+            tracing::warn!(
+                currency,
+                "currency not recognized by the commerce engine; persisted order will default to its base currency"
+            );
+        }
         let order = self
             .inner
             .orders()
             .create(CreateOrder {
                 customer_id: customer.id,
                 items: order_items,
-                currency: currency.parse().ok(),
+                currency: parsed_currency,
                 ..Default::default()
             })
             .map_err(|e| ApiError::EngineUnavailable(format!("orders.create: {e}")))?;
