@@ -340,7 +340,9 @@ def test_a2a_quote_envelope():
     assert body["intent"] == "intent.a2a_quote"
     assert body["params"]["peer_agent_id"].endswith("compute-provider")
     assert body["params"]["service"]["kind"] == "compute"
-    assert body["params"]["expires_in_secs"] == 300
+    # Wire field is `expires_in_seconds` (matches the server); the old
+    # `expires_in_secs` key was silently dropped by the handler.
+    assert body["params"]["expires_in_seconds"] == 300
     assert body["params"]["reference_id"] == "job-42"
 
 
@@ -417,6 +419,8 @@ def test_mandate_and_idempotency_headers_propagate_through_any_wrapper():
     assert h["icp-idempotency-key"] == "idem-abc"
     assert h["icp-agent-id"] == DEMO_AGENT
     assert h["authorization"].startswith("Bearer ")
+    # Handlers require ICP-Version by default — every intent POST must send it.
+    assert h["icp-version"] == "2026-04-21"
 
 
 def test_every_post_carries_auto_generated_request_id():

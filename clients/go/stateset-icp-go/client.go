@@ -22,23 +22,34 @@ import (
 	"time"
 )
 
+// ICPVersion is the spec revision this client targets. It is sent as the
+// ICP-Version header on every request because handlers require it by
+// default (ICP_REQUIRE_VERSION=true); omitting it makes a default-
+// configured handler reject every intent write with 400. Keep in sync
+// with ICP_VERSION in the handler's src/constants.rs.
+const ICPVersion = "2026-04-21"
+
 // Client is a synchronous ICP client.
 //
 // Construct with New; override the HTTP transport or timeout via the
 // optional Config. Safe for concurrent use by multiple goroutines —
 // the underlying http.Client is itself concurrent-safe.
 type Client struct {
-	baseURL string
-	apiKey  string
-	agentID string
-	http    *http.Client
+	baseURL    string
+	apiKey     string
+	agentID    string
+	icpVersion string
+	http       *http.Client
 }
 
 // Config tunes optional Client behavior. Zero values select sensible
-// defaults: 30s timeout, http.DefaultTransport.
+// defaults: 30s timeout, http.DefaultTransport, ICPVersion.
 type Config struct {
 	Timeout   time.Duration
 	Transport http.RoundTripper
+	// ICPVersion overrides the ICP-Version header sent on every request.
+	// Empty selects the ICPVersion constant.
+	ICPVersion string
 }
 
 // New returns a Client pointed at baseURL.
@@ -55,10 +66,15 @@ func New(baseURL, apiKey, agentID string, cfg ...Config) *Client {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
+	icpVersion := c.ICPVersion
+	if icpVersion == "" {
+		icpVersion = ICPVersion
+	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
-		agentID: agentID,
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		apiKey:     apiKey,
+		agentID:    agentID,
+		icpVersion: icpVersion,
 		http: &http.Client{
 			Transport: c.Transport, // nil → http.DefaultTransport
 			Timeout:   timeout,
@@ -204,6 +220,7 @@ func (c *Client) getJSON(path string) (map[string]any, error) {
 func (c *Client) applyAuthHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("ICP-Agent-Id", c.agentID)
+	req.Header.Set("ICP-Version", c.icpVersion)
 	req.Header.Set("Accept", "application/json")
 }
 

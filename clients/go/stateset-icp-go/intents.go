@@ -237,10 +237,10 @@ type A2AQuoteParams struct {
 	// Service kind + free-form params — handler-typed enum lives
 	// at `service.kind` ∈ {compute, data_feed, image_generation,
 	// ad_hoc}.
-	Service        map[string]any
-	PriceHint      map[string]any // Money map
-	ExpiresInSecs  int
-	ReferenceID    string
+	Service       map[string]any
+	PriceHint     map[string]any // Money map
+	ExpiresInSecs int
+	ReferenceID   string
 }
 
 // A2AQuote asks a peer agent for a quote on a service.
@@ -253,7 +253,9 @@ func (c *Client) A2AQuote(p A2AQuoteParams, opts SubmitOptions) (map[string]any,
 		params["price_hint"] = p.PriceHint
 	}
 	if p.ExpiresInSecs > 0 {
-		params["expires_in_secs"] = p.ExpiresInSecs
+		// Wire field is `expires_in_seconds` (src/models.rs); the old
+		// `expires_in_secs` key was silently ignored, defaulting to 300s.
+		params["expires_in_seconds"] = p.ExpiresInSecs
 	}
 	if p.ReferenceID != "" {
 		params["reference_id"] = p.ReferenceID
@@ -320,4 +322,3 @@ func (c *Client) call(intent string, params map[string]any, opts SubmitOptions) 
 		Params:  params,
 	}, opts)
 }
-

@@ -16,6 +16,12 @@ from typing import Any, Iterator, Optional, Sequence
 import httpx
 
 
+# Spec revision this client targets, sent as the `ICP-Version` header on
+# every request (handlers require it by default). Keep in sync with
+# `ICP_VERSION` in the handler's src/constants.rs.
+ICP_VERSION = "2026-04-21"
+
+
 # --- errors ---------------------------------------------------------------
 
 
@@ -218,6 +224,7 @@ class Client:
         *,
         api_key: str,
         agent_id: str,
+        icp_version: str = ICP_VERSION,
         timeout: float = 30.0,
         verify_tls: bool = True,
         transport: Optional[httpx.BaseTransport] = None,
@@ -225,9 +232,13 @@ class Client:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._agent_id = agent_id
+        # Handlers default to requiring ICP-Version on every intent write
+        # (ICP_REQUIRE_VERSION=true), so send it on every request — omitting
+        # it makes a default-configured server reject all writes with 400.
         default_headers = {
             "authorization": f"Bearer {api_key}",
             "icp-agent-id": agent_id,
+            "icp-version": icp_version,
             "accept": "application/json",
         }
         self._http = httpx.Client(
@@ -642,7 +653,9 @@ class Client:
         if price_hint is not None:
             params["price_hint"] = price_hint
         if expires_in_secs is not None:
-            params["expires_in_secs"] = expires_in_secs
+            # Server field is `expires_in_seconds` (src/models.rs); the old
+            # `expires_in_secs` key was silently ignored, defaulting to 300s.
+            params["expires_in_seconds"] = expires_in_secs
         if reference_id is not None:
             params["reference_id"] = reference_id
         return self._call(

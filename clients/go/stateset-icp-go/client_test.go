@@ -153,6 +153,8 @@ func TestSubmitIntentSendsEnvelopeAndHeaders(t *testing.T) {
 		"Icp-Idempotency-Key": "idem-1",
 		"Icp-Request-Id":      "req-explicit",
 		"Icp-Trace-Id":        "trace-1",
+		// Handlers require ICP-Version by default — must be sent.
+		"Icp-Version": "2026-04-21",
 	}
 	for name, want := range wantHeaders {
 		if got := req.Header.Get(name); got != want {

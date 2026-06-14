@@ -9,6 +9,17 @@ and this package tracks the ICP spec-version it targets (see README).
 
 ## [Unreleased]
 
+### Fixed
+- **Send the `ICP-Version` header on every request.** Handlers default to
+  `ICP_REQUIRE_VERSION=true`, so the client previously had *every* intent
+  write (quote/authorize/buy/…) rejected with `400 invalid_request` against
+  a default-configured handler. The header is now sent automatically;
+  `Client(..., icp_version=...)` overrides the targeted spec version.
+- **`a2a_quote(expires_in_secs=…)` is no longer silently dropped.** The
+  parameter was sent as `expires_in_secs`, but the handler's field is
+  `expires_in_seconds` — so the requested expiry was ignored and the peer
+  quote always used the 300s default. Fixed the wire key.
+
 ### Added
 - **SSE cross-language golden-vector test**
   (`tests/test_vectors_sse.py`) — loads the shared fixture at

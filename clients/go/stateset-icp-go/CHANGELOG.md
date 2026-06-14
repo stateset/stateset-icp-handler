@@ -6,6 +6,19 @@ changelog](../../../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Send the `ICP-Version` header on every request.** Handlers default to
+  `ICP_REQUIRE_VERSION=true`, so the client previously had *every* intent
+  write (Quote/Authorize/Buy/…) rejected with `400 invalid_request` against
+  a default-configured handler. `applyAuthHeaders` now sets it on all
+  requests; override the targeted spec version via `Config.ICPVersion` (the
+  exported `ICPVersion` constant is the default).
+- **`A2AQuote` expiry is no longer silently dropped.** `ExpiresInSecs` was
+  sent as `expires_in_secs`, but the handler's field is `expires_in_seconds`
+  — so the requested window was ignored and the peer quote always used the
+  300s default. Fixed the wire key.
+
 ### Added
 
 - **`examples/listen/main.go`** — live SSE tail paralleling

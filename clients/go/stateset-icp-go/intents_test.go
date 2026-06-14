@@ -291,9 +291,9 @@ func TestSubscribe(t *testing.T) {
 
 func TestSubscriptionLifecycleEnvelopes(t *testing.T) {
 	cases := []struct {
-		name  string
-		call  func(c *Client) (map[string]any, error)
-		wire  string
+		name string
+		call func(c *Client) (map[string]any, error)
+		wire string
 	}{
 		{"renew", func(c *Client) (map[string]any, error) { return c.Renew("sub_1", SubmitOptions{}) }, "intent.renew"},
 		{"pause", func(c *Client) (map[string]any, error) { return c.Pause("sub_1", SubmitOptions{}) }, "intent.pause"},
@@ -330,7 +330,9 @@ func TestA2AQuote(t *testing.T) {
 	if svc, _ := p["service"].(map[string]any); svc["kind"] != "compute" {
 		t.Errorf("service.kind missing")
 	}
-	if p["expires_in_secs"].(float64) != 300 || p["reference_id"] != "job-42" {
+	// Wire field is `expires_in_seconds` (matches the server); the old
+	// `expires_in_secs` key was silently dropped by the handler.
+	if p["expires_in_seconds"].(float64) != 300 || p["reference_id"] != "job-42" {
 		t.Errorf("optional params = %+v", p)
 	}
 }
