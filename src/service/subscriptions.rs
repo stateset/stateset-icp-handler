@@ -55,7 +55,20 @@ impl IcpService {
         // to `trial_end`; the scheduler bills it then (the renewal query
         // includes `trialing`) and flips the status to `active`.
         if let Some(trial_days) = params.trial_days.filter(|d| *d > 0) {
-            let trial_end = now + chrono::Duration::days(i64::from(trial_days));
+            // Bound the trial: an unbounded client-supplied value would
+            // overflow `now + Duration` and panic the process (the release
+            // profile is `panic = "abort"`). A year is a generous ceiling.
+            const MAX_TRIAL_DAYS: u32 = 366;
+            if trial_days > MAX_TRIAL_DAYS {
+                return Err(ApiError::InvalidRequest(format!(
+                    "subscribe.params.trial_days must be between 1 and {MAX_TRIAL_DAYS}"
+                )));
+            }
+            let trial_end = now
+                .checked_add_signed(chrono::Duration::days(i64::from(trial_days)))
+                .ok_or_else(|| {
+                    ApiError::InvalidRequest("subscribe.params.trial_days out of range".into())
+                })?;
             let sub = Subscription {
                 id,
                 status: SubscriptionStatus::Trialing,

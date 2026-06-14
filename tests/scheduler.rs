@@ -186,6 +186,46 @@ async fn trial_subscription_defers_first_charge_then_converts_to_active() {
 }
 
 #[tokio::test]
+async fn trial_days_overflow_is_rejected_not_panic() {
+    // An unbounded trial_days would overflow `now + Duration` and (with
+    // panic=abort) kill the process. It must be rejected as invalid input.
+    let (_state, app) = build().await;
+    let mut body = subscribe_body(card_payment());
+    body["params"]["trial_days"] = json!(4_000_000_000u64); // > u32 cap anyway
+    let resp = submit(&app, body).await;
+    assert_eq!(resp["error"]["type"], "invalid_request");
+}
+
+#[tokio::test]
+async fn trial_transaction_cannot_be_bought_directly() {
+    // The trial enrollment returns a pseudo-transaction; an agent must NOT
+    // be able to `intent.buy` it to charge the customer mid-trial.
+    let (_state, app) = build().await;
+    let mut body = subscribe_body(card_payment());
+    body["params"]["trial_days"] = json!(14);
+    let resp = submit(&app, body).await;
+    let txn_id = resp["transaction"]["id"].as_str().unwrap().to_string();
+
+    let buy = submit(
+        &app,
+        json!({
+            "intent": "intent.buy",
+            "agent_id": DEMO_AGENT,
+            "params": {
+                "transaction_id": txn_id,
+                "payment": { "method": "card", "token": "tok_x" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(buy["error"]["type"], "precondition_failed", "{buy}");
+    assert!(buy["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("subscription"));
+}
+
+#[tokio::test]
 async fn paused_subscription_is_skipped_by_scheduler() {
     let (state, app) = build().await;
     let resp = submit(&app, subscribe_body(card_payment())).await;

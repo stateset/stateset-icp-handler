@@ -331,6 +331,11 @@ impl Config {
         {
             issues.push("ICP_WEBHOOK_SECRET is required when ICP_WEBHOOK_URL is set");
         }
+        // An idempotency reservation lease at or beyond the cache TTL is
+        // incoherent — a reservation would outlive the row that backs it.
+        if self.idempotency_lease_secs >= (crate::idempotency::DEFAULT_TTL_HOURS as u64) * 3600 {
+            issues.push("ICP_IDEMPOTENCY_LEASE_SECONDS must be well below the 24h cache TTL");
+        }
 
         if issues.is_empty() {
             Ok(())

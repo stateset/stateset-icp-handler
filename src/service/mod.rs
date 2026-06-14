@@ -552,7 +552,7 @@ impl IcpService {
         // reservation for local duplicates. The DB reservation below is what
         // extends that guarantee across *separate* processes sharing one
         // database — neither alone is sufficient for a multi-replica fleet.
-        let _guard = self.lock_idempotency_key(&tenant_id, &key).await;
+        let guard = self.lock_idempotency_key(&tenant_id, &key).await;
         let lease = chrono::Duration::seconds(self.config.idempotency_lease_secs.max(1) as i64);
 
         let replay =
@@ -576,14 +576,16 @@ impl IcpService {
         {
             crate::idempotency::ReserveOutcome::Replay(cached) => replay(cached),
             crate::idempotency::ReserveOutcome::Conflict => Err(conflict()),
-            crate::idempotency::ReserveOutcome::Won => {
+            crate::idempotency::ReserveOutcome::Won(reservation_id) => {
                 // We own the claim. Execute, then record the response — or
                 // release the reservation so a failed attempt can be retried
-                // immediately rather than waiting out the lease.
+                // immediately rather than waiting out the lease. Both calls
+                // carry our reservation token so a stale-lease takeover can't
+                // be clobbered by, nor clobber, this caller.
                 let body = match self.handle_intent(input).await {
                     Ok(body) => body,
                     Err(e) => {
-                        self.idempotency.release(&tenant_id, &key);
+                        self.idempotency.release(&tenant_id, &key, &reservation_id);
                         return Err(e);
                     }
                 };
@@ -598,6 +600,7 @@ impl IcpService {
                         body_json: body_bytes,
                     },
                     Utc::now(),
+                    &reservation_id,
                 );
                 Ok(IntentExecution {
                     body,
@@ -605,9 +608,14 @@ impl IcpService {
                 })
             }
             crate::idempotency::ReserveOutcome::InProgress => {
-                // Another process is executing this exact request. Wait
-                // briefly for its result and replay it; if it doesn't land in
-                // time, return a retryable error so the client retries (by
+                // Another *process* holds the reservation (a same-process
+                // duplicate would have been serialized by `guard` before
+                // reaching `reserve`). The DB reservation is the real guard
+                // now, so drop the in-process lock before sleeping rather than
+                // head-of-line-blocking same-key callers for the poll window.
+                drop(guard);
+                // Wait briefly for its result and replay it; if it doesn't land
+                // in time, return a retryable error so the client retries (by
                 // which point the original has almost certainly completed).
                 const MAX_POLLS: u32 = 20;
                 const POLL_INTERVAL_MS: u64 = 100;

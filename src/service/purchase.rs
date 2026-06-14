@@ -14,6 +14,22 @@ use crate::models::{AuthorizeParams, BuyParams, OrderSummary, Transaction, Trans
 use super::helpers::validate_payment_instrument;
 use super::{IcpService, IntentInput, Outcome};
 
+/// Subscription-lifecycle transactions (trial-enrollment previews,
+/// pause/cancel markers) are linked to a subscription via
+/// `external_refs["subscription_id"]`. They are NOT directly chargeable —
+/// authorizing/buying one would bypass the subscription billing flow (e.g.
+/// charge a free trial immediately, double-counting mandate spend). Reject
+/// any money-moving intent that targets one.
+fn ensure_not_subscription_linked(txn: &Transaction) -> Result<(), ApiError> {
+    if txn.external_refs.contains_key("subscription_id") {
+        return Err(ApiError::PreconditionFailed(
+            "transaction belongs to a subscription and cannot be authorized or bought directly"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl IcpService {
     pub(super) async fn do_authorize(
         &self,
@@ -25,6 +41,7 @@ impl IcpService {
         let txn_id = params.transaction_id.clone();
         let _txn_guard = self.lock_transaction(&txn_id).await;
         let txn = self.transaction_for_input(&txn_id, input)?;
+        ensure_not_subscription_linked(&txn)?;
         if txn.state != TransactionState::Quoted {
             return Err(ApiError::PreconditionFailed(format!(
                 "transaction in state {:?} cannot be authorized",
@@ -69,6 +86,7 @@ impl IcpService {
 
         // Load transaction.
         let txn = self.transaction_for_input(&txn_id, input)?;
+        ensure_not_subscription_linked(&txn)?;
         match txn.state {
             TransactionState::Quoted => self.ensure_quote_open(&txn, Utc::now())?,
             TransactionState::Authorized => {}

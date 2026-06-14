@@ -31,6 +31,14 @@ fn completed(body: &[u8]) -> CachedResponse {
     }
 }
 
+/// Assert a reserve won the claim and return its fencing token.
+fn won(outcome: ReserveOutcome) -> String {
+    match outcome {
+        ReserveOutcome::Won(token) => token,
+        other => panic!("expected Won, got {other:?}"),
+    }
+}
+
 #[test]
 fn cross_instance_reservation_blocks_second_executor_then_replays() {
     let path = scratch_db_path();
@@ -40,10 +48,7 @@ fn cross_instance_reservation_blocks_second_executor_then_replays() {
     let lease = Duration::seconds(60);
 
     // Process A wins the claim.
-    assert!(
-        matches!(a.reserve("t", "k", "dig", now, lease), ReserveOutcome::Won),
-        "first claimant must win"
-    );
+    let token = won(a.reserve("t", "k", "dig", now, lease));
 
     // Process B, hitting the same shared DB, sees an in-progress claim — it
     // must NOT also get Won (that would be the double-charge).
@@ -55,15 +60,14 @@ fn cross_instance_reservation_blocks_second_executor_then_replays() {
         "second claimant must observe the in-progress reservation"
     );
 
-    // A finishes and records its response.
-    a.store("t", "k", "dig", completed(br#"{"ok":1}"#), now);
+    // A finishes and records its response (using its token).
+    a.store("t", "k", "dig", completed(br#"{"ok":1}"#), now, &token);
 
     // B now replays A's response instead of executing.
     match b.reserve("t", "k", "dig", now, lease) {
         ReserveOutcome::Replay(c) => assert_eq!(c.body_json, br#"{"ok":1}"#),
         other => panic!("want Replay after completion, got {other:?}"),
     }
-    // And a plain lookup from B replays too.
     assert!(matches!(
         b.lookup("t", "k", "dig", now),
         LookupOutcome::Replay(_)
@@ -80,11 +84,8 @@ fn cross_instance_conflict_on_different_body() {
     let now = Utc::now();
     let lease = Duration::seconds(60);
 
-    assert!(matches!(
-        a.reserve("t", "k", "digest-A", now, lease),
-        ReserveOutcome::Won
-    ));
-    a.store("t", "k", "digest-A", completed(br#"{"a":1}"#), now);
+    let token = won(a.reserve("t", "k", "digest-A", now, lease));
+    a.store("t", "k", "digest-A", completed(br#"{"a":1}"#), now, &token);
 
     // Same key, different request body → conflict across instances.
     assert!(
@@ -105,16 +106,13 @@ fn released_reservation_can_be_reclaimed_immediately() {
     let now = Utc::now();
     let lease = Duration::seconds(60);
 
-    assert!(matches!(
-        store.reserve("t", "k", "dig", now, lease),
-        ReserveOutcome::Won
-    ));
+    let token = won(store.reserve("t", "k", "dig", now, lease));
     // Execution failed — release so a retry isn't blocked for the lease.
-    store.release("t", "k");
+    store.release("t", "k", &token);
     assert!(
         matches!(
             store.reserve("t", "k", "dig", now, lease),
-            ReserveOutcome::Won
+            ReserveOutcome::Won(_)
         ),
         "released key must be immediately reclaimable"
     );
@@ -131,10 +129,7 @@ fn stale_reservation_is_reclaimed_after_lease() {
     let lease = Duration::seconds(30);
 
     // A claims, then "crashes" (never stores, never releases).
-    assert!(matches!(
-        a.reserve("t", "k", "dig", now, lease),
-        ReserveOutcome::Won
-    ));
+    let _a_token = won(a.reserve("t", "k", "dig", now, lease));
 
     // Within the lease, B must back off.
     assert!(matches!(
@@ -147,10 +142,56 @@ fn stale_reservation_is_reclaimed_after_lease() {
     assert!(
         matches!(
             b.reserve("t", "k", "dig", now + Duration::seconds(31), lease),
-            ReserveOutcome::Won
+            ReserveOutcome::Won(_)
         ),
         "an expired reservation must be reclaimable after the lease"
     );
+
+    cleanup(&path);
+}
+
+#[test]
+fn superseded_holder_cannot_overwrite_the_takers_response() {
+    // Fencing: A claims, is slow; past the lease B takes over and completes.
+    // A's later store (with A's stale token) must NOT clobber B's response.
+    let path = scratch_db_path();
+    let a = IdempotencyStore::with_pool(state_db::open(&path).expect("pool a"));
+    let b = IdempotencyStore::with_pool(state_db::open(&path).expect("pool b"));
+    let now = Utc::now();
+    let lease = Duration::seconds(30);
+
+    let a_token = won(a.reserve("t", "k", "dig", now, lease));
+    // B takes over after the lease and completes with its own response.
+    let later = now + Duration::seconds(31);
+    let b_token = won(b.reserve("t", "k", "dig", later, lease));
+    assert_ne!(a_token, b_token, "takeover must mint a fresh token");
+    b.store(
+        "t",
+        "k",
+        "dig",
+        completed(br#"{"winner":"B"}"#),
+        later,
+        &b_token,
+    );
+
+    // A finally finishes and tries to store with its stale token — no-op.
+    a.store(
+        "t",
+        "k",
+        "dig",
+        completed(br#"{"winner":"A"}"#),
+        later,
+        &a_token,
+    );
+
+    // The cache holds B's response, not A's.
+    match b.lookup("t", "k", "dig", later) {
+        LookupOutcome::Replay(c) => assert_eq!(
+            c.body_json, br#"{"winner":"B"}"#,
+            "superseded holder must not overwrite the taker's cached response"
+        ),
+        other => panic!("want Replay of B's response, got {other:?}"),
+    }
 
     cleanup(&path);
 }
@@ -162,11 +203,8 @@ fn in_memory_reservation_round_trips() {
     let now = Utc::now();
     let lease = Duration::seconds(60);
 
-    assert!(matches!(
-        store.reserve("t", "k", "dig", now, lease),
-        ReserveOutcome::Won
-    ));
-    store.store("t", "k", "dig", completed(br#"{"ok":1}"#), now);
+    let token = won(store.reserve("t", "k", "dig", now, lease));
+    store.store("t", "k", "dig", completed(br#"{"ok":1}"#), now, &token);
     match store.reserve("t", "k", "dig", now, lease) {
         ReserveOutcome::Replay(c) => assert_eq!(c.body_json, br#"{"ok":1}"#),
         other => panic!("want Replay, got {other:?}"),

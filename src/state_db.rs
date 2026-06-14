@@ -103,7 +103,23 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "denormalized_query_columns_and_indexes",
         body: migration_v3_query_columns_and_indexes,
     },
+    Migration {
+        version: 4,
+        name: "idempotency_reservation_id",
+        body: migration_v4_idempotency_reservation_id,
+    },
 ];
+
+/// Owner/fencing token for an idempotency reservation. A stale-lease
+/// takeover writes a fresh `reservation_id`; the original (merely slow,
+/// not dead) holder's later `store` is conditioned on its own token, so it
+/// becomes a detectable no-op instead of clobbering the taker's response.
+fn migration_v4_idempotency_reservation_id(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    add_columns_idempotent(
+        tx,
+        &["ALTER TABLE idempotency ADD COLUMN reservation_id TEXT NOT NULL DEFAULT ''"],
+    )
+}
 
 fn run_migrations(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(

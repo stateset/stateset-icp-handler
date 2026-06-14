@@ -79,8 +79,9 @@ const PENDING_STATUS: u16 = 0;
 pub enum ReserveOutcome {
     /// This caller atomically claimed the key and must now execute the
     /// request, then call [`IdempotencyStore::store`] on success or
-    /// [`IdempotencyStore::release`] on failure.
-    Won,
+    /// [`IdempotencyStore::release`] on failure — passing back the carried
+    /// reservation token so a superseded holder can't overwrite the result.
+    Won(String),
     /// A completed response already exists with a matching digest —
     /// replay it.
     Replay(CachedResponse),
@@ -109,6 +110,11 @@ struct Entry {
     request_digest: String,
     response: CachedResponse,
     created_at: DateTime<Utc>,
+    /// Owner/fencing token, set when the row is claimed as a reservation.
+    /// `store`/`release` only act when their token matches, so a
+    /// superseded (stale-lease takeover) holder can't clobber the taker's
+    /// result. Empty for legacy/completed rows written before fencing.
+    reservation_id: String,
 }
 
 impl Default for IdempotencyStore {
@@ -198,6 +204,8 @@ impl IdempotencyStore {
                                 body_json: body.into_bytes(),
                             },
                             created_at,
+                            // lookup never inspects the token; default empty.
+                            reservation_id: String::new(),
                         })
                     }
                     None => None,
@@ -248,13 +256,16 @@ impl IdempotencyStore {
         now: DateTime<Utc>,
         lease: Duration,
     ) -> ReserveOutcome {
-        let pending = || Entry {
+        // Fresh fencing token, written only if this call claims the key.
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let pending_entry = |reservation_id: String| Entry {
             request_digest: request_digest.to_string(),
             response: CachedResponse {
                 status: PENDING_STATUS,
                 body_json: Vec::new(),
             },
             created_at: now,
+            reservation_id,
         };
         match &self.backend {
             Backend::Memory(inner) => {
@@ -267,8 +278,8 @@ impl IdempotencyStore {
                     Some(e) if now - e.created_at <= self.ttl => {
                         if e.response.status == PENDING_STATUS {
                             if now - e.created_at > lease {
-                                guard.insert(key, pending()); // stale holder → take over
-                                ReserveOutcome::Won
+                                guard.insert(key, pending_entry(token.clone())); // stale → take over
+                                ReserveOutcome::Won(token)
                             } else {
                                 ReserveOutcome::InProgress
                             }
@@ -280,8 +291,8 @@ impl IdempotencyStore {
                     }
                     // Absent or TTL-expired → claim it.
                     _ => {
-                        guard.insert(key, pending());
-                        ReserveOutcome::Won
+                        guard.insert(key, pending_entry(token.clone()));
+                        ReserveOutcome::Won(token)
                     }
                 }
             }
@@ -321,29 +332,32 @@ impl IdempotencyStore {
                     tx.execute(
                         "INSERT INTO idempotency \
                              (tenant_id, idempotency_key, request_digest, \
-                              response_status, response_body, created_at) \
-                         VALUES (?1, ?2, ?3, 0, '', ?4) \
+                              response_status, response_body, created_at, reservation_id) \
+                         VALUES (?1, ?2, ?3, 0, '', ?4, ?5) \
                          ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET \
                              request_digest = excluded.request_digest, \
                              response_status = 0, response_body = '', \
-                             created_at = excluded.created_at",
+                             created_at = excluded.created_at, \
+                             reservation_id = excluded.reservation_id",
                         rusqlite::params![
                             tenant_id,
                             idempotency_key,
                             request_digest,
-                            now.to_rfc3339()
+                            now.to_rfc3339(),
+                            token,
                         ],
                     )
                 };
+                let won = |r: rusqlite::Result<usize>| match r {
+                    Ok(_) => ReserveOutcome::Won(token.clone()),
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency reserve claim failed");
+                        ReserveOutcome::InProgress
+                    }
+                };
 
                 let outcome = match existing {
-                    None => match claim_pending(&tx) {
-                        Ok(_) => ReserveOutcome::Won,
-                        Err(err) => {
-                            tracing::error!(%err, "idempotency reserve claim failed");
-                            ReserveOutcome::InProgress
-                        }
-                    },
+                    None => won(claim_pending(&tx)),
                     Some((digest, status, body, created_str)) => {
                         let created = DateTime::parse_from_rfc3339(&created_str)
                             .map(|d| d.with_timezone(&Utc))
@@ -352,16 +366,10 @@ impl IdempotencyStore {
                         let status = status as u16;
                         if expired {
                             // Stale completed/pending row → reclaim.
-                            match claim_pending(&tx) {
-                                Ok(_) => ReserveOutcome::Won,
-                                Err(_) => ReserveOutcome::InProgress,
-                            }
+                            won(claim_pending(&tx))
                         } else if status == PENDING_STATUS {
                             if now - created > lease {
-                                match claim_pending(&tx) {
-                                    Ok(_) => ReserveOutcome::Won, // dead holder → take over
-                                    Err(_) => ReserveOutcome::InProgress,
-                                }
+                                won(claim_pending(&tx)) // dead holder → take over
                             } else {
                                 ReserveOutcome::InProgress
                             }
@@ -387,18 +395,19 @@ impl IdempotencyStore {
 
     /// Release a reservation whose execution failed, so the request can be
     /// retried immediately instead of waiting out the lease. Only deletes a
-    /// still-pending row — never a completed response.
-    pub fn release(&self, tenant_id: &str, idempotency_key: &str) {
+    /// still-pending row that this caller still owns (matching
+    /// `reservation_id`) — never a completed response, and never a row a
+    /// stale-lease takeover has since re-claimed.
+    pub fn release(&self, tenant_id: &str, idempotency_key: &str, reservation_id: &str) {
         match &self.backend {
             Backend::Memory(inner) => {
                 let mut guard = inner
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let key = (tenant_id.to_string(), idempotency_key.to_string());
-                if guard
-                    .get(&key)
-                    .is_some_and(|e| e.response.status == PENDING_STATUS)
-                {
+                if guard.get(&key).is_some_and(|e| {
+                    e.response.status == PENDING_STATUS && e.reservation_id == reservation_id
+                }) {
                     guard.remove(&key);
                 }
             }
@@ -412,8 +421,9 @@ impl IdempotencyStore {
                 };
                 if let Err(err) = conn.execute(
                     "DELETE FROM idempotency \
-                     WHERE tenant_id = ?1 AND idempotency_key = ?2 AND response_status = 0",
-                    rusqlite::params![tenant_id, idempotency_key],
+                     WHERE tenant_id = ?1 AND idempotency_key = ?2 \
+                       AND response_status = 0 AND reservation_id = ?3",
+                    rusqlite::params![tenant_id, idempotency_key, reservation_id],
                 ) {
                     tracing::error!(%err, "idempotency release failed");
                 }
@@ -421,8 +431,12 @@ impl IdempotencyStore {
         }
     }
 
-    /// Store the response that was just produced for this key. Called
-    /// only on the cache-miss path; replays don't re-store.
+    /// Record the response produced for a key this caller reserved. The
+    /// write only lands if the caller still owns the reservation
+    /// (`reservation_id` matches) — if a stale-lease takeover re-claimed
+    /// the key, this caller was superseded and the write is dropped
+    /// (logged) rather than clobbering the taker's result. Called only on
+    /// the reserve-`Won` path; replays don't re-store.
     pub fn store(
         &self,
         tenant_id: &str,
@@ -430,21 +444,34 @@ impl IdempotencyStore {
         request_digest: &str,
         response: CachedResponse,
         now: DateTime<Utc>,
+        reservation_id: &str,
     ) {
-        let entry = Entry {
-            request_digest: request_digest.to_string(),
-            response: response.clone(),
-            created_at: now,
-        };
         match &self.backend {
-            Backend::Memory(inner) => match inner.write() {
-                Ok(mut guard) => {
-                    guard.insert((tenant_id.to_string(), idempotency_key.to_string()), entry);
+            Backend::Memory(inner) => {
+                let mut guard = inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = (tenant_id.to_string(), idempotency_key.to_string());
+                let owns_or_absent = guard
+                    .get(&key)
+                    .map(|e| e.reservation_id == reservation_id)
+                    .unwrap_or(true);
+                if owns_or_absent {
+                    guard.insert(
+                        key,
+                        Entry {
+                            request_digest: request_digest.to_string(),
+                            response,
+                            created_at: now,
+                            reservation_id: String::new(),
+                        },
+                    );
+                } else {
+                    tracing::warn!(
+                        "idempotency store superseded by a takeover; response not cached"
+                    );
                 }
-                Err(err) => {
-                    tracing::error!(%err, "idempotency write lock poisoned");
-                }
-            },
+            }
             Backend::Sqlite(pool) => {
                 let conn = match pool.get() {
                     Ok(conn) => conn,
@@ -454,16 +481,22 @@ impl IdempotencyStore {
                     }
                 };
                 let body_str = String::from_utf8_lossy(&response.body_json).to_string();
-                if let Err(err) = conn.execute(
+                // Insert when absent; on conflict, complete (and clear the
+                // token) ONLY the reservation we still own — the `WHERE` on the
+                // upsert's UPDATE makes a superseded holder's write a no-op
+                // instead of clobbering the stale-lease taker's response.
+                match conn.execute(
                     "INSERT INTO idempotency \
                          (tenant_id, idempotency_key, request_digest, \
-                          response_status, response_body, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                          response_status, response_body, created_at, reservation_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, '') \
                      ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET \
                          request_digest = excluded.request_digest, \
                          response_status = excluded.response_status, \
                          response_body = excluded.response_body, \
-                         created_at = excluded.created_at",
+                         created_at = excluded.created_at, \
+                         reservation_id = '' \
+                     WHERE idempotency.reservation_id = ?7",
                     rusqlite::params![
                         tenant_id,
                         idempotency_key,
@@ -471,9 +504,15 @@ impl IdempotencyStore {
                         response.status as i64,
                         body_str,
                         now.to_rfc3339(),
+                        reservation_id,
                     ],
                 ) {
-                    tracing::error!(%err, "idempotency write failed");
+                    Ok(0) => tracing::warn!(
+                        tenant_id,
+                        "idempotency store superseded by a stale-lease takeover; response not cached"
+                    ),
+                    Ok(_) => {}
+                    Err(err) => tracing::error!(%err, "idempotency write failed"),
                 }
             }
         }
@@ -597,7 +636,7 @@ mod tests {
             status: 200,
             body_json: b"{\"ok\":true}".to_vec(),
         };
-        store.store("t1", "k1", &digest, resp.clone(), now);
+        store.store("t1", "k1", &digest, resp.clone(), now, "");
 
         // Second call with same body: replay carries the cached body.
         let outcome = store.lookup("t1", "k1", &digest, now);
@@ -623,6 +662,7 @@ mod tests {
                 body_json: b"{}".to_vec(),
             },
             now,
+            "",
         );
         let outcome = store.lookup("t1", "same-key", &d2, now);
         assert!(matches!(outcome, LookupOutcome::Conflict));
@@ -642,6 +682,7 @@ mod tests {
                 body_json: b"a".to_vec(),
             },
             now,
+            "",
         );
         let outcome = store.lookup("tenant_b", "k1", &d, now);
         assert!(matches!(outcome, LookupOutcome::Miss));
@@ -661,6 +702,7 @@ mod tests {
                 body_json: b"x".to_vec(),
             },
             now,
+            "",
         );
         // 2 seconds later — past TTL.
         let later = now + Duration::seconds(2);

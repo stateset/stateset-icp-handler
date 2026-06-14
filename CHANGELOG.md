@@ -37,7 +37,10 @@ and this project adheres to date-based ICP versioning — see
   blocked. `ICP_IDEMPOTENCY_LEASE_SECONDS` (default 60) bounds recovery when
   a claiming process dies — keep it above the slowest intent latency, since
   too short a lease could let a slow holder's key be re-claimed and executed
-  twice. The in-process lock remains as a same-process fast path.
+  twice. A per-reservation **fencing token** ensures a superseded (slow, not
+  dead) holder's later write becomes a detectable no-op rather than
+  clobbering the takeover worker's cached response. The in-process lock
+  remains as a same-process fast path.
 - **Conformance harness now exercises idempotency (spec §13).** The
   `icp-conformance` suite gained two checks — a same-key+body retry must
   replay (`Idempotent-Replayed: true`, same transaction), and a same-key
