@@ -119,6 +119,18 @@ lazy_static! {
     )
     .expect("register icp_idempotency_pruned_total");
 
+    /// Stale-lease reservation takeovers: a worker found another worker's
+    /// reservation expired and re-claimed it, then the original (slow, not
+    /// dead) holder's write was rejected by the fencing token. A NON-ZERO
+    /// rate means the idempotency lease is too short relative to real intent
+    /// latency — the regime where a double-execute can occur. Alert on it
+    /// and raise ICP_IDEMPOTENCY_LEASE_SECONDS.
+    pub static ref IDEMPOTENCY_TAKEOVERS: IntCounter = register_int_counter!(
+        "icp_idempotency_reservation_takeovers_total",
+        "Idempotency reservation writes rejected because a stale-lease takeover superseded them."
+    )
+    .expect("register icp_idempotency_reservation_takeovers_total");
+
     /// Idempotency sweeper liveness signal — bumped on every
     /// sweeper tick, including no-op ticks. Alert on
     /// rate-of-change dropping.
@@ -172,6 +184,13 @@ pub fn record_intent(intent: &str, outcome: &str) {
 /// Bump the per-outcome webhook delivery counter.
 pub fn record_webhook_delivery(outcome: &str) {
     WEBHOOK_DELIVERIES.with_label_values(&[outcome]).inc();
+}
+
+/// Record that an idempotency write was rejected by the fencing token
+/// because a stale-lease takeover superseded it. A non-zero rate signals
+/// the lease is too short for real intent latency (double-execute risk).
+pub fn record_idempotency_takeover() {
+    IDEMPOTENCY_TAKEOVERS.inc();
 }
 
 /// Bump the worker tick counter and refresh the queue-depth gauge

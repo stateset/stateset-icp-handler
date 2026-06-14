@@ -467,6 +467,7 @@ impl IdempotencyStore {
                         },
                     );
                 } else {
+                    crate::metrics::record_idempotency_takeover();
                     tracing::warn!(
                         "idempotency store superseded by a takeover; response not cached"
                     );
@@ -507,10 +508,13 @@ impl IdempotencyStore {
                         reservation_id,
                     ],
                 ) {
-                    Ok(0) => tracing::warn!(
-                        tenant_id,
-                        "idempotency store superseded by a stale-lease takeover; response not cached"
-                    ),
+                    Ok(0) => {
+                        crate::metrics::record_idempotency_takeover();
+                        tracing::warn!(
+                            tenant_id,
+                            "idempotency store superseded by a stale-lease takeover; response not cached"
+                        );
+                    }
                     Ok(_) => {}
                     Err(err) => tracing::error!(%err, "idempotency write failed"),
                 }

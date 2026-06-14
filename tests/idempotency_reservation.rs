@@ -174,7 +174,9 @@ fn superseded_holder_cannot_overwrite_the_takers_response() {
         &b_token,
     );
 
-    // A finally finishes and tries to store with its stale token — no-op.
+    // A finally finishes and tries to store with its stale token — no-op,
+    // and the takeover metric must record the rejected write.
+    let takeovers_before = stateset_icp_handler::metrics::IDEMPOTENCY_TAKEOVERS.get();
     a.store(
         "t",
         "k",
@@ -182,6 +184,10 @@ fn superseded_holder_cannot_overwrite_the_takers_response() {
         completed(br#"{"winner":"A"}"#),
         later,
         &a_token,
+    );
+    assert!(
+        stateset_icp_handler::metrics::IDEMPOTENCY_TAKEOVERS.get() > takeovers_before,
+        "a superseded write must bump the takeover metric"
     );
 
     // The cache holds B's response, not A's.
