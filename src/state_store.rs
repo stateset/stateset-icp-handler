@@ -59,7 +59,13 @@ where
         }
     }
 
-    fn insert(&self, id: &str, value: T) {
+    /// Insert/replace a row. `index` carries the denormalized metadata
+    /// columns (tenant_id, state, timestamps, …) the concrete store wants
+    /// kept alongside the JSON payload. They are written in the SAME UPSERT
+    /// as `payload_json`, so a concurrent reader/sweeper can never observe
+    /// a row whose index columns lag its payload — the previous two-step
+    /// (separate-connection) write had exactly that gap.
+    fn insert(&self, id: &str, value: T, index: &[(&'static str, String)]) {
         match &self.backend {
             JsonBackend::Memory(inner) => match inner.write() {
                 Ok(mut guard) => {
@@ -84,21 +90,33 @@ where
                         return;
                     }
                 };
+                // Base columns are id + payload_json; every index column is
+                // appended to the column list, the VALUES placeholders, and
+                // the ON CONFLICT SET clause. Column names are compile-time
+                // constants from our own code (never user input), so the
+                // format! interpolation is injection-safe.
+                let mut cols = String::from("id, payload_json");
+                let mut placeholders = String::from("?1, ?2");
+                let mut set = String::from("payload_json = excluded.payload_json");
+                for (i, (col, _)) in index.iter().enumerate() {
+                    cols.push_str(", ");
+                    cols.push_str(col);
+                    placeholders.push_str(&format!(", ?{}", i + 3));
+                    set.push_str(&format!(", {col} = excluded.{col}"));
+                }
                 let sql = format!(
-                    "INSERT INTO {table} (id, payload_json, updated_at) \
-                     VALUES (?1, ?2, ?3) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                         payload_json = excluded.payload_json, \
-                         updated_at = excluded.updated_at"
+                    "INSERT INTO {table} ({cols}) VALUES ({placeholders}) \
+                     ON CONFLICT(id) DO UPDATE SET {set}"
                 );
-                conn.execute(
-                    &sql,
-                    rusqlite::params![id, json, chrono::Utc::now().to_rfc3339()],
-                )
-                .unwrap_or_else(|err| {
-                    tracing::error!(table, id, %err, "store insert failed");
-                    0
-                });
+                let mut params: Vec<String> = Vec::with_capacity(2 + index.len());
+                params.push(id.to_string());
+                params.push(json);
+                params.extend(index.iter().map(|(_, v)| v.clone()));
+                conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+                    .unwrap_or_else(|err| {
+                        tracing::error!(table, id, %err, "store insert failed");
+                        0
+                    });
             }
         }
     }
@@ -133,9 +151,15 @@ where
         }
     }
 
-    fn update<F>(&self, id: &str, f: F) -> Option<T>
+    /// Read-modify-write a row. `index_of` derives the denormalized index
+    /// columns from the post-mutation value; they are written in the SAME
+    /// transaction as `payload_json` so the row's payload and index can
+    /// never diverge (the prior follow-up `UPDATE` on a separate connection
+    /// could fail or be observed mid-flight, leaving them inconsistent).
+    fn update<F, I>(&self, id: &str, f: F, index_of: I) -> Option<T>
     where
         F: FnOnce(&mut T),
+        I: FnOnce(&T) -> Vec<(&'static str, String)>,
     {
         match &self.backend {
             JsonBackend::Memory(inner) => {
@@ -185,12 +209,20 @@ where
                         return None;
                     }
                 };
-                let update_sql =
-                    format!("UPDATE {table} SET payload_json = ?1, updated_at = ?2 WHERE id = ?3");
-                if let Err(err) = tx.execute(
-                    &update_sql,
-                    rusqlite::params![updated, chrono::Utc::now().to_rfc3339(), id],
-                ) {
+                let index = index_of(&val);
+                // payload_json is ?1; index columns are ?2..; id is last.
+                let mut set = String::from("payload_json = ?1");
+                for (i, (col, _)) in index.iter().enumerate() {
+                    set.push_str(&format!(", {col} = ?{}", i + 2));
+                }
+                let id_placeholder = index.len() + 2;
+                let update_sql = format!("UPDATE {table} SET {set} WHERE id = ?{id_placeholder}");
+                let mut params: Vec<String> = Vec::with_capacity(index.len() + 2);
+                params.push(updated);
+                params.extend(index.iter().map(|(_, v)| v.clone()));
+                params.push(id.to_string());
+                if let Err(err) = tx.execute(&update_sql, rusqlite::params_from_iter(params.iter()))
+                {
                     tracing::error!(table, id, %err, "store update-write failed");
                     return None;
                 }
@@ -401,8 +433,8 @@ impl TransactionStore {
 
     pub fn insert(&self, txn: Transaction) {
         let id = txn.id.clone();
-        self.inner.insert(&id, txn.clone());
-        self.update_index_columns(&txn);
+        let index = Self::index_columns(&txn);
+        self.inner.insert(&id, txn, &index);
     }
 
     pub fn get(&self, id: &str) -> Option<Transaction> {
@@ -413,9 +445,25 @@ impl TransactionStore {
     where
         F: FnOnce(&mut Transaction),
     {
-        let updated = self.inner.update(id, f)?;
-        self.update_index_columns(&updated);
-        Some(updated)
+        self.inner.update(id, f, Self::index_columns)
+    }
+
+    /// Denormalized index columns kept alongside the JSON payload (spec
+    /// §8 list endpoints + the expiry sweeper read these instead of
+    /// scanning every payload). Written atomically with the payload.
+    fn index_columns(txn: &Transaction) -> Vec<(&'static str, String)> {
+        vec![
+            ("updated_at", txn.updated_at.to_rfc3339()),
+            ("tenant_id", txn.tenant_id.clone()),
+            ("created_at", txn.created_at.to_rfc3339()),
+            ("state", transaction_state_wire_name(txn.state).to_string()),
+            (
+                "quote_expires_at",
+                txn.quote_expires_at
+                    .map(|expires_at| expires_at.to_rfc3339())
+                    .unwrap_or_default(),
+            ),
+        ]
     }
 
     pub fn list(&self, limit: usize) -> Vec<Transaction> {
@@ -499,34 +547,6 @@ impl TransactionStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    fn update_index_columns(&self, txn: &Transaction) {
-        let JsonBackend::Sqlite { pool, .. } = &self.inner.backend else {
-            return;
-        };
-        let Ok(conn) = pool.get() else {
-            tracing::error!(id = %txn.id, "transaction index metadata update could not acquire pool connection");
-            return;
-        };
-        if let Err(err) = conn.execute(
-            "UPDATE transactions \
-             SET tenant_id = ?1, created_at = ?2, state = ?3, updated_at = ?4, \
-                 quote_expires_at = ?5 \
-             WHERE id = ?6",
-            rusqlite::params![
-                txn.tenant_id,
-                txn.created_at.to_rfc3339(),
-                transaction_state_wire_name(txn.state),
-                txn.updated_at.to_rfc3339(),
-                txn.quote_expires_at
-                    .map(|expires_at| expires_at.to_rfc3339())
-                    .unwrap_or_default(),
-                txn.id,
-            ],
-        ) {
-            tracing::error!(id = %txn.id, %err, "transaction index metadata update failed");
-        }
     }
 
     fn list_for_tenant_indexed(
@@ -662,8 +682,8 @@ impl SubscriptionStore {
 
     pub fn insert(&self, sub: Subscription) {
         let id = sub.id.clone();
-        self.inner.insert(&id, sub.clone());
-        self.update_index_columns(&sub);
+        let index = Self::index_columns(&sub);
+        self.inner.insert(&id, sub, &index);
     }
 
     pub fn get(&self, id: &str) -> Option<Subscription> {
@@ -674,9 +694,25 @@ impl SubscriptionStore {
     where
         F: FnOnce(&mut Subscription),
     {
-        let updated = self.inner.update(id, f)?;
-        self.update_index_columns(&updated);
-        Some(updated)
+        self.inner.update(id, f, Self::index_columns)
+    }
+
+    /// Denormalized index columns (tenant_id, status, charge schedule)
+    /// read by the subscription list endpoint and the renewal sweeper.
+    /// Written atomically with the JSON payload. `payment_present` is a
+    /// 0/1 flag; SQLite's INTEGER affinity converts the textual value.
+    fn index_columns(sub: &Subscription) -> Vec<(&'static str, String)> {
+        vec![
+            ("updated_at", sub.updated_at.to_rfc3339()),
+            ("tenant_id", sub.tenant_id.clone()),
+            ("created_at", sub.created_at.to_rfc3339()),
+            ("status", sub.status.wire_name().to_string()),
+            ("next_charge_at", sub.next_charge_at.to_rfc3339()),
+            (
+                "payment_present",
+                i64::from(sub.payment_instrument.is_some()).to_string(),
+            ),
+        ]
     }
 
     pub fn list(&self, limit: usize) -> Vec<Subscription> {
@@ -816,33 +852,6 @@ impl SubscriptionStore {
             }
         }
         counts
-    }
-
-    fn update_index_columns(&self, sub: &Subscription) {
-        let JsonBackend::Sqlite { pool, .. } = &self.inner.backend else {
-            return;
-        };
-        let Ok(conn) = pool.get() else {
-            tracing::error!(id = %sub.id, "subscription index metadata update could not acquire pool connection");
-            return;
-        };
-        if let Err(err) = conn.execute(
-            "UPDATE subscriptions \
-             SET tenant_id = ?1, created_at = ?2, status = ?3, updated_at = ?4, \
-                 next_charge_at = ?5, payment_present = ?6 \
-             WHERE id = ?7",
-            rusqlite::params![
-                sub.tenant_id,
-                sub.created_at.to_rfc3339(),
-                sub.status.wire_name(),
-                sub.updated_at.to_rfc3339(),
-                sub.next_charge_at.to_rfc3339(),
-                i64::from(sub.payment_instrument.is_some()),
-                sub.id,
-            ],
-        ) {
-            tracing::error!(id = %sub.id, %err, "subscription index metadata update failed");
-        }
     }
 
     fn list_due_for_renewal_indexed(
@@ -990,8 +999,8 @@ impl PeerQuoteStore {
 
     pub fn insert(&self, quote: PeerQuote) {
         let id = quote.id.clone();
-        self.inner.insert(&id, quote.clone());
-        self.update_index_columns(&quote);
+        let index = Self::index_columns(&quote);
+        self.inner.insert(&id, quote, &index);
     }
 
     pub fn get(&self, id: &str) -> Option<PeerQuote> {
@@ -1002,9 +1011,20 @@ impl PeerQuoteStore {
     where
         F: FnOnce(&mut PeerQuote),
     {
-        let updated = self.inner.update(id, f)?;
-        self.update_index_columns(&updated);
-        Some(updated)
+        self.inner.update(id, f, Self::index_columns)
+    }
+
+    /// Denormalized index columns (tenant_id, status, expiry) read by the
+    /// peer-quote list endpoint and the expiry sweeper. Written atomically
+    /// with the JSON payload.
+    fn index_columns(quote: &PeerQuote) -> Vec<(&'static str, String)> {
+        vec![
+            ("updated_at", quote.updated_at.to_rfc3339()),
+            ("tenant_id", quote.tenant_id.clone()),
+            ("created_at", quote.created_at.to_rfc3339()),
+            ("status", quote.status.wire_name().to_string()),
+            ("expires_at", quote.expires_at.to_rfc3339()),
+        ]
     }
 
     pub fn len(&self) -> usize {
@@ -1090,32 +1110,6 @@ impl PeerQuoteStore {
         all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         all.truncate(limit);
         all
-    }
-
-    fn update_index_columns(&self, quote: &PeerQuote) {
-        let JsonBackend::Sqlite { pool, .. } = &self.inner.backend else {
-            return;
-        };
-        let Ok(conn) = pool.get() else {
-            tracing::error!(id = %quote.id, "peer quote index metadata update could not acquire pool connection");
-            return;
-        };
-        if let Err(err) = conn.execute(
-            "UPDATE peer_quotes \
-             SET tenant_id = ?1, created_at = ?2, status = ?3, updated_at = ?4, \
-                 expires_at = ?5 \
-             WHERE id = ?6",
-            rusqlite::params![
-                quote.tenant_id,
-                quote.created_at.to_rfc3339(),
-                quote.status.wire_name(),
-                quote.updated_at.to_rfc3339(),
-                quote.expires_at.to_rfc3339(),
-                quote.id,
-            ],
-        ) {
-            tracing::error!(id = %quote.id, %err, "peer quote index metadata update failed");
-        }
     }
 
     fn list_due_for_expiry_indexed(
