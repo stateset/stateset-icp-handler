@@ -44,6 +44,67 @@ async fn rpc(app: &Router, req_body: Value) -> (StatusCode, Value) {
 // --------------------------------------------------------------------------
 
 #[tokio::test]
+async fn mcp_tools_call_is_tenant_rate_limited() {
+    // The MCP surface previously bypassed the tenant rate limiter that the
+    // HTTP/gRPC front doors apply, letting a client drive unlimited
+    // (including state-changing) intents. With a per-key cap of 1, the
+    // second tools/call in the same window must be rejected.
+    let app = setup(|cfg| {
+        cfg.enable_demo_keys = false;
+        cfg.api_keys_json = Some(
+            json!([{
+                "key": "k_rl",
+                "tenant_id": "tenant_rl",
+                "name": "RL",
+                "rate_limit_per_minute": 1
+            }])
+            .to_string(),
+        );
+    })
+    .await;
+
+    async fn call_as(app: &Router, bearer: &str, id: i64) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": "icp_quote",
+                "arguments": {
+                    "items": [{ "sku": "W-1", "quantity": 1,
+                                "unit_price_hint": { "amount_minor": 100, "currency": "USD" } }],
+                    "currency": "USD"
+                }
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    let first = call_as(&app, "k_rl", 1).await;
+    assert_eq!(
+        first["result"]["isError"], false,
+        "first call within the limit should succeed"
+    );
+
+    let second = call_as(&app, "k_rl", 2).await;
+    assert_eq!(
+        second["result"]["isError"], true,
+        "second call must be rate-limited"
+    );
+    assert_eq!(
+        second["result"]["structuredContent"]["error"]["code"], "rate_limited",
+        "rate-limit rejection must surface the rate_limited error code"
+    );
+}
+
+#[tokio::test]
 async fn mcp_initialize_returns_capabilities() {
     let app = setup(|_| {}).await;
     let (status, body) = rpc(
@@ -214,6 +275,37 @@ async fn mcp_full_flow_quote_authorize_buy_through_tool_calls() {
         "completed"
     );
     assert_eq!(buy_body["result"]["isError"], false);
+
+    // 4. Retry the buy — a duplicate MCP tool call must replay the
+    // original capture (still completed, not an error) rather than
+    // re-entering intent.buy on an already-completed txn (which would
+    // surface isError=true). Guards against MCP-surface double-charge.
+    let (_s, retry_body) = rpc(
+        &app,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "icp_buy",
+                "arguments": {
+                    "transaction_id": txn_id,
+                    "payment": { "method": "card", "token": "tok_demo" }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        retry_body["result"]["isError"], false,
+        "retried MCP buy must replay, not error"
+    );
+    assert_eq!(
+        retry_body["result"]["structuredContent"]["transaction"]["state"],
+        "completed"
+    );
+    assert_eq!(
+        retry_body["result"]["structuredContent"], buy_body["result"]["structuredContent"],
+        "retry must return the original capture (no double-charge)"
+    );
 }
 
 #[tokio::test]

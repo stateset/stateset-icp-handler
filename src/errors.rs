@@ -166,6 +166,15 @@ impl ApiError {
         matches!(self, Self::RateLimited | Self::EngineUnavailable(_))
     }
 
+    /// Like [`into_body`](Self::into_body) but correlates the error to the
+    /// failing intent by stamping `error.intent_id` (spec §12). Empty /
+    /// absent ids are left unset so the field stays omitted.
+    pub fn into_body_with_intent_id(self, intent_id: Option<String>) -> (StatusCode, ApiErrorBody) {
+        let (status, mut body) = self.into_body();
+        body.error.intent_id = intent_id.filter(|s| !s.is_empty());
+        (status, body)
+    }
+
     pub fn into_body(self) -> (StatusCode, ApiErrorBody) {
         let (type_, code, status) = self.code_and_status();
         let message = self.message();

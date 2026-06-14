@@ -125,6 +125,54 @@ async fn same_key_same_body_replays_cached_response() {
 }
 
 #[tokio::test]
+async fn client_intent_id_dedups_without_an_explicit_key() {
+    // Spec §7.4 / §15.2: an intent is idempotent under (agent_id,
+    // intent_id) even with no ICP-Idempotency-Key header. A retry that
+    // carries the same client-chosen intent_id must replay, not
+    // re-execute.
+    let app = setup().await;
+    let mut body = quote_body(1500);
+    body["intent_id"] = json!("int_client_fixed_1");
+
+    let (s1, h1, b1) = send(&app, body.clone(), &[]).await;
+    assert_eq!(s1, StatusCode::OK);
+    assert!(
+        h1.get("idempotent-replayed").is_none(),
+        "first call is fresh"
+    );
+
+    let (s2, h2, b2) = send(&app, body, &[]).await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        h2.get("idempotent-replayed").unwrap().to_str().unwrap(),
+        "true",
+        "same intent_id must replay even without an explicit idempotency key"
+    );
+    assert_eq!(
+        b2["transaction"]["id"], b1["transaction"]["id"],
+        "intent_id replay returns the original transaction"
+    );
+    assert_eq!(b2, b1);
+}
+
+#[tokio::test]
+async fn different_intent_ids_do_not_collide() {
+    let app = setup().await;
+    let mut a = quote_body(500);
+    a["intent_id"] = json!("int_a");
+    let mut b = quote_body(500);
+    b["intent_id"] = json!("int_b");
+    let (_, ha, ba) = send(&app, a, &[]).await;
+    let (_, hb, bb) = send(&app, b, &[]).await;
+    assert!(ha.get("idempotent-replayed").is_none());
+    assert!(hb.get("idempotent-replayed").is_none());
+    assert_ne!(
+        ba["transaction"]["id"], bb["transaction"]["id"],
+        "distinct intent_ids must produce distinct transactions"
+    );
+}
+
+#[tokio::test]
 async fn same_key_different_body_returns_409_idempotency_conflict() {
     let app = setup().await;
     let (s1, _, _) = send(&app, quote_body(1000), &[("ICP-Idempotency-Key", "k1")]).await;

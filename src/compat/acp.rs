@@ -191,7 +191,7 @@ pub async fn create_session(
         "ship_to": ship_to,
     });
 
-    let quote_body = run_intent(&state, &ctx, "intent.quote", params).await?;
+    let quote_body = run_intent(&state, &ctx, "intent.quote", params, None).await?;
     let txn = quote_body["transaction"].clone();
 
     // Store the ACP session_id ↔ txn_id mapping under external_refs.
@@ -201,6 +201,7 @@ pub async fn create_session(
         StatusCode::CREATED,
         &ctx.request_id,
         session_view(&txn, &state.config.public_base_url),
+        Some(&quote_body),
     ))
 }
 
@@ -223,6 +224,7 @@ pub async fn get_session(
         StatusCode::OK,
         &ctx.request_id,
         session_view(&v, &state.config.public_base_url),
+        None,
     ))
 }
 
@@ -247,12 +249,16 @@ pub async fn update_session(
         params["ship_to"] = serde_json::to_value(addr)?;
     }
 
-    let body_val = run_intent(&state, &ctx, "intent.authorize", params).await?;
+    // ACP updates are merges — intentionally callable multiple times with
+    // different bodies — so this path is NOT idempotency-keyed (doing so
+    // would 409 a legitimate second merge).
+    let body_val = run_intent(&state, &ctx, "intent.authorize", params, None).await?;
     let txn = body_val["transaction"].clone();
     Ok(acp_response(
         StatusCode::OK,
         &ctx.request_id,
         session_view(&txn, &state.config.public_base_url),
+        Some(&body_val),
     ))
 }
 
@@ -283,13 +289,22 @@ pub async fn complete_session(
         })),
     });
 
-    let body_val = run_intent(&state, &ctx, "intent.buy", params).await?;
+    // The complete (buy) step is the charge — guard it so a network retry
+    // replays the original capture instead of double-charging (spec §13).
+    // Keyed on the session id, which is stable across retries.
+    let idem_key = format!("acp:complete:{id}");
+    let body_val = run_intent(&state, &ctx, "intent.buy", params, Some(&idem_key)).await?;
     let txn = body_val["transaction"].clone();
     let order = body_val.get("order").cloned();
 
     let mut view = session_view(&txn, &state.config.public_base_url);
     view.order = order.filter(|v| !v.is_null());
-    Ok(acp_response(StatusCode::OK, &ctx.request_id, view))
+    Ok(acp_response(
+        StatusCode::OK,
+        &ctx.request_id,
+        view,
+        Some(&body_val),
+    ))
 }
 
 pub async fn cancel_session(
@@ -299,12 +314,14 @@ pub async fn cancel_session(
 ) -> Result<impl IntoResponse, ApiError> {
     let ctx = build_context(&state, &headers)?;
     let params = json!({ "transaction_id": id });
-    let body_val = run_intent(&state, &ctx, "intent.return", params).await?;
+    let idem_key = format!("acp:cancel:{id}");
+    let body_val = run_intent(&state, &ctx, "intent.return", params, Some(&idem_key)).await?;
     let txn = body_val["transaction"].clone();
     Ok(acp_response(
         StatusCode::OK,
         &ctx.request_id,
         session_view(&txn, &state.config.public_base_url),
+        Some(&body_val),
     ))
 }
 
@@ -374,6 +391,7 @@ async fn run_intent(
     ctx: &CompatContext,
     intent: &str,
     params: Value,
+    idempotency_key: Option<&str>,
 ) -> Result<Value, ApiError> {
     let envelope = IntentEnvelope {
         intent: intent.to_string(),
@@ -391,8 +409,11 @@ async fn run_intent(
         ctx.request_id.clone(),
         ctx.trace_id.clone(),
     );
-    let body = state.service.handle_intent(input).await?;
-    Ok(serde_json::to_value(body)?)
+    let execution = state
+        .service
+        .handle_intent_idempotent(input, idempotency_key)
+        .await?;
+    Ok(serde_json::to_value(execution.body)?)
 }
 
 fn map_buyer(b: AcpBuyer) -> IcpBuyer {
@@ -532,18 +553,31 @@ fn stamp_external_ref(state: &AppState, txn: &Value, key: &str) {
     });
 }
 
+/// Build an ACP response. When `receipt_src` is the intent body produced
+/// by a state-changing intent, its signed receipt is surfaced via the
+/// spec-required `ICP-Receipt` / `ICP-Receipt-Kid` headers (§4) so a
+/// receipt-verifying ACP client finds them on the compat surface too.
+/// Pass `None` for pure reads (no receipt to stamp).
 fn acp_response(
     status: StatusCode,
     request_id: &str,
     view: SessionView,
-) -> (StatusCode, [(&'static str, HeaderValue); 2], Json<Value>) {
-    let api_version = HeaderValue::from_static(ACP_API_VERSION);
-    let req_id = HeaderValue::from_str(request_id).unwrap_or(HeaderValue::from_static("unknown"));
-    (
+    receipt_src: Option<&Value>,
+) -> axum::response::Response {
+    let mut response = (
         status,
-        [("api-version", api_version), ("request-id", req_id)],
         Json(serde_json::to_value(view).unwrap_or(Value::Null)),
     )
+        .into_response();
+    let h = response.headers_mut();
+    h.insert("api-version", HeaderValue::from_static(ACP_API_VERSION));
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        h.insert("request-id", v);
+    }
+    if let Some(src) = receipt_src {
+        crate::handlers::stamp_receipt_headers(h, src);
+    }
+    response
 }
 
 // Silence an unused-import warning on `TransactionState` until we use it

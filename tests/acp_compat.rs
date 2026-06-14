@@ -163,6 +163,67 @@ async fn acp_full_session_lifecycle_create_update_complete() {
 }
 
 #[tokio::test]
+async fn acp_complete_retry_is_idempotent_and_stamps_receipt_header() {
+    // A retried `/complete` is the canonical double-charge risk on the
+    // ACP surface: ChatGPT-style clients retry network failures. The
+    // second call must REPLAY the original capture (same order, status
+    // 200) rather than re-entering intent.buy (which would 412 on an
+    // already-completed transaction). Also asserts the §4 ICP-Receipt
+    // response header is surfaced on the compat completion.
+    let app = setup(|_| {}).await;
+
+    let (_s, _h, created) =
+        send_json(&app, "POST", "/checkout_sessions", Some(create_body())).await;
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    send_json(
+        &app,
+        "POST",
+        &format!("/checkout_sessions/{session_id}"),
+        Some(json!({ "buyer": { "email": "alice@example.com" } })),
+    )
+    .await;
+
+    let complete_body = json!({
+        "payment_data": { "token": "vault_tok_demo_abc123", "provider": "stripe_delegated" }
+    });
+
+    let (s1, h1, b1) = send_json(
+        &app,
+        "POST",
+        &format!("/checkout_sessions/{session_id}/complete"),
+        Some(complete_body.clone()),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(b1["status"], "completed");
+    assert!(
+        h1.get("icp-receipt").is_some(),
+        "completion must stamp the ICP-Receipt header (spec §4)"
+    );
+    assert!(h1.get("icp-receipt-kid").is_some());
+
+    // Retry — must replay, not re-execute.
+    let (s2, _h2, b2) = send_json(
+        &app,
+        "POST",
+        &format!("/checkout_sessions/{session_id}/complete"),
+        Some(complete_body),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "retried complete must replay (not 412 re-enter the pipeline)"
+    );
+    assert_eq!(b2["status"], "completed");
+    assert_eq!(
+        b2, b1,
+        "retry must return the byte-identical original response, proving replay (no double-charge)"
+    );
+}
+
+#[tokio::test]
 async fn acp_get_session_returns_current_state() {
     let app = setup(|_| {}).await;
     let (_s, _h, created) =

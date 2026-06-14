@@ -95,6 +95,12 @@ pub struct IntentInput<'a> {
     /// compatibility paths, which treat the tenant's bearer token as a
     /// self-mandate scoped to that merchant.
     pub skip_mandate_check: bool,
+    /// When true, the caller has already applied the tenant rate limit
+    /// (and emitted the `x-ratelimit-*` headers), so the service must not
+    /// double-count. The HTTP and gRPC front doors set this; the compat /
+    /// MCP surfaces leave it false so the service enforces the limit for
+    /// them — making rate limiting safe-by-default for any new transport.
+    pub skip_rate_limit: bool,
 }
 
 impl<'a> IntentInput<'a> {
@@ -116,6 +122,9 @@ impl<'a> IntentInput<'a> {
             request_id,
             trace_id,
             skip_mandate_check: false,
+            // HTTP / gRPC apply the tenant rate limit at the front door
+            // (with response headers) before calling the service.
+            skip_rate_limit: true,
         }
     }
 
@@ -136,18 +145,27 @@ impl<'a> IntentInput<'a> {
             request_id,
             trace_id,
             skip_mandate_check: true,
+            // Compat / MCP surfaces don't pre-check; the service enforces
+            // the tenant rate limit for them.
+            skip_rate_limit: false,
         }
     }
 }
 
+/// Outcome of an idempotency-guarded intent execution.
+pub struct IntentExecution {
+    pub body: IntentResponseBody,
+    /// True when the body was served from the idempotency cache rather
+    /// than freshly executed — callers stamp `Idempotent-Replayed: true`.
+    pub replayed: bool,
+}
+
 impl IcpService {
     pub fn new(config: Config, engine: Option<CommerceEngine>, signer: ReceiptSigner) -> Self {
-        Self::with_resolver(
-            config,
-            engine,
-            signer,
-            Arc::new(CompositeResolver::default_set()),
-        )
+        let resolver = Arc::new(CompositeResolver::default_set_with_options(
+            config.allow_insecure_urls,
+        ));
+        Self::with_resolver(config, engine, signer, resolver)
     }
 
     pub fn with_resolver(
@@ -221,6 +239,13 @@ impl IcpService {
                 .operation_locks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Drop locks no caller is holding. While a guard is alive the
+            // `Arc` strong count is >= 2 (one in the map, one in the live
+            // `OwnedMutexGuard`); once released it falls to 1, so a count
+            // of 1 means the entry is idle and safe to evict. Without this
+            // the map grows by one `Arc<AsyncMutex>` per distinct
+            // idempotency key forever — an unbounded per-request leak.
+            guard.retain(|_, lock| Arc::strong_count(lock) > 1);
             guard
                 .entry(key)
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
@@ -312,6 +337,7 @@ impl IcpService {
                         helpers::estimate_intent_amount_minor(&input.envelope),
                         Utc::now(),
                         &input.tenant.tenant_id,
+                        input.envelope.context.jurisdiction.as_deref(),
                         &self.mandates,
                         resolver,
                     )
@@ -465,6 +491,102 @@ impl IcpService {
         self.events.emit(event);
 
         Ok(body)
+    }
+
+    /// Execute an intent under idempotency protection shared by every
+    /// transport (the first-class HTTP path *and* the ACP/UCP compat
+    /// surfaces). The effective dedup key is `explicit_key` when present,
+    /// otherwise the client-supplied `intent_id` — spec §7.4/§15.2 make an
+    /// intent idempotent under `(agent_id, intent_id)`, independent of the
+    /// optional `ICP-Idempotency-Key` header. With neither key there is
+    /// nothing stable to dedup on, so the intent runs unguarded.
+    ///
+    /// Centralizing this here is what closes the double-charge gap on the
+    /// compat paths, which previously called `handle_intent` directly and
+    /// re-executed on every network retry.
+    pub async fn handle_intent_idempotent(
+        &self,
+        input: IntentInput<'_>,
+        explicit_key: Option<&str>,
+    ) -> Result<IntentExecution, ApiError> {
+        // Enforce the tenant rate limit for surfaces that don't pre-check at
+        // their front door (compat ACP/UCP, MCP). HTTP and gRPC set
+        // `skip_rate_limit` because they already applied it (and emitted the
+        // `x-ratelimit-*` headers). Gating here means a newly-added transport
+        // is rate-limited by default rather than silently uncapped.
+        if !input.skip_rate_limit {
+            if let crate::rate_limit::RateLimitDecision::Denied { .. } =
+                self.check_tenant_rate_limit(&input.tenant).await?
+            {
+                return Err(ApiError::RateLimited);
+            }
+        }
+
+        let effective_key: Option<String> = match explicit_key {
+            Some(k) if !k.is_empty() => Some(k.to_string()),
+            _ => input
+                .envelope
+                .intent_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|id| format!("intent:{}:{id}", input.agent.raw)),
+        };
+
+        let Some(key) = effective_key else {
+            let body = self.handle_intent(input).await?;
+            return Ok(IntentExecution {
+                body,
+                replayed: false,
+            });
+        };
+
+        let tenant_id = input.tenant.tenant_id.clone();
+        // Match retries by semantic (JCS-canonicalized) request equality,
+        // so a reused key with a different body is a 409 conflict.
+        let canonical = serde_jcs::to_vec(&input.envelope)
+            .map_err(|e| ApiError::ProcessingError(format!("jcs: {e}")))?;
+        let digest = crate::idempotency::IdempotencyStore::digest_request(&canonical);
+
+        // Hold the per-key lock across lookup→execute→store so two
+        // concurrent retries on the same instance can't both execute.
+        let _guard = self.lock_idempotency_key(&tenant_id, &key).await;
+        match self
+            .idempotency
+            .lookup(&tenant_id, &key, &digest, Utc::now())
+        {
+            crate::idempotency::LookupOutcome::Replay(cached) => {
+                let body: IntentResponseBody = serde_json::from_slice(&cached.body_json)
+                    .map_err(|e| ApiError::ProcessingError(format!("cached response JSON: {e}")))?;
+                Ok(IntentExecution {
+                    body,
+                    replayed: true,
+                })
+            }
+            crate::idempotency::LookupOutcome::Conflict => {
+                Err(ApiError::IdempotencyConflict(format!(
+                    "idempotency key `{key}` was used previously with a different request body"
+                )))
+            }
+            crate::idempotency::LookupOutcome::Miss => {
+                let body = self.handle_intent(input).await?;
+                let body_bytes = serde_json::to_vec(&body)
+                    .map_err(|e| ApiError::ProcessingError(format!("serialize for cache: {e}")))?;
+                self.idempotency.store(
+                    &tenant_id,
+                    &key,
+                    &digest,
+                    crate::idempotency::CachedResponse {
+                        status: 200,
+                        body_json: body_bytes,
+                    },
+                    Utc::now(),
+                );
+                Ok(IntentExecution {
+                    body,
+                    replayed: false,
+                })
+            }
+        }
     }
 
     /// Return true when an in-process event belongs to `tenant_id`.

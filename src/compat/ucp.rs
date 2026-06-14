@@ -257,7 +257,7 @@ pub async fn create_checkout(
     let mut envelope = base_envelope(&ctx, "intent.quote", params);
     envelope.context.currency = Some(body.currency.clone());
 
-    let quote_body = run_with_envelope(&state, &ctx, envelope).await?;
+    let quote_body = run_with_envelope(&state, &ctx, envelope, None).await?;
     let txn = quote_body["transaction"].clone();
     stamp_external_ref(&state, &txn, "ucp_session_id");
 
@@ -265,6 +265,7 @@ pub async fn create_checkout(
         StatusCode::CREATED,
         &ctx.request_id,
         checkout_response(&txn, &state.config.public_base_url),
+        Some(&quote_body),
     ))
 }
 
@@ -287,6 +288,7 @@ pub async fn get_checkout(
         StatusCode::OK,
         &ctx.request_id,
         checkout_response(&v, &state.config.public_base_url),
+        None,
     ))
 }
 
@@ -309,12 +311,15 @@ pub async fn update_checkout(
         params["ship_to"] = serde_json::to_value(addr)?;
     }
 
-    let body_val = run_intent(&state, &ctx, "intent.authorize", params).await?;
+    // Merge update — intentionally repeatable with differing bodies, so
+    // not idempotency-keyed (keying would 409 a legitimate second merge).
+    let body_val = run_intent(&state, &ctx, "intent.authorize", params, None).await?;
     let txn = body_val["transaction"].clone();
     Ok(ucp_response(
         StatusCode::OK,
         &ctx.request_id,
         checkout_response(&txn, &state.config.public_base_url),
+        Some(&body_val),
     ))
 }
 
@@ -349,13 +354,21 @@ pub async fn complete_checkout(
     };
 
     let params = json!({ "transaction_id": id, "payment": payment });
-    let body_val = run_intent(&state, &ctx, "intent.buy", params).await?;
+    // The complete (buy) step is the charge — guard against double-charge
+    // on retry (spec §13), keyed on the stable session id.
+    let idem_key = format!("ucp:complete:{id}");
+    let body_val = run_intent(&state, &ctx, "intent.buy", params, Some(&idem_key)).await?;
     let txn = body_val["transaction"].clone();
     let order = body_val.get("order").cloned();
 
     let mut resp = checkout_response(&txn, &state.config.public_base_url);
     resp.order = order.filter(|v| !v.is_null());
-    Ok(ucp_response(StatusCode::OK, &ctx.request_id, resp))
+    Ok(ucp_response(
+        StatusCode::OK,
+        &ctx.request_id,
+        resp,
+        Some(&body_val),
+    ))
 }
 
 pub async fn cancel_checkout(
@@ -365,12 +378,14 @@ pub async fn cancel_checkout(
 ) -> Result<impl IntoResponse, ApiError> {
     let ctx = build_context(&state, &headers)?;
     let params = json!({ "transaction_id": id });
-    let body_val = run_intent(&state, &ctx, "intent.return", params).await?;
+    let idem_key = format!("ucp:cancel:{id}");
+    let body_val = run_intent(&state, &ctx, "intent.return", params, Some(&idem_key)).await?;
     let txn = body_val["transaction"].clone();
     Ok(ucp_response(
         StatusCode::OK,
         &ctx.request_id,
         checkout_response(&txn, &state.config.public_base_url),
+        Some(&body_val),
     ))
 }
 
@@ -484,14 +499,22 @@ async fn run_intent(
     ctx: &CompatContext,
     intent: &str,
     params: Value,
+    idempotency_key: Option<&str>,
 ) -> Result<Value, ApiError> {
-    run_with_envelope(state, ctx, base_envelope(ctx, intent, params)).await
+    run_with_envelope(
+        state,
+        ctx,
+        base_envelope(ctx, intent, params),
+        idempotency_key,
+    )
+    .await
 }
 
 async fn run_with_envelope(
     state: &AppState,
     ctx: &CompatContext,
     envelope: IntentEnvelope,
+    idempotency_key: Option<&str>,
 ) -> Result<Value, ApiError> {
     let input = IntentInput::for_compat(
         envelope,
@@ -500,8 +523,11 @@ async fn run_with_envelope(
         ctx.request_id.clone(),
         ctx.trace_id.clone(),
     );
-    let body = state.service.handle_intent(input).await?;
-    Ok(serde_json::to_value(body)?)
+    let execution = state
+        .service
+        .handle_intent_idempotent(input, idempotency_key)
+        .await?;
+    Ok(serde_json::to_value(execution.body)?)
 }
 
 fn map_buyer(b: UcpBuyer) -> IcpBuyer {
@@ -689,16 +715,27 @@ fn stamp_external_ref(state: &AppState, txn: &Value, key: &str) {
     });
 }
 
+/// Build a UCP response. `receipt_src` (the intent body from a
+/// state-changing intent) surfaces the signed receipt via the §4
+/// `ICP-Receipt` / `ICP-Receipt-Kid` headers; pass `None` for reads.
 fn ucp_response(
     status: StatusCode,
     request_id: &str,
     view: CheckoutResponse,
-) -> (StatusCode, [(&'static str, HeaderValue); 2], Json<Value>) {
-    let ucp_version = HeaderValue::from_static(UCP_VERSION);
-    let req_id = HeaderValue::from_str(request_id).unwrap_or(HeaderValue::from_static("unknown"));
-    (
+    receipt_src: Option<&Value>,
+) -> axum::response::Response {
+    let mut response = (
         status,
-        [("ucp-version", ucp_version), ("request-id", req_id)],
         Json(serde_json::to_value(view).unwrap_or(Value::Null)),
     )
+        .into_response();
+    let h = response.headers_mut();
+    h.insert("ucp-version", HeaderValue::from_static(UCP_VERSION));
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        h.insert("request-id", v);
+    }
+    if let Some(src) = receipt_src {
+        crate::handlers::stamp_receipt_headers(h, src);
+    }
+    response
 }

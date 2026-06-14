@@ -13,15 +13,11 @@ use uuid::Uuid;
 
 use crate::constants::headers;
 use crate::errors::ApiError;
-use crate::idempotency::{CachedResponse, IdempotencyStore, LookupOutcome};
 use crate::models::IntentEnvelope;
 use crate::service::IntentInput;
 use crate::AppState;
 
-use super::{
-    client_ip_for_rate_limit, ensure_agent_allowed, resolve_agent, resolve_tenant,
-    stamp_receipt_headers,
-};
+use super::{client_ip_for_rate_limit, ensure_agent_allowed, resolve_agent, resolve_tenant};
 
 #[utoipa::path(
     post,
@@ -148,7 +144,11 @@ pub async fn submit_intent(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // Idempotency (ICP spec §13).
+    // Idempotency (ICP spec §13). The optional `ICP-Idempotency-Key`
+    // takes precedence; absent it the service falls back to
+    // `(agent_id, intent_id)` per §7.4. Both are enforced in the service
+    // layer (`handle_intent_idempotent`) so the ACP/UCP compat surfaces
+    // inherit the same double-charge protection.
     let idempotency_key = headers
         .get(headers::ICP_IDEMPOTENCY_KEY)
         .and_then(|v| v.to_str().ok())
@@ -159,60 +159,9 @@ pub async fn submit_intent(
         ));
     }
 
-    // Hash the JCS-canonicalized envelope so retries are matched by
-    // *semantic* equivalence, not by raw byte equality.
-    let canonical =
-        serde_jcs::to_vec(&envelope).map_err(|e| ApiError::ProcessingError(format!("jcs: {e}")))?;
-    let request_digest = IdempotencyStore::digest_request(&canonical);
-
-    let tenant_id = tenant.tenant_id.clone();
-    let _idempotency_guard = if let Some(key) = idempotency_key.as_deref() {
-        Some(state.service.lock_idempotency_key(&tenant_id, key).await)
-    } else {
-        None
-    };
-    if let Some(key) = idempotency_key.as_deref() {
-        let outcome =
-            state
-                .service
-                .idempotency
-                .lookup(&tenant_id, key, &request_digest, chrono::Utc::now());
-        match outcome {
-            LookupOutcome::Replay(body) => {
-                let status =
-                    http::StatusCode::from_u16(body.status).unwrap_or(http::StatusCode::OK);
-                let body_json: serde_json::Value = serde_json::from_slice(&body.body_json)
-                    .map_err(|e| ApiError::ProcessingError(format!("cached response JSON: {e}")))?;
-                let mut response = (status, Json(body_json.clone())).into_response();
-                let h = response.headers_mut();
-                h.insert(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("application/json"),
-                );
-                stamp_receipt_headers(h, &body_json);
-                h.insert(
-                    "idempotent-replayed",
-                    http::HeaderValue::from_static("true"),
-                );
-                if let Ok(v) = http::HeaderValue::from_str(key) {
-                    h.insert("idempotent-key", v);
-                }
-                // Surface the *current* rate-limit window state on the
-                // replay too — the cached response is logically the
-                // same intent but the rate counter has moved on.
-                for (name, value) in &rl_headers {
-                    h.insert(name.clone(), value.clone());
-                }
-                return Ok(response);
-            }
-            LookupOutcome::Conflict => {
-                return Err(ApiError::IdempotencyConflict(format!(
-                    "ICP-Idempotency-Key `{key}` was used previously with a different request body"
-                )));
-            }
-            LookupOutcome::Miss => {}
-        }
-    }
+    // Captured before the envelope moves into the input so a failing
+    // intent can correlate its error to the request (spec §12).
+    let intent_id_for_error = envelope.intent_id.clone();
 
     let input = IntentInput::for_icp(
         envelope,
@@ -224,28 +173,22 @@ pub async fn submit_intent(
     );
 
     let started = Instant::now();
-    let body = state.service.handle_intent(input).await?;
+    let execution = match state
+        .service
+        .handle_intent_idempotent(input, idempotency_key.as_deref())
+        .await
+    {
+        Ok(execution) => execution,
+        Err(e) => {
+            let (status, body) = e.into_body_with_intent_id(intent_id_for_error);
+            return Ok((status, Json(body)).into_response());
+        }
+    };
+    let body = execution.body;
     let intent_name = body.intent.clone();
     let body_json = serde_json::to_value(&body)?;
     crate::metrics::record_intent(intent_name.as_str(), "ok");
     crate::metrics::record_http("/icp/v1/intents", 200, started.elapsed().as_secs_f64());
-
-    // Cache only successful responses — a transient 5xx from the
-    // pipeline shouldn't poison the idempotency cache.
-    if let Some(key) = idempotency_key.as_deref() {
-        let body_bytes = serde_json::to_vec(&body_json)
-            .map_err(|e| ApiError::ProcessingError(format!("serialize for cache: {e}")))?;
-        state.service.idempotency.store(
-            &tenant_id,
-            key,
-            &request_digest,
-            CachedResponse {
-                status: 200,
-                body_json: body_bytes,
-            },
-            chrono::Utc::now(),
-        );
-    }
 
     let mut response = (http::StatusCode::OK, Json(body_json)).into_response();
     let h = response.headers_mut();
@@ -255,6 +198,17 @@ pub async fn submit_intent(
         }
         if let Ok(v) = http::HeaderValue::from_str(&body.receipt.kid) {
             h.insert(headers::ICP_RECEIPT_KID, v);
+        }
+    }
+    if execution.replayed {
+        h.insert(
+            "idempotent-replayed",
+            http::HeaderValue::from_static("true"),
+        );
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Ok(v) = http::HeaderValue::from_str(key) {
+                h.insert("idempotent-key", v);
+            }
         }
     }
     for (name, value) in rl_headers {

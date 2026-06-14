@@ -10,7 +10,6 @@ use tonic::{Request, Response, Status};
 
 use crate::agent::{AgentIdentifier, ApiKeyInfo, ApiKeyStore};
 use crate::discovery;
-use crate::idempotency::{CachedResponse, IdempotencyStore, LookupOutcome};
 use crate::models::IntentEnvelope;
 use crate::service::{IcpService, IntentInput};
 
@@ -114,46 +113,14 @@ impl IcpHandler for GrpcHandler {
         }
         let intent_env: IntentEnvelope = serde_json::from_slice(&inner.payload_json)
             .map_err(|e| Status::invalid_argument(format!("payload_json: {e}")))?;
-        let canonical = serde_jcs::to_vec(&intent_env)
-            .map_err(|e| Status::internal(format!("payload canonicalize: {e}")))?;
-        let request_digest = IdempotencyStore::digest_request(&canonical);
+        // Mirror the HTTP path, which 401s on a missing ICP-Agent-Id —
+        // otherwise an empty agent_id would parse to an opaque blank
+        // identity and be recorded on the transaction/receipt.
+        if envelope.agent_id.is_empty() {
+            return Err(Status::unauthenticated("agent_id required"));
+        }
         let agent = AgentIdentifier::parse(&envelope.agent_id);
         ensure_agent_allowed(&tenant, &agent)?;
-        let tenant_id = tenant.tenant_id.clone();
-        let idempotency_key = envelope.idempotency_key.clone();
-        let _idempotency_guard = if idempotency_key.is_empty() {
-            None
-        } else {
-            Some(
-                self.service
-                    .lock_idempotency_key(&tenant_id, &idempotency_key)
-                    .await,
-            )
-        };
-        if !idempotency_key.is_empty() {
-            let outcome = self.service.idempotency.lookup(
-                &tenant_id,
-                &idempotency_key,
-                &request_digest,
-                chrono::Utc::now(),
-            );
-            match outcome {
-                LookupOutcome::Replay(cached) => {
-                    let (receipt_jws, receipt_kid) = receipt_fields_from_body(&cached.body_json)?;
-                    return Ok(Response::new(IntentResponse {
-                        payload_json: cached.body_json,
-                        receipt_jws,
-                        receipt_kid,
-                    }));
-                }
-                LookupOutcome::Conflict => {
-                    return Err(Status::already_exists(format!(
-                        "idempotency_key `{idempotency_key}` was used previously with a different request body"
-                    )));
-                }
-                LookupOutcome::Miss => {}
-            }
-        }
 
         let mandate_jws = if envelope.mandate_jws.is_empty() {
             None
@@ -174,26 +141,25 @@ impl IcpHandler for GrpcHandler {
         let input =
             IntentInput::for_icp(intent_env, agent, tenant, mandate_jws, request_id, trace_id);
 
-        let body = self
+        // Route through the shared idempotency wrapper so gRPC gets the same
+        // protection as HTTP — including the `(agent_id, intent_id)` fallback
+        // (spec §7.4) when no explicit `idempotency_key` is supplied. The
+        // hand-rolled lookup/store this replaces only engaged on a non-empty
+        // key, leaving intent_id-only retries able to double-charge.
+        let explicit_key = if envelope.idempotency_key.is_empty() {
+            None
+        } else {
+            Some(envelope.idempotency_key.as_str())
+        };
+        let execution = self
             .service
-            .handle_intent(input)
+            .handle_intent_idempotent(input, explicit_key)
             .await
             .map_err(api_error_to_status)?;
+        let body = execution.body;
 
         let payload_json =
             serde_json::to_vec(&body).map_err(|e| Status::internal(format!("serialize: {e}")))?;
-        if !idempotency_key.is_empty() {
-            self.service.idempotency.store(
-                &tenant_id,
-                &idempotency_key,
-                &request_digest,
-                CachedResponse {
-                    status: 200,
-                    body_json: payload_json.clone(),
-                },
-                chrono::Utc::now(),
-            );
-        }
 
         Ok(Response::new(IntentResponse {
             payload_json,
@@ -406,24 +372,6 @@ fn grpc_client_id_for_rate_limit(
         }
     }
     "grpc".to_string()
-}
-
-fn receipt_fields_from_body(payload_json: &[u8]) -> Result<(String, String), Status> {
-    let body: serde_json::Value = serde_json::from_slice(payload_json)
-        .map_err(|e| Status::internal(format!("cached response JSON: {e}")))?;
-    let receipt_jws = body
-        .get("receipt")
-        .and_then(|receipt| receipt.get("jws"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let receipt_kid = body
-        .get("receipt")
-        .and_then(|receipt| receipt.get("kid"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    Ok((receipt_jws, receipt_kid))
 }
 
 fn api_error_to_status(err: crate::errors::ApiError) -> Status {

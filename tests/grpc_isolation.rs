@@ -319,3 +319,70 @@ async fn grpc_fake_bearer_floods_are_pre_auth_limited() {
     let second = h.submit_intent(request()).await.unwrap_err();
     assert_eq!(second.code(), tonic::Code::ResourceExhausted);
 }
+
+#[tokio::test]
+async fn grpc_dedups_on_intent_id_without_explicit_key() {
+    // Spec §7.4: an intent is idempotent under (agent_id, intent_id) even
+    // with no explicit idempotency_key. Before the fix, gRPC only deduped
+    // on a non-empty key, so an intent_id-only retry re-executed and could
+    // double-charge. The retry must replay the original transaction.
+    let h = handler().await;
+    let body = json!({
+        "intent": "intent.quote",
+        "intent_id": "int_grpc_fixed",
+        "agent_id": AGENT,
+        "params": {
+            "items": [{
+                "sku": "WIDGET",
+                "quantity": 1,
+                "unit_price_hint": { "amount_minor": 100, "currency": "USD" }
+            }]
+        }
+    });
+    // envelope() leaves idempotency_key empty.
+    let request = IntentRequest {
+        envelope: Some(envelope()),
+        payload_json: serde_json::to_vec(&body).unwrap(),
+    };
+    let first = h
+        .submit_intent(auth(Request::new(request.clone()), "k_a"))
+        .await
+        .expect("first")
+        .into_inner();
+    let second = h
+        .submit_intent(auth(Request::new(request), "k_a"))
+        .await
+        .expect("second")
+        .into_inner();
+
+    let fb: Value = serde_json::from_slice(&first.payload_json).unwrap();
+    let sb: Value = serde_json::from_slice(&second.payload_json).unwrap();
+    assert_eq!(
+        fb["transaction"]["id"], sb["transaction"]["id"],
+        "intent_id retry must replay the original transaction"
+    );
+    assert_eq!(
+        h.service.transactions.len(),
+        1,
+        "intent_id retry must not create a second transaction"
+    );
+}
+
+#[tokio::test]
+async fn grpc_rejects_empty_agent_id() {
+    // The HTTP path 401s on a missing ICP-Agent-Id; gRPC must match rather
+    // than accept a blank agent identity.
+    let h = handler().await;
+    let mut env = envelope();
+    env.agent_id = String::new();
+    let resp = h
+        .submit_intent(auth(
+            Request::new(IntentRequest {
+                envelope: Some(env),
+                payload_json: serde_json::to_vec(&quote_body("WIDGET")).unwrap(),
+            }),
+            "k_a",
+        ))
+        .await;
+    assert_eq!(resp.unwrap_err().code(), tonic::Code::Unauthenticated);
+}

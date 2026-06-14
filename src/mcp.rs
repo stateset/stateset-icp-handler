@@ -396,6 +396,16 @@ async fn handle_tools_call(
         context.jurisdiction = Some(jurisdiction.to_string());
     }
 
+    // Guard state-changing intents that target an existing transaction
+    // (notably intent.buy) so a retried MCP tool call replays rather than
+    // charging twice. Keyed on the transaction id, which is stable across
+    // retries. Quote and reads have no such id and run unguarded. Computed
+    // before `transaction_id` moves into the envelope.
+    let idem_key = transaction_id
+        .as_deref()
+        .filter(|_| intent.is_state_change())
+        .map(|tid| format!("mcp:{}:{tid}", intent.wire_name()));
+
     let envelope = IntentEnvelope {
         intent: intent.wire_name().to_string(),
         intent_id: None,
@@ -414,8 +424,13 @@ async fn handle_tools_call(
         None,
     );
 
-    match state.service.handle_intent(input).await {
-        Ok(body) => {
+    match state
+        .service
+        .handle_intent_idempotent(input, idem_key.as_deref())
+        .await
+    {
+        Ok(execution) => {
+            let body = execution.body;
             let structured = serde_json::to_value(&body).unwrap_or(Value::Null);
             // MCP `tools/call` result: content is an array of content
             // blocks. We return both a text summary and the structured
