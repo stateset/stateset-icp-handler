@@ -428,9 +428,34 @@ pub async fn serve(
         None
     };
 
+    let mut scheduler_task = scheduler_task;
+    let mut webhook_task = webhook_task;
+    let mut idempotency_sweeper_task = idempotency_sweeper_task;
+    let mut expiry_sweeper_task = expiry_sweeper_task;
+
+    // A background loop should never end while the server is up. Folding
+    // each handle into the `select!` turns a silent subsystem death (loop
+    // panics, JoinHandle dropped, server keeps returning 200) into a
+    // process exit the orchestrator can restart.
     let outcome = tokio::select! {
         res = http => res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
         res = grpc => res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
+        how = background_task_ended(&mut scheduler_task) => {
+            warn!("subscription scheduler task {how} unexpectedly; shutting down");
+            Ok(())
+        }
+        how = background_task_ended(&mut webhook_task) => {
+            warn!("webhook delivery worker {how} unexpectedly; shutting down");
+            Ok(())
+        }
+        how = background_task_ended(&mut idempotency_sweeper_task) => {
+            warn!("idempotency sweeper task {how} unexpectedly; shutting down");
+            Ok(())
+        }
+        how = background_task_ended(&mut expiry_sweeper_task) => {
+            warn!("expiry sweeper task {how} unexpectedly; shutting down");
+            Ok(())
+        }
     };
 
     if let Some(task) = scheduler_task {
@@ -449,7 +474,53 @@ pub async fn serve(
     outcome
 }
 
+/// Resolves when the process is asked to stop. Listens for SIGINT
+/// (Ctrl-C, all platforms) *and* SIGTERM (Unix) — the latter is the
+/// signal Kubernetes/Docker/systemd send on rollout or scale-down, and
+/// not handling it meant graceful shutdown never fired in production
+/// (the runtime was torn down by the eventual SIGKILL instead).
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
     info!("shutdown signal received");
+}
+
+/// Awaits an optional background-task handle. Resolves when the task
+/// ends (including via panic, surfaced as a `JoinError`); stays pending
+/// forever when the task was never spawned. Used to fold background
+/// loops into the main `select!` so that a silently-dying subsystem
+/// brings the whole process down (and lets the orchestrator restart it)
+/// instead of leaving a healthy-looking server that no longer renews
+/// subscriptions or delivers webhooks.
+async fn background_task_ended(task: &mut Option<tokio::task::JoinHandle<()>>) -> &'static str {
+    match task {
+        Some(handle) => match handle.await {
+            Ok(()) => "exited",
+            Err(e) if e.is_panic() => "panicked",
+            Err(_) => "cancelled",
+        },
+        None => std::future::pending().await,
+    }
 }
