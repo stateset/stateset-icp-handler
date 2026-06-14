@@ -380,6 +380,178 @@ async fn test_intent_quote(r: &Runner) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// §13: a write retried with the same `ICP-Idempotency-Key` and an
+/// equivalent body MUST replay the cached response (stamped
+/// `Idempotent-Replayed: true`) rather than re-execute. This is the
+/// guard against network-retry double-charges, so a conformant handler
+/// must demonstrate it.
+async fn test_idempotency_replay(r: &Runner) -> Result<Option<String>, String> {
+    // Unique key per run so an external, long-lived handler isn't already
+    // holding a cached entry from a previous suite invocation.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("conf-idem-{nanos}");
+    let body = json!({
+        "intent": "intent.quote",
+        "agent_id": r.args.agent_id,
+        "params": {
+            "items": [
+                { "sku": r.args.sku, "quantity": 1,
+                  "unit_price_hint": { "amount_minor": 1234, "currency": r.args.currency } }
+            ]
+        },
+        "context": { "currency": r.args.currency }
+    })
+    .to_string();
+
+    // First request — establishes the cache entry.
+    let resp1 = r
+        .client
+        .post(r.url("/icp/v1/intents"))
+        .headers(r.auth_headers())
+        .header("ICP-Idempotency-Key", &key)
+        .body(body.clone())
+        .send()
+        .await
+        .map_err(|e| format!("POST intents (first): {e}"))?;
+    let status1 = resp1.status();
+    let body1: Value = resp1
+        .json()
+        .await
+        .map_err(|e| format!("json (first): {e}"))?;
+
+    if status1 == 401
+        && body1
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("mandate_invalid")
+        && r.args.mandate.is_none()
+    {
+        return Ok(Some(
+            "handler requires mandate; supply --mandate to run".into(),
+        ));
+    }
+    if !status1.is_success() {
+        return Err(format!(
+            "first request status {status1}; body = {}",
+            short_json(&body1)
+        ));
+    }
+    let txn1 = require_str(&require_field(&body1, "transaction")?, "id")?;
+
+    // Second request — identical key + body. Must replay.
+    let resp2 = r
+        .client
+        .post(r.url("/icp/v1/intents"))
+        .headers(r.auth_headers())
+        .header("ICP-Idempotency-Key", &key)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST intents (replay): {e}"))?;
+    let replayed = resp2
+        .headers()
+        .get("idempotent-replayed")
+        .and_then(|v| v.to_str().ok())
+        == Some("true");
+    let body2: Value = resp2
+        .json()
+        .await
+        .map_err(|e| format!("json (replay): {e}"))?;
+    if !replayed {
+        return Err(
+            "retry with the same ICP-Idempotency-Key did not set `Idempotent-Replayed: true`"
+                .into(),
+        );
+    }
+    let txn2 = require_str(&require_field(&body2, "transaction")?, "id")?;
+    if txn1 != txn2 {
+        return Err(format!(
+            "idempotent replay returned a different transaction ({txn1} vs {txn2}) — handler re-executed instead of replaying"
+        ));
+    }
+    Ok(None)
+}
+
+/// §13: reusing an idempotency key with a *different* body MUST be
+/// rejected as a conflict (HTTP 409), not silently served from cache or
+/// re-executed.
+async fn test_idempotency_conflict(r: &Runner) -> Result<Option<String>, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("conf-idem-conflict-{nanos}");
+    let make_body = |amount: i64| {
+        json!({
+            "intent": "intent.quote",
+            "agent_id": r.args.agent_id,
+            "params": {
+                "items": [
+                    { "sku": r.args.sku, "quantity": 1,
+                      "unit_price_hint": { "amount_minor": amount, "currency": r.args.currency } }
+                ]
+            },
+            "context": { "currency": r.args.currency }
+        })
+        .to_string()
+    };
+
+    let resp1 = r
+        .client
+        .post(r.url("/icp/v1/intents"))
+        .headers(r.auth_headers())
+        .header("ICP-Idempotency-Key", &key)
+        .body(make_body(1000))
+        .send()
+        .await
+        .map_err(|e| format!("POST intents (first): {e}"))?;
+    let status1 = resp1.status();
+    let body1: Value = resp1
+        .json()
+        .await
+        .map_err(|e| format!("json (first): {e}"))?;
+    if status1 == 401
+        && body1
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("mandate_invalid")
+        && r.args.mandate.is_none()
+    {
+        return Ok(Some(
+            "handler requires mandate; supply --mandate to run".into(),
+        ));
+    }
+    if !status1.is_success() {
+        return Err(format!(
+            "first request status {status1}; body = {}",
+            short_json(&body1)
+        ));
+    }
+
+    // Same key, different amount → semantically different request.
+    let resp2 = r
+        .client
+        .post(r.url("/icp/v1/intents"))
+        .headers(r.auth_headers())
+        .header("ICP-Idempotency-Key", &key)
+        .body(make_body(9999))
+        .send()
+        .await
+        .map_err(|e| format!("POST intents (conflict): {e}"))?;
+    if resp2.status().as_u16() != 409 {
+        return Err(format!(
+            "reused key with a different body returned {}, expected 409 conflict",
+            resp2.status()
+        ));
+    }
+    Ok(None)
+}
+
 async fn test_receipt_body_digest_matches_jcs(r: &Runner) -> Result<Option<String>, String> {
     let resp = r
         .client
@@ -933,6 +1105,14 @@ async fn main() -> ExitCode {
         test_discovery_intents_are_live
     );
     run_test!("intent.quote happy path", test_intent_quote);
+    run_test!(
+        "idempotency replay (same key + body)",
+        test_idempotency_replay
+    );
+    run_test!(
+        "idempotency conflict (same key, different body → 409)",
+        test_idempotency_conflict
+    );
     run_test!(
         "receipt body_digest matches JCS of response",
         test_receipt_body_digest_matches_jcs

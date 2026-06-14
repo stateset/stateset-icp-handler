@@ -8,6 +8,14 @@
 # Exit code mirrors the conformance tool: 0 on all-pass, non-zero otherwise.
 set -euo pipefail
 
+# Build profile. Defaults to --release for realistic timing; CI sets
+# ICP_CONFORMANCE_DEBUG=1 to skip the slow LTO release build.
+if [[ -n "${ICP_CONFORMANCE_DEBUG:-}" ]]; then
+  PROFILE_FLAG=""
+else
+  PROFILE_FLAG="--release"
+fi
+
 EXTERNAL="${ICP_URL:-}"
 
 if [[ -z "$EXTERNAL" ]]; then
@@ -23,7 +31,7 @@ if [[ -z "$EXTERNAL" ]]; then
   ICP_REQUIRE_MANDATE=false \
   COMMERCE_DB_PATH="${DB}" \
   LOG_LEVEL=warn \
-    cargo run --quiet --release --bin stateset-icp-handler >/dev/null 2>&1 &
+    cargo run --quiet ${PROFILE_FLAG} --bin stateset-icp-handler >/dev/null 2>&1 &
   SERVER_PID=$!
   trap 'kill $SERVER_PID 2>/dev/null || true; rm -f "${DB}" "${DB}"-*' EXIT
 
@@ -37,7 +45,7 @@ else
 fi
 
 echo
-cargo run --quiet --release --bin icp-conformance -- \
+cargo run --quiet ${PROFILE_FLAG} --bin icp-conformance -- \
   --url "${URL}" \
   --api-key "${ICP_API_KEY:-icp_demo_key_123}" \
   --agent-id "${ICP_AGENT_ID:-did:stateset:agent:conformance}" \
