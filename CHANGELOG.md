@@ -16,6 +16,114 @@ and this project adheres to date-based ICP versioning — see
 
 ## [Unreleased]
 
+### Added
+- **Conformance harness now exercises idempotency (spec §13).** The
+  `icp-conformance` suite gained two checks — a same-key+body retry must
+  replay (`Idempotent-Replayed: true`, same transaction), and a same-key
+  different-body request must return `409`. These are the guarantees that
+  were previously untested, which is how the compat double-charge gap
+  went unnoticed.
+
+### Security
+- **`did:web` resolver SSRF guard.** Mandate verification resolves the
+  attacker-controlled `iss` DID, but `DidWebResolver` previously issued
+  the document GET with none of the SSRF protections the webhook worker
+  applies — making it a blind-SSRF primitive reachable by any
+  authenticated tenant in the hardened production configuration. The
+  SSRF check (literal-IP + DNS-resolution against a private/loopback/
+  link-local/metadata blocklist) is now shared between the webhook
+  worker and the resolver so the two outbound-fetch paths can't drift,
+  and is toggled by the same `allow_insecure_urls` setting.
+
+### Fixed
+- **Rate limiting now covers the compat and MCP surfaces.** Only the HTTP
+  and gRPC front doors applied the per-tenant rate limit; the ACP, UCP, and
+  MCP intent paths called the pipeline directly and were entirely uncapped,
+  letting a client drive unlimited state-changing intents (incl.
+  `intent.buy`) on the most sensitive surfaces. The limit is now enforced
+  in the shared `handle_intent_idempotent` chokepoint for any transport
+  that doesn't pre-check (HTTP/gRPC still pre-check and emit
+  `x-ratelimit-*` headers), so it's applied by default and can't be
+  forgotten on a future surface.
+- **Production requires a webhook secret when a webhook URL is set.** A
+  configured `ICP_WEBHOOK_URL` with no `ICP_WEBHOOK_SECRET` silently shipped
+  unsigned deliveries; the production config gate now rejects it.
+- **`decimal_to_minor` saturates instead of collapsing to 0 on overflow.**
+  An amount whose minor-unit value exceeds `i64` (reachable at high-precision
+  crypto scales) previously became `0` — the worst possible fallback for a
+  charge. It now saturates to `i64::MAX`/`MIN` and logs.
+- **Unrecognized currency is logged.** The commerce engine maps an unknown
+  currency code to its base currency (USD); that mapping is now logged at
+  `warn` rather than silently persisting an order in the wrong currency.
+- **Atomic state-store writes.** Transaction / subscription / peer-quote
+  rows previously wrote their JSON payload and their denormalized index
+  columns (`tenant_id`, `state`/`status`, timestamps, …) in two separate
+  statements on two pooled connections, so a concurrent reader or the
+  expiry/renewal sweepers could briefly observe a row whose index columns
+  lagged its payload (or, if the follow-up write failed, permanently
+  diverged). Both columns now write in a single `INSERT … ON CONFLICT` /
+  `UPDATE` within one transaction.
+- **Double-charge closed on every write transport (spec §13).**
+  The ACP/UCP `…/complete` endpoints and the MCP `icp_buy` tool called
+  the intent pipeline directly with no idempotency, and the gRPC path's
+  hand-rolled dedup only engaged on a non-empty `idempotency_key` — so a
+  network retry could re-run `intent.buy` and capture payment twice.
+  Idempotency now lives in the service layer (`handle_intent_idempotent`)
+  and every transport (HTTP, ACP, UCP, MCP, gRPC) routes through it. The
+  compat/MCP paths are keyed on the stable session/transaction id; ACP/UCP
+  merge-updates are deliberately left unkeyed (meant to be repeatable with
+  differing bodies).
+- **`intent_id` idempotency honored on every transport (spec §7.4 / §15.2).**
+  A retry carrying the same client-chosen `intent_id` now replays even
+  without an `ICP-Idempotency-Key` header — including over gRPC, whose
+  earlier dedup ignored `intent_id` entirely. The explicit key still takes
+  precedence when present.
+- **Tax computation no longer overflows.** The 8.75% tax multiply used a
+  plain `i64 * 875` while every other amount op saturated; a crafted unit
+  price near `i64::MAX` (reachable from any authenticated `intent.quote`)
+  panicked the request under overflow-checks or silently wrapped to a
+  corrupt/negative tax that flowed into the charged total and signed
+  receipt. The multiply is now widened to `i128`.
+- **gRPC rejects a missing `agent_id`.** The HTTP path 401s on an absent
+  `ICP-Agent-Id`; gRPC now matches (`unauthenticated`) instead of recording
+  a blank agent identity on the transaction and receipt.
+- **`ICP-Receipt` / `ICP-Receipt-Kid` headers on compat responses
+  (spec §4).** State-changing ACP/UCP responses now surface the signed
+  receipt via the spec-required headers, matching the first-class ICP
+  path (previously the receipt was only in the body).
+- **`error.intent_id` populated (spec §12).** Errors raised while
+  processing an intent now echo the request's `intent_id` so a client
+  can correlate the failure to the intent it sent (previously always
+  omitted).
+- **Mandate jurisdiction & policy enforcement (spec §6.1 steps 6–7).**
+  `evaluate` now refuses an intent whose fulfillment jurisdiction is not
+  listed in a jurisdiction-constrained mandate (and refuses when the
+  mandate constrains jurisdictions but the intent declares none), and
+  honors the `prohibit_subscriptions` policy. These bounds were parsed
+  but silently unenforced. Jurisdiction matching treats a listed ISO
+  country (`US`) as authorizing its ISO-3166-2 subdivisions (`US-CA`,
+  the form an intent's `context.jurisdiction` actually carries), so a
+  country-scoped mandate authorizes a subdivision fulfillment.
+- **Webhook deliveries no longer lost on restart.** Rows flipped to
+  `in_flight` immediately before the delivery POST were never reclaimed
+  (`list_due` selects only `pending`/`failed`, and operator retry
+  refuses `in_flight`), so a crash or redeploy mid-send dropped the
+  delivery permanently. The worker now reclaims orphaned `in_flight`
+  rows to `pending` on startup, restoring the at-least-once guarantee
+  across restarts.
+- **Background subsystem death is no longer silent.** The subscription
+  scheduler, webhook worker, idempotency sweeper, and expiry sweeper are
+  now folded into the main `select!`: if any loop exits or panics, the
+  process shuts down (so the orchestrator can restart it) instead of
+  leaving a healthy-looking server that has silently stopped renewing
+  subscriptions or delivering webhooks.
+- **Graceful shutdown on SIGTERM.** The server now handles SIGTERM (the
+  signal Kubernetes/Docker/systemd send on rollout), not just SIGINT, so
+  in-flight requests drain on a normal pod stop instead of being killed.
+- **Bounded operation-lock map.** The per-key serialization map leaked
+  one `Arc<Mutex>` per distinct idempotency key indefinitely; idle locks
+  are now evicted, bounding the map to in-flight operations.
+
 ## [0.6.0] — 2026-05-19
 
 ### Added
