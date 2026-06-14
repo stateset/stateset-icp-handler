@@ -1,7 +1,6 @@
 //! Background delivery worker: drains the outbox, signs, posts, and
 //! schedules retries with exponential backoff.
 
-use std::net::IpAddr;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -10,7 +9,7 @@ use super::outbox::WebhookOutbox;
 use super::signing::sign;
 use super::subscribers::SubscriberStore;
 use super::types::{DeliveryStatus, PruneReport, TickReport, WebhookDelivery};
-use super::url::{is_forbidden_ip, validate_destination_url};
+use super::url::validate_destination_url;
 use super::DEFAULT_TIMEOUT_SECS;
 
 /// Exponential backoff: `attempts²` seconds, clamped to 1 hour.
@@ -185,31 +184,9 @@ impl WebhookWorker {
     }
 
     async fn ensure_public_resolution(&self, url: &str) -> anyhow::Result<()> {
-        let parsed = reqwest::Url::parse(url)?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("url must include a host"))?;
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if is_forbidden_ip(ip) {
-                anyhow::bail!("url host must not resolve to localhost or a private network");
-            }
-            return Ok(());
-        }
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| anyhow::anyhow!("url must include a resolvable port"))?;
-        let mut addrs = tokio::net::lookup_host((host, port)).await?;
-        let mut saw_addr = false;
-        for addr in addrs.by_ref() {
-            saw_addr = true;
-            if is_forbidden_ip(addr.ip()) {
-                anyhow::bail!("url host must not resolve to localhost or a private network");
-            }
-        }
-        if !saw_addr {
-            anyhow::bail!("url host did not resolve to any address");
-        }
-        Ok(())
+        super::url::ensure_public_url(url)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     fn secret_for_delivery(&self, delivery: &WebhookDelivery) -> Option<String> {
@@ -236,6 +213,12 @@ pub async fn run_loop(worker: WebhookWorker, period: StdDuration) {
         interval_secs = period.as_secs_f64(),
         "webhook worker started"
     );
+    // Recover deliveries left `in_flight` by a previous process that
+    // died mid-send, so they get retried instead of silently lost.
+    let reclaimed = worker.outbox.reclaim_in_flight(Utc::now());
+    if reclaimed > 0 {
+        tracing::warn!(reclaimed, "reclaimed orphaned in_flight webhook deliveries");
+    }
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {

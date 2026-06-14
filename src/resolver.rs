@@ -63,6 +63,8 @@ pub enum ResolveError {
     },
     #[error("DID document at `{url}` malformed: {message}")]
     DidDocument { url: String, message: String },
+    #[error("refusing to resolve `{url}`: {message}")]
+    Blocked { url: String, message: String },
 }
 
 /// A verifying key advertised by a principal, suitable for JWS
@@ -172,6 +174,12 @@ pub struct DidWebResolver {
     scheme: String,
     cache: RwLock<HashMap<String, CachedKeyset>>,
     cache_ttl: Duration,
+    /// When false (production default), the resolver refuses to fetch a
+    /// `did:web` document whose host resolves to localhost or a private
+    /// network — the same SSRF gate the webhook worker applies. The
+    /// `iss` of a mandate is attacker-controlled, so without this a
+    /// caller could make the handler issue arbitrary internal GETs.
+    allow_insecure: bool,
 }
 
 struct CachedKeyset {
@@ -192,12 +200,26 @@ impl DidWebResolver {
     }
 
     pub fn with_options(client: reqwest::Client, scheme: &str, cache_ttl: Duration) -> Self {
+        // A non-https scheme only ever appears in development/test wiring
+        // (production fetches `did:web` over https), so treat it as the
+        // insecure-allowed mode — this lets the existing http-based tests
+        // resolve against a localhost mock without tripping the guard.
+        let allow_insecure = !scheme.eq_ignore_ascii_case("https");
         Self {
             client,
             scheme: scheme.to_string(),
             cache: RwLock::new(HashMap::new()),
             cache_ttl,
+            allow_insecure,
         }
+    }
+
+    /// Override the SSRF guard explicitly. Production wiring passes the
+    /// handler's `allow_insecure_urls` flag here so the resolver and the
+    /// webhook worker honor the same operator setting.
+    pub fn allowing_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
     }
 
     fn url_for(&self, did: &str) -> Result<String, ResolveError> {
@@ -264,6 +286,14 @@ impl PrincipalResolver for DidWebResolver {
             return Ok(keys);
         }
         let url = self.url_for(did)?;
+        if !self.allow_insecure {
+            crate::webhook::url::ensure_public_url(&url)
+                .await
+                .map_err(|message| ResolveError::Blocked {
+                    url: url.clone(),
+                    message,
+                })?;
+        }
         let resp = self
             .client
             .get(&url)
@@ -427,11 +457,19 @@ impl CompositeResolver {
         self
     }
 
-    /// The default resolver set: `did:key` + `did:web` (HTTPS).
+    /// The default resolver set: `did:key` + `did:web` (HTTPS, SSRF-guarded).
     pub fn default_set() -> Self {
-        Self::new()
-            .with(Box::new(DidKeyResolver))
-            .with(Box::new(DidWebResolver::new()))
+        Self::default_set_with_options(false)
+    }
+
+    /// The default resolver set with the `did:web` SSRF guard toggled to
+    /// match the handler's `allow_insecure_urls` setting. Production passes
+    /// `false`; development wiring may pass `true` to resolve against
+    /// localhost registries.
+    pub fn default_set_with_options(allow_insecure: bool) -> Self {
+        Self::new().with(Box::new(DidKeyResolver)).with(Box::new(
+            DidWebResolver::new().allowing_insecure(allow_insecure),
+        ))
     }
 }
 

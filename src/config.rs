@@ -307,6 +307,17 @@ impl Config {
         {
             issues.push("REDIS_URL is required when production rate limits are enabled");
         }
+        // A configured global webhook URL with no secret ships UNSIGNED
+        // deliveries (the worker signs only when a secret is present), so
+        // receivers can't authenticate them. Require the secret in prod.
+        if self.webhook_url.is_some()
+            && self
+                .webhook_secret
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            issues.push("ICP_WEBHOOK_SECRET is required when ICP_WEBHOOK_URL is set");
+        }
 
         if issues.is_empty() {
             Ok(())

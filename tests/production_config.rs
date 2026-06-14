@@ -49,6 +49,28 @@ fn production_profile_rejects_dev_defaults() {
 }
 
 #[test]
+fn production_requires_webhook_secret_when_webhook_url_set() {
+    // A global webhook URL with no secret ships unsigned deliveries, which
+    // receivers cannot authenticate — production must reject it.
+    let mut cfg = production_ready_config();
+    cfg.validate_runtime()
+        .expect("baseline production config should be valid");
+
+    cfg.webhook_url = Some("https://merchant.example.com/hook".into());
+    cfg.webhook_secret = None;
+    let err = cfg.validate_runtime().unwrap_err().to_string();
+    assert!(
+        err.contains("ICP_WEBHOOK_SECRET is required"),
+        "unexpected error: {err}"
+    );
+
+    // Supplying the secret clears the issue.
+    cfg.webhook_secret = Some("whsec_test".into());
+    cfg.validate_runtime()
+        .expect("config with webhook secret should be valid");
+}
+
+#[test]
 fn invalid_payment_mode_is_rejected() {
     let mut cfg = Config::for_test();
     cfg.payment_execution_mode = "fake_mode".into();

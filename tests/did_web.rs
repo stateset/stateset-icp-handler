@@ -390,3 +390,60 @@ async fn end_to_end_did_web_signed_mandate_accepted_by_handler() {
         "mock did:web host should have been fetched"
     );
 }
+
+/// A production-mode (`https`, SSRF-guarded) resolver must refuse to fetch
+/// a `did:web` whose host points at an internal address — closing the
+/// blind-SSRF primitive an attacker could otherwise reach via a mandate
+/// `iss`. The refusal happens before any network call.
+#[tokio::test]
+async fn did_web_https_resolver_blocks_internal_hosts() {
+    let resolver = DidWebResolver::with_options(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap(),
+        "https",
+        Duration::from_secs(60),
+    );
+
+    for did in [
+        "did:web:127.0.0.1",
+        "did:web:localhost",
+        "did:web:169.254.169.254", // cloud metadata endpoint
+        "did:web:10.0.0.5",
+        "did:web:192.168.1.1",
+    ] {
+        let err = resolver
+            .resolve(did)
+            .await
+            .expect_err("internal host must be refused");
+        assert!(
+            matches!(
+                err,
+                stateset_icp_handler::resolver::ResolveError::Blocked { .. }
+            ),
+            "{did} should be Blocked, got {err:?}"
+        );
+    }
+}
+
+/// The same internal host resolves fine when the resolver is explicitly
+/// put in insecure mode (dev parity with `allow_insecure_urls=true`),
+/// confirming the guard is the toggle and not a hard block.
+#[tokio::test]
+async fn did_web_insecure_resolver_allows_internal_hosts() {
+    let signing = SigningKey::generate(&mut OsRng);
+    let server = MockServer::start(
+        did_doc_multibase("did:web:does-not-matter", &signing),
+        "/.well-known/did.json",
+    )
+    .await;
+    // http scheme => allow_insecure inferred true; target the localhost mock.
+    let resolver = http_resolver(Duration::from_secs(0));
+    let did = format!("did:web:localhost%3A{}", server.addr.port());
+    let keys = resolver
+        .resolve(&did)
+        .await
+        .expect("insecure resolver should reach localhost mock");
+    assert_eq!(keys.len(), 1);
+}

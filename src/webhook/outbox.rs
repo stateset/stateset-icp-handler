@@ -376,6 +376,68 @@ impl WebhookOutbox {
         });
     }
 
+    /// Reclaim deliveries stranded in `in_flight`.
+    ///
+    /// A row is flipped to `in_flight` immediately before the (slow,
+    /// network) delivery POST. If the process dies or is restarted
+    /// between that flip and the terminal `mark_delivered` /
+    /// `bump_failure`, the row is stuck: `list_due` only selects
+    /// `pending`/`failed`, and the operator retry path refuses
+    /// `in_flight`. The delivery would then be silently lost — breaking
+    /// the at-least-once guarantee at exactly the moment (restart) it
+    /// matters most.
+    ///
+    /// Called once on worker startup. The single worker owns the table,
+    /// so any `in_flight` row at startup is necessarily orphaned: reset
+    /// it to `pending` and make it immediately due. `attempts` is left
+    /// untouched (the interrupted attempt never reached a terminal
+    /// transition, so it was never counted). Returns the number of
+    /// reclaimed rows.
+    pub fn reclaim_in_flight(&self, now: DateTime<Utc>) -> usize {
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut guard = match inner.write() {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox write lock poisoned");
+                        return 0;
+                    }
+                };
+                let mut count = 0;
+                for d in guard.values_mut() {
+                    if matches!(d.status, DeliveryStatus::InFlight) {
+                        d.status = DeliveryStatus::Pending;
+                        d.next_attempt_at = now;
+                        d.updated_at = now;
+                        count += 1;
+                    }
+                }
+                count
+            }
+            Backend::Sqlite(pool) => {
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook outbox pool acquire failed");
+                        return 0;
+                    }
+                };
+                match conn.execute(
+                    "UPDATE webhook_deliveries \
+                     SET status = 'pending', next_attempt_at = ?1, updated_at = ?1 \
+                     WHERE status = 'in_flight'",
+                    rusqlite::params![now.to_rfc3339()],
+                ) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        tracing::error!(%err, "webhook in_flight reclaim failed");
+                        0
+                    }
+                }
+            }
+        }
+    }
+
     pub fn mark_delivered(&self, id: &str, status_code: u16, now: DateTime<Utc>) {
         self.update(id, |d| {
             d.status = DeliveryStatus::Delivered;

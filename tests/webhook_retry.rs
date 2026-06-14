@@ -317,6 +317,56 @@ async fn outbox_unit_refuses_in_flight_retries() {
 }
 
 #[tokio::test]
+async fn reclaim_resurrects_orphaned_in_flight_deliveries() {
+    // A process that dies mid-send leaves a row stuck in `in_flight`:
+    // `list_due` ignores it and the operator retry path refuses it, so
+    // without startup reclaim the delivery is lost forever. Reclaim must
+    // flip it back to `pending` and make it immediately due again.
+    let outbox = WebhookOutbox::in_memory();
+    let now = Utc::now();
+    let future = now + chrono::Duration::hours(1);
+    outbox.enqueue(stateset_icp_handler::webhook::WebhookDelivery {
+        id: "del_orphan".into(),
+        event_id: "e".into(),
+        event_type: "transaction.completed".into(),
+        url: "http://nowhere".into(),
+        payload_json: "{}".into(),
+        status: DeliveryStatus::Pending,
+        attempts: 1,
+        max_attempts: 3,
+        // Stale future schedule that list_due would otherwise skip — proves
+        // reclaim rewrites next_attempt_at, not just the status.
+        next_attempt_at: future,
+        last_status_code: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+        delivered_at: None,
+        tenant_id: String::new(),
+    });
+    outbox.mark_in_flight("del_orphan", future);
+    assert!(
+        outbox.list_due(now, 50).is_empty(),
+        "in_flight row must not be due before reclaim"
+    );
+
+    let reclaimed = outbox.reclaim_in_flight(now);
+    assert_eq!(reclaimed, 1, "exactly one orphan should be reclaimed");
+
+    let due = outbox.list_due(now, 50);
+    assert_eq!(due.len(), 1, "reclaimed row must be due again");
+    assert_eq!(due[0].id, "del_orphan");
+    assert_eq!(due[0].status, DeliveryStatus::Pending);
+    assert_eq!(
+        due[0].attempts, 1,
+        "reclaim preserves the prior attempt count"
+    );
+
+    // Idempotent: a second reclaim with nothing in flight is a no-op.
+    assert_eq!(outbox.reclaim_in_flight(now), 0);
+}
+
+#[tokio::test]
 async fn retry_resets_attempt_counter_so_next_failure_starts_fresh() {
     // After the operator retries, the row should behave as if it were
     // freshly enqueued — which means it gets the full max_attempts

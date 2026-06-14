@@ -33,7 +33,7 @@ mod outbox;
 mod signing;
 mod subscribers;
 mod types;
-mod url;
+pub(crate) mod url;
 mod worker;
 
 pub use outbox::WebhookOutbox;

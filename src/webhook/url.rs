@@ -27,6 +27,51 @@ pub fn validate_destination_url(url: &str, allow_insecure: bool) -> Result<(), S
     Ok(())
 }
 
+/// Resolve `url`'s host and refuse it if the literal address — or *any*
+/// address DNS returns for it — points at localhost or a private/internal
+/// network. This is the SSRF gate shared by the webhook worker and the
+/// `did:web` resolver, so the two outbound-fetch paths can't drift apart
+/// (the resolver previously had no guard at all, making it a blind-SSRF
+/// primitive reachable by any authenticated mandate `iss`).
+///
+/// Note the residual DNS-rebinding TOCTOU: the caller resolves here, then
+/// the HTTP client resolves again independently. Closing that fully needs
+/// connection-time IP pinning; this check still blocks the overwhelming
+/// majority of SSRF attempts (literal internal IPs, metadata endpoints,
+/// internal hostnames).
+pub(crate) async fn ensure_public_url(url: &str) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| "url must be a valid absolute URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "url must include a host".to_string())?;
+    if is_forbidden_host(host) {
+        return Err("url host must not resolve to localhost or a private network".into());
+    }
+    // Literal IPs are fully vetted by is_forbidden_host above; only names
+    // need a DNS round-trip.
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "url must include a resolvable port".to_string())?;
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("dns resolution failed: {e}"))?;
+    let mut saw_addr = false;
+    for addr in addrs.by_ref() {
+        saw_addr = true;
+        if is_forbidden_ip(addr.ip()) {
+            return Err("url host must not resolve to localhost or a private network".into());
+        }
+    }
+    if !saw_addr {
+        return Err("url host did not resolve to any address".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn is_forbidden_host(host: &str) -> bool {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     if matches!(
