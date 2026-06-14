@@ -547,28 +547,46 @@ impl IcpService {
             .map_err(|e| ApiError::ProcessingError(format!("jcs: {e}")))?;
         let digest = crate::idempotency::IdempotencyStore::digest_request(&canonical);
 
-        // Hold the per-key lock across lookup→execute→store so two
-        // concurrent retries on the same instance can't both execute.
+        // The in-process lock is the fast path: it serializes same-key
+        // concurrency within this process so we rarely hit the database
+        // reservation for local duplicates. The DB reservation below is what
+        // extends that guarantee across *separate* processes sharing one
+        // database — neither alone is sufficient for a multi-replica fleet.
         let _guard = self.lock_idempotency_key(&tenant_id, &key).await;
-        match self
-            .idempotency
-            .lookup(&tenant_id, &key, &digest, Utc::now())
-        {
-            crate::idempotency::LookupOutcome::Replay(cached) => {
+        let lease = chrono::Duration::seconds(self.config.idempotency_lease_secs.max(1) as i64);
+
+        let replay =
+            |cached: crate::idempotency::CachedResponse| -> Result<IntentExecution, ApiError> {
                 let body: IntentResponseBody = serde_json::from_slice(&cached.body_json)
                     .map_err(|e| ApiError::ProcessingError(format!("cached response JSON: {e}")))?;
                 Ok(IntentExecution {
                     body,
                     replayed: true,
                 })
-            }
-            crate::idempotency::LookupOutcome::Conflict => {
-                Err(ApiError::IdempotencyConflict(format!(
-                    "idempotency key `{key}` was used previously with a different request body"
-                )))
-            }
-            crate::idempotency::LookupOutcome::Miss => {
-                let body = self.handle_intent(input).await?;
+            };
+        let conflict = || {
+            ApiError::IdempotencyConflict(format!(
+                "idempotency key `{key}` was used previously with a different request body"
+            ))
+        };
+
+        match self
+            .idempotency
+            .reserve(&tenant_id, &key, &digest, Utc::now(), lease)
+        {
+            crate::idempotency::ReserveOutcome::Replay(cached) => replay(cached),
+            crate::idempotency::ReserveOutcome::Conflict => Err(conflict()),
+            crate::idempotency::ReserveOutcome::Won => {
+                // We own the claim. Execute, then record the response — or
+                // release the reservation so a failed attempt can be retried
+                // immediately rather than waiting out the lease.
+                let body = match self.handle_intent(input).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        self.idempotency.release(&tenant_id, &key);
+                        return Err(e);
+                    }
+                };
                 let body_bytes = serde_json::to_vec(&body)
                     .map_err(|e| ApiError::ProcessingError(format!("serialize for cache: {e}")))?;
                 self.idempotency.store(
@@ -585,6 +603,28 @@ impl IcpService {
                     body,
                     replayed: false,
                 })
+            }
+            crate::idempotency::ReserveOutcome::InProgress => {
+                // Another process is executing this exact request. Wait
+                // briefly for its result and replay it; if it doesn't land in
+                // time, return a retryable error so the client retries (by
+                // which point the original has almost certainly completed).
+                const MAX_POLLS: u32 = 20;
+                const POLL_INTERVAL_MS: u64 = 100;
+                for _ in 0..MAX_POLLS {
+                    tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                    match self
+                        .idempotency
+                        .lookup(&tenant_id, &key, &digest, Utc::now())
+                    {
+                        crate::idempotency::LookupOutcome::Replay(cached) => return replay(cached),
+                        crate::idempotency::LookupOutcome::Conflict => return Err(conflict()),
+                        crate::idempotency::LookupOutcome::Miss => continue,
+                    }
+                }
+                Err(ApiError::EngineUnavailable(format!(
+                    "a request with idempotency key `{key}` is already in progress; retry shortly"
+                )))
             }
         }
     }

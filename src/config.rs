@@ -90,6 +90,16 @@ pub struct Config {
     /// accumulate; not appropriate in production).
     pub idempotency_sweeper_interval_secs: u64,
 
+    /// Lease for an idempotency *reservation*, in seconds. Before
+    /// executing a keyed write the handler claims the key with a pending
+    /// reservation, so concurrent duplicates — even across separate
+    /// handler processes sharing one database — cannot both execute. If
+    /// the claiming process dies, the reservation becomes reclaimable
+    /// after this lease. Keep it comfortably above the slowest expected
+    /// intent latency: too short and a slow (not dead) holder's key could
+    /// be re-claimed and executed twice. Default 60s.
+    pub idempotency_lease_secs: u64,
+
     /// How often the quote-expiry sweeper runs, in seconds.
     /// Default 60. The sweeper transitions transactions whose
     /// `quote_expires_at <= now` (and that are still in pre-auth
@@ -195,6 +205,9 @@ impl Config {
             )
             .parse()
             .unwrap_or(30),
+            idempotency_lease_secs: env_default("ICP_IDEMPOTENCY_LEASE_SECONDS", "60")
+                .parse()
+                .unwrap_or(60),
             idempotency_sweeper_interval_secs: env_default(
                 "ICP_IDEMPOTENCY_SWEEPER_INTERVAL_SECONDS",
                 "3600",
@@ -373,6 +386,7 @@ impl Config {
             // need to exercise eviction; 0 disables the background
             // sweeper so it never races against the test's clock.
             idempotency_sweeper_interval_secs: 0,
+            idempotency_lease_secs: 60,
             // Same reasoning for expiries — tests call
             // `tick_expiries(now)` directly with controlled clocks.
             expiry_sweeper_interval_secs: 0,

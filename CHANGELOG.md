@@ -17,6 +17,18 @@ and this project adheres to date-based ICP versioning — see
 ## [Unreleased]
 
 ### Added
+- **Cross-instance idempotency.** Idempotency was previously serialized only
+  by an in-process lock, so two handler processes sharing one database could
+  both miss-then-execute the same keyed write and double-charge. A keyed
+  write now atomically *reserves* the key in the database (a pending row
+  claimed inside an `IMMEDIATE` transaction) before executing: exactly one
+  process across the fleet wins and runs it, concurrent duplicates wait and
+  replay the result (or get a retryable error), and a different body still
+  conflicts. A failed attempt releases its reservation so retries aren't
+  blocked. `ICP_IDEMPOTENCY_LEASE_SECONDS` (default 60) bounds recovery when
+  a claiming process dies — keep it above the slowest intent latency, since
+  too short a lease could let a slow holder's key be re-claimed and executed
+  twice. The in-process lock remains as a same-process fast path.
 - **Conformance harness now exercises idempotency (spec §13).** The
   `icp-conformance` suite gained two checks — a same-key+body retry must
   replay (`Idempotent-Replayed: true`, same transaction), and a same-key

@@ -64,6 +64,34 @@ pub enum LookupOutcome {
     Conflict,
 }
 
+/// `response_status` sentinel marking a reservation row that has been
+/// claimed for execution but not yet completed. No real HTTP response
+/// uses status 0, so it unambiguously means "in progress".
+const PENDING_STATUS: u16 = 0;
+
+/// The effect of attempting to atomically *claim* an idempotency key
+/// before executing (see [`IdempotencyStore::reserve`]). Unlike
+/// [`LookupOutcome`], this distinguishes "nobody is executing, I won the
+/// claim" from "another worker is currently executing this key" — the
+/// distinction that makes idempotency correct across *multiple* handler
+/// processes sharing one database, not just within one process.
+#[derive(Debug, Clone)]
+pub enum ReserveOutcome {
+    /// This caller atomically claimed the key and must now execute the
+    /// request, then call [`IdempotencyStore::store`] on success or
+    /// [`IdempotencyStore::release`] on failure.
+    Won,
+    /// A completed response already exists with a matching digest —
+    /// replay it.
+    Replay(CachedResponse),
+    /// A row exists with a different request digest — 409 conflict.
+    Conflict,
+    /// Another worker holds an unexpired reservation for this key and is
+    /// executing it right now. The caller should briefly wait for the
+    /// result, then replay it (or return a retryable error).
+    InProgress,
+}
+
 #[derive(Clone)]
 pub struct IdempotencyStore {
     backend: Backend,
@@ -186,10 +214,210 @@ impl IdempotencyStore {
             return LookupOutcome::Miss;
         }
 
+        // A reservation placeholder (status 0) is an in-progress claim, not
+        // a completed response — it is not replayable.
+        if entry.response.status == PENDING_STATUS {
+            return LookupOutcome::Miss;
+        }
+
         if entry.request_digest == request_digest {
             LookupOutcome::Replay(entry.response)
         } else {
             LookupOutcome::Conflict
+        }
+    }
+
+    /// Atomically claim a key before executing, so that concurrent
+    /// duplicates — even across separate handler processes sharing one
+    /// database — cannot both execute (the double-charge the in-process
+    /// lock alone cannot prevent in a multi-replica fleet).
+    ///
+    /// On the SQLite backend the read-decide-write runs inside an
+    /// `IMMEDIATE` transaction, which takes the database write lock, so
+    /// exactly one caller across the fleet can claim a given key at a time.
+    ///
+    /// `lease` bounds crash recovery: a reservation whose holder died is
+    /// reclaimable once it is older than the lease. Keep the lease well
+    /// above the slowest expected intent latency — too short and a slow
+    /// (not dead) holder's key could be re-claimed and executed twice.
+    pub fn reserve(
+        &self,
+        tenant_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+        now: DateTime<Utc>,
+        lease: Duration,
+    ) -> ReserveOutcome {
+        let pending = || Entry {
+            request_digest: request_digest.to_string(),
+            response: CachedResponse {
+                status: PENDING_STATUS,
+                body_json: Vec::new(),
+            },
+            created_at: now,
+        };
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut guard = inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = (tenant_id.to_string(), idempotency_key.to_string());
+                match guard.get(&key) {
+                    // Fresh, completed, matching → replay; mismatching → conflict.
+                    Some(e) if now - e.created_at <= self.ttl => {
+                        if e.response.status == PENDING_STATUS {
+                            if now - e.created_at > lease {
+                                guard.insert(key, pending()); // stale holder → take over
+                                ReserveOutcome::Won
+                            } else {
+                                ReserveOutcome::InProgress
+                            }
+                        } else if e.request_digest == request_digest {
+                            ReserveOutcome::Replay(e.response.clone())
+                        } else {
+                            ReserveOutcome::Conflict
+                        }
+                    }
+                    // Absent or TTL-expired → claim it.
+                    _ => {
+                        guard.insert(key, pending());
+                        ReserveOutcome::Won
+                    }
+                }
+            }
+            Backend::Sqlite(pool) => {
+                let mut conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        // Fail closed: tell the caller to retry rather than
+                        // risk a second execution.
+                        return ReserveOutcome::InProgress;
+                    }
+                };
+                let tx = match conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                {
+                    Ok(tx) => tx,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency reserve begin failed");
+                        return ReserveOutcome::InProgress;
+                    }
+                };
+                let existing: Option<(String, i64, String, String)> = tx
+                    .query_row(
+                        "SELECT request_digest, response_status, response_body, created_at \
+                         FROM idempotency WHERE tenant_id = ?1 AND idempotency_key = ?2",
+                        rusqlite::params![tenant_id, idempotency_key],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()
+                    .unwrap_or_else(|err| {
+                        tracing::error!(%err, "idempotency reserve read failed");
+                        None
+                    });
+
+                let claim_pending = |tx: &rusqlite::Transaction<'_>| {
+                    tx.execute(
+                        "INSERT INTO idempotency \
+                             (tenant_id, idempotency_key, request_digest, \
+                              response_status, response_body, created_at) \
+                         VALUES (?1, ?2, ?3, 0, '', ?4) \
+                         ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET \
+                             request_digest = excluded.request_digest, \
+                             response_status = 0, response_body = '', \
+                             created_at = excluded.created_at",
+                        rusqlite::params![
+                            tenant_id,
+                            idempotency_key,
+                            request_digest,
+                            now.to_rfc3339()
+                        ],
+                    )
+                };
+
+                let outcome = match existing {
+                    None => match claim_pending(&tx) {
+                        Ok(_) => ReserveOutcome::Won,
+                        Err(err) => {
+                            tracing::error!(%err, "idempotency reserve claim failed");
+                            ReserveOutcome::InProgress
+                        }
+                    },
+                    Some((digest, status, body, created_str)) => {
+                        let created = DateTime::parse_from_rfc3339(&created_str)
+                            .map(|d| d.with_timezone(&Utc))
+                            .unwrap_or(now);
+                        let expired = now - created > self.ttl;
+                        let status = status as u16;
+                        if expired {
+                            // Stale completed/pending row → reclaim.
+                            match claim_pending(&tx) {
+                                Ok(_) => ReserveOutcome::Won,
+                                Err(_) => ReserveOutcome::InProgress,
+                            }
+                        } else if status == PENDING_STATUS {
+                            if now - created > lease {
+                                match claim_pending(&tx) {
+                                    Ok(_) => ReserveOutcome::Won, // dead holder → take over
+                                    Err(_) => ReserveOutcome::InProgress,
+                                }
+                            } else {
+                                ReserveOutcome::InProgress
+                            }
+                        } else if digest == request_digest {
+                            ReserveOutcome::Replay(CachedResponse {
+                                status,
+                                body_json: body.into_bytes(),
+                            })
+                        } else {
+                            ReserveOutcome::Conflict
+                        }
+                    }
+                };
+
+                if let Err(err) = tx.commit() {
+                    tracing::error!(%err, "idempotency reserve commit failed");
+                    return ReserveOutcome::InProgress;
+                }
+                outcome
+            }
+        }
+    }
+
+    /// Release a reservation whose execution failed, so the request can be
+    /// retried immediately instead of waiting out the lease. Only deletes a
+    /// still-pending row — never a completed response.
+    pub fn release(&self, tenant_id: &str, idempotency_key: &str) {
+        match &self.backend {
+            Backend::Memory(inner) => {
+                let mut guard = inner
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let key = (tenant_id.to_string(), idempotency_key.to_string());
+                if guard
+                    .get(&key)
+                    .is_some_and(|e| e.response.status == PENDING_STATUS)
+                {
+                    guard.remove(&key);
+                }
+            }
+            Backend::Sqlite(pool) => {
+                let conn = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        tracing::error!(%err, "idempotency pool acquire failed");
+                        return;
+                    }
+                };
+                if let Err(err) = conn.execute(
+                    "DELETE FROM idempotency \
+                     WHERE tenant_id = ?1 AND idempotency_key = ?2 AND response_status = 0",
+                    rusqlite::params![tenant_id, idempotency_key],
+                ) {
+                    tracing::error!(%err, "idempotency release failed");
+                }
+            }
         }
     }
 
