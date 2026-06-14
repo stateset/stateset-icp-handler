@@ -133,6 +133,59 @@ async fn tick_after_next_charge_at_runs_auto_renewal() {
 }
 
 #[tokio::test]
+async fn trial_subscription_defers_first_charge_then_converts_to_active() {
+    let (state, app) = build().await;
+    let mut body = subscribe_body(card_payment());
+    body["params"]["trial_days"] = json!(14);
+
+    let resp = submit(&app, body).await;
+    let sub = &resp["subscription"];
+    let sub_id = sub["id"].as_str().unwrap().to_string();
+
+    // Enrolled in a trial — no money moved, status trialing, first charge
+    // deferred. The response transaction is the priced preview, not a charge.
+    assert_eq!(sub["status"], "trialing");
+    assert_eq!(sub["charges_completed"], 0);
+    assert!(sub["trial_end"].is_string(), "trial_end must be set");
+    assert!(
+        sub["last_transaction_id"].is_null(),
+        "no charge transaction during trial"
+    );
+    assert_eq!(
+        resp["transaction"]["state"], "authorized",
+        "trial enrollment is a pseudo-transaction, not a completed charge"
+    );
+
+    // Before trial end, the scheduler must NOT charge it.
+    let report = state.service.tick_subscriptions(Utc::now()).await;
+    assert_eq!(
+        report.renewed, 0,
+        "trial must not be charged before it ends"
+    );
+    assert_eq!(
+        state.service.subscriptions.get(&sub_id).unwrap().status,
+        stateset_icp_handler::models::SubscriptionStatus::Trialing
+    );
+
+    // At trial end the scheduler bills the first charge and activates it.
+    let due_at = Utc::now() - Duration::seconds(1);
+    force_due(&state, &sub_id, due_at);
+    let report = state.service.tick_subscriptions(Utc::now()).await;
+    assert_eq!(report.due, 1);
+    assert_eq!(report.renewed, 1, "trial's first charge fires at trial end");
+
+    let after = state.service.subscriptions.get(&sub_id).unwrap();
+    assert_eq!(
+        after.status.wire_name(),
+        "active",
+        "trial converts to active"
+    );
+    assert_eq!(after.charges_completed, 1, "first real charge recorded");
+    assert!(after.trial_end.is_none(), "trial_end cleared on conversion");
+    assert!(after.last_transaction_id.is_some());
+}
+
+#[tokio::test]
 async fn paused_subscription_is_skipped_by_scheduler() {
     let (state, app) = build().await;
     let resp = submit(&app, subscribe_body(card_payment())).await;

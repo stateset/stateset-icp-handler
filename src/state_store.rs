@@ -776,6 +776,7 @@ impl SubscriptionStore {
         let mut counts = SubscriptionStatusCounts::default();
         for sub in self.inner.list(usize::MAX) {
             match sub.status {
+                crate::models::SubscriptionStatus::Trialing => counts.trialing += 1,
                 crate::models::SubscriptionStatus::Active => counts.active += 1,
                 crate::models::SubscriptionStatus::Paused => counts.paused += 1,
                 crate::models::SubscriptionStatus::Canceled => counts.canceled += 1,
@@ -792,8 +793,11 @@ impl SubscriptionStore {
                 .list(usize::MAX)
                 .into_iter()
                 .filter(|s| {
-                    matches!(s.status, crate::models::SubscriptionStatus::Active)
-                        && s.next_charge_at <= now
+                    matches!(
+                        s.status,
+                        crate::models::SubscriptionStatus::Active
+                            | crate::models::SubscriptionStatus::Trialing
+                    ) && s.next_charge_at <= now
                         && s.payment_instrument.is_some()
                 })
                 .collect(),
@@ -804,8 +808,11 @@ impl SubscriptionStore {
                         .list(usize::MAX)
                         .into_iter()
                         .filter(|s| {
-                            matches!(s.status, crate::models::SubscriptionStatus::Active)
-                                && s.next_charge_at <= now
+                            matches!(
+                                s.status,
+                                crate::models::SubscriptionStatus::Active
+                                    | crate::models::SubscriptionStatus::Trialing
+                            ) && s.next_charge_at <= now
                                 && s.payment_instrument.is_some()
                         })
                         .collect();
@@ -844,6 +851,7 @@ impl SubscriptionStore {
             let (status, count) = row;
             let count = count as usize;
             match status.as_str() {
+                "trialing" => counts.trialing = count,
                 "active" => counts.active = count,
                 "paused" => counts.paused = count,
                 "canceled" => counts.canceled = count,
@@ -864,8 +872,10 @@ impl SubscriptionStore {
             return Vec::new();
         };
         let mut stmt = match conn.prepare(
+            // `trialing` is included so a trial's first charge fires at its
+            // trial_end (next_charge_at); the scheduler flips it to active.
             "SELECT id, payload_json FROM subscriptions \
-             WHERE status = 'active' \
+             WHERE status IN ('active', 'trialing') \
                AND payment_present = 1 \
                AND next_charge_at != '' \
                AND next_charge_at <= ?1",
@@ -959,6 +969,7 @@ impl SubscriptionStore {
 /// failed dunning, and watch `active` for headcount stability.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct SubscriptionStatusCounts {
+    pub trialing: usize,
     pub active: usize,
     pub paused: usize,
     pub canceled: usize,

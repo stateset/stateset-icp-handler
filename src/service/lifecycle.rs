@@ -108,6 +108,12 @@ impl IcpService {
                         .map(|m| m.currency.clone())
                         .unwrap_or_else(|| txn.currency.clone());
                     self.subscriptions.update(&sub.id, |s| {
+                        // A trial's first successful charge converts it to a
+                        // normal active subscription.
+                        if s.status == SubscriptionStatus::Trialing {
+                            s.status = SubscriptionStatus::Active;
+                            s.trial_end = None;
+                        }
                         s.current_period_start = new_period_start;
                         s.current_period_end = new_period_end;
                         s.next_charge_at = new_period_end;

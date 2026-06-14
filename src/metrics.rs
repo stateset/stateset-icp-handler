@@ -249,6 +249,9 @@ pub fn record_subscription_renewal(outcome: &str) {
 pub fn record_subscription_scheduler_tick(counts: &crate::state_store::SubscriptionStatusCounts) {
     SUBSCRIPTION_SCHEDULER_TICKS.inc();
     SUBSCRIPTIONS_BY_STATUS
+        .with_label_values(&["trialing"])
+        .set(counts.trialing as i64);
+    SUBSCRIPTIONS_BY_STATUS
         .with_label_values(&["active"])
         .set(counts.active as i64);
     SUBSCRIPTIONS_BY_STATUS

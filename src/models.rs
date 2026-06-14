@@ -353,6 +353,10 @@ pub struct TrackParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
+    /// In a free trial — enrolled with a payment instrument on file, but
+    /// the first charge is deferred to `trial_end` (= `next_charge_at`).
+    /// The scheduler's first successful charge flips this to `Active`.
+    Trialing,
     Active,
     Paused,
     Canceled,
@@ -362,6 +366,7 @@ pub enum SubscriptionStatus {
 impl SubscriptionStatus {
     pub fn wire_name(self) -> &'static str {
         match self {
+            Self::Trialing => "trialing",
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Canceled => "canceled",
@@ -437,6 +442,11 @@ pub struct Subscription {
     /// any successful renewal. Used to drive the `past_due` transition.
     #[serde(default)]
     pub failed_renewal_attempts: u32,
+    /// When set, the subscription is in a free trial until this instant —
+    /// no charge is taken at `subscribe` time; the first charge fires at
+    /// `next_charge_at` (= `trial_end`). Absent for non-trial subscriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_end: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -448,6 +458,11 @@ pub struct SubscribeParams {
     pub ship_to: Option<Address>,
     pub cadence: BillingCadence,
     pub payment: PaymentInstrument,
+    /// Optional free-trial length in days. When set (> 0) no charge is
+    /// taken at subscribe time; the subscription starts `trialing` and the
+    /// first charge is scheduled for `now + trial_days`.
+    #[serde(default)]
+    pub trial_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

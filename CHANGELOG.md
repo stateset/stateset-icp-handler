@@ -17,6 +17,15 @@ and this project adheres to date-based ICP versioning — see
 ## [Unreleased]
 
 ### Added
+- **Subscription free trials.** `intent.subscribe` accepts `trial_days`:
+  when set, no charge is taken at subscribe time, the subscription starts in
+  a new `trialing` status with the payment instrument on file, and the first
+  charge is scheduled for `now + trial_days`. The renewal scheduler bills
+  that first charge at trial end and flips the status to `active`. A manual
+  `intent.renew` during the trial converts it early. Adds `Subscription.
+  trial_end`, the `trialing` subscription status (queryable via the
+  `?status=trialing` list filter and exposed on the `subscriptions_by_status`
+  metric), and a `trialing` count to the scheduler status snapshot.
 - **Cross-instance idempotency.** Idempotency was previously serialized only
   by an in-process lock, so two handler processes sharing one database could
   both miss-then-execute the same keyed write and double-charge. A keyed

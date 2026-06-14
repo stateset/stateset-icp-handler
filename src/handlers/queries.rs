@@ -161,12 +161,13 @@ fn parse_subscription_status_filter(
 ) -> Result<crate::models::SubscriptionStatus, ApiError> {
     use crate::models::SubscriptionStatus;
     match s {
+        "trialing" => Ok(SubscriptionStatus::Trialing),
         "active" => Ok(SubscriptionStatus::Active),
         "paused" => Ok(SubscriptionStatus::Paused),
         "canceled" => Ok(SubscriptionStatus::Canceled),
         "past_due" => Ok(SubscriptionStatus::PastDue),
         other => Err(ApiError::InvalidRequest(format!(
-            "unknown status filter '{other}' — expected one of active|paused|canceled|past_due"
+            "unknown status filter '{other}' — expected one of trialing|active|paused|canceled|past_due"
         ))),
     }
 }
