@@ -563,7 +563,7 @@ Phase 0-3 of the 1.0 readiness plan shipped in `v0.2.0`. Remaining work for a tr
 
 - Additional DID resolver methods (`did:stateset:buyer`, formal `did:web` TTL-cache documentation).
 - Full engine routing for tax, promotions, and shipping (stub seams exist today — real providers pluggable via `ShippingCalculator`, `TaxEngine`, `PromotionEngine` traits in a follow-up release).
-- Go and Ruby bindings (Python + npm shipped; Go is the next natural target given agent frameworks in that language).
+- Ruby bindings (Python, Go, and npm shipped; Ruby is the next natural target).
 - Distributed state: the in-memory rate-limit counter and the per-instance SQLite state pool both cap multi-handler scale-out. A Redis- or Postgres-backed `StateBackend` trait implementation removes that cap.
 - Multi-handler horizontal scale-out behind a sticky-by-`agent_id` load balancer with shared state.
 - GitHub Releases publishing pre-built `icp-conformance` binaries so `npx @stateset/icp-conformance` can download on first run rather than requiring a monorepo checkout.

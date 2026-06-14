@@ -286,9 +286,12 @@ On the roadmap toward v1.0:
 
 - [ ] Additional DID resolver methods (`did:stateset:buyer`)
 - [ ] Full engine routing for tax, promotions, shipping
-- [ ] Subscription mid-cycle proration and trial periods
+- [ ] Subscription mid-cycle proration
 
-Consult [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
+Recently shipped: subscription free trials (`intent.subscribe` `trial_days`)
+and cross-instance idempotency (database reservations so multiple replicas
+sharing one store can't double-charge). Consult [`CHANGELOG.md`](./CHANGELOG.md)
+for the full release history.
 
 ---
 
