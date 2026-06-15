@@ -58,8 +58,28 @@ impl IcpService {
             .clone()
             .unwrap_or_else(|| "USD".to_string());
 
-        let (line_items, totals) =
+        let (line_items, mut totals) =
             price_request_items(&params.items, &currency, "quote.params.items")?;
+
+        // Apply discount codes through the engine's promotions engine when
+        // the caller supplied any. Additive and safe-by-default: with no
+        // codes, no engine, or no matching coupon (the un-seeded default),
+        // the discount is 0 and totals are unchanged. The discount is baked
+        // into the stored totals, so the later charge (which reads the
+        // transaction's total) is consistent with the quote.
+        if !params.discount_codes.is_empty() {
+            if let Some(engine) = self.engine.as_ref() {
+                let discount = engine.compute_discount_minor(
+                    &params.items,
+                    &currency,
+                    params.ship_to.as_ref(),
+                    &params.discount_codes,
+                );
+                if discount > 0 {
+                    super::helpers::apply_discount_to_totals(&mut totals, discount, &currency);
+                }
+            }
+        }
 
         let mut txn = self.fresh_transaction(input, TransactionState::Quoted);
         txn.buyer = params.buyer.unwrap_or_default();

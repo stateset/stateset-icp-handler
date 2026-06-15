@@ -68,6 +68,77 @@ impl CommerceEngine {
         self.inner.promotions()
     }
 
+    /// Compute the total discount (in minor units) for `coupon_codes` against
+    /// the given basket, via the engine's promotions engine. Returns 0 when
+    /// no code matches a configured coupon — which is the case for the
+    /// default/un-seeded database, so callers get the prior (no-discount)
+    /// behavior unless coupons have actually been provisioned. Unknown or
+    /// invalid codes are simply rejected by the engine, never an error.
+    pub fn compute_discount_minor(
+        &self,
+        items: &[crate::models::RequestItem],
+        currency: &str,
+        ship_to: Option<&crate::models::Address>,
+        coupon_codes: &[String],
+    ) -> i64 {
+        use stateset_core::{ApplyPromotionsRequest, PromotionLineItem};
+        let Ok(parsed_currency) = currency.parse() else {
+            return 0;
+        };
+        let mut line_items = Vec::with_capacity(items.len());
+        let mut subtotal = Decimal::ZERO;
+        for (idx, item) in items.iter().enumerate() {
+            let unit_minor = item
+                .unit_price_hint
+                .as_ref()
+                .map(|m| m.amount_minor)
+                .unwrap_or(1_000);
+            let unit_price = minor_to_decimal(unit_minor, currency);
+            let qty = item.quantity.max(0);
+            // `rust_decimal` multiply/add PANIC on overflow. A crafted
+            // huge amount_minor × quantity would otherwise abort the
+            // process (release builds use panic=abort) — the same class the
+            // tax path is hardened against. A basket too large to represent
+            // simply gets no discount.
+            let Some(line_total) = unit_price.checked_mul(Decimal::from(qty)) else {
+                return 0;
+            };
+            let Some(next) = subtotal.checked_add(line_total) else {
+                return 0;
+            };
+            subtotal = next;
+            line_items.push(PromotionLineItem {
+                id: format!("li_{idx:06}"),
+                product_id: None,
+                variant_id: None,
+                sku: Some(item.sku.clone()),
+                category_ids: Vec::new(),
+                quantity: qty.min(i64::from(i32::MAX)) as i32,
+                unit_price,
+                line_total,
+            });
+        }
+        let request = ApplyPromotionsRequest {
+            cart_id: None,
+            customer_id: None,
+            coupon_codes: coupon_codes.to_vec(),
+            line_items,
+            subtotal,
+            shipping_amount: Decimal::ZERO,
+            shipping_country: ship_to.and_then(|a| a.country.clone()),
+            shipping_state: ship_to.and_then(|a| a.state.clone()),
+            currency: parsed_currency,
+            is_first_order: false,
+        };
+        match self.promotions().apply(request) {
+            Ok(result) => crate::models::decimal_to_minor(result.total_discount, currency).max(0),
+            Err(err) => {
+                tracing::warn!(%err, "promotions apply failed; applying no discount");
+                0
+            }
+        }
+    }
+
     pub fn tax(&self) -> stateset_embedded::Tax {
         self.inner.tax()
     }

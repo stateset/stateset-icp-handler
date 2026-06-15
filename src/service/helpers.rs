@@ -135,13 +135,7 @@ pub(super) fn price_request_items(
             total: Money::new(line_subtotal, currency),
         });
     }
-    // 8.75% tax. Widen to i128 for the multiply: `subtotal_minor` can reach
-    // i64::MAX (the line math above saturates), and a plain `i64 * 875`
-    // would overflow — panicking under overflow-checks or silently wrapping
-    // to a corrupt (even negative) tax that then flows into the charged
-    // total and the signed receipt. The result is < subtotal, so the
-    // narrowing back to i64 cannot truncate.
-    let tax_minor = (i128::from(subtotal_minor) * 875 / 10_000) as i64;
+    let tax_minor = flat_tax_minor(subtotal_minor);
     let total_minor = subtotal_minor.saturating_add(tax_minor);
     let totals = Totals {
         subtotal: Some(Money::new(subtotal_minor, currency)),
@@ -151,6 +145,33 @@ pub(super) fn price_request_items(
         total: Some(Money::new(total_minor, currency)),
     };
     Ok((line_items, totals))
+}
+
+/// Flat 8.75% tax in minor units. Widened to i128 for the multiply:
+/// `subtotal_minor` can reach i64::MAX (line math saturates), and a plain
+/// `i64 * 875` would overflow — panicking under overflow-checks or silently
+/// wrapping to a corrupt (even negative) tax that then flows into the
+/// charged total and the signed receipt. The result is < subtotal, so the
+/// narrowing back to i64 cannot truncate.
+pub(super) fn flat_tax_minor(subtotal_minor: i64) -> i64 {
+    (i128::from(subtotal_minor) * 875 / 10_000) as i64
+}
+
+/// Apply a discount (minor units) to an already-priced `Totals`, recomputing
+/// tax on the post-discount subtotal: `total = (subtotal − discount) + tax`.
+/// The discount is clamped to the subtotal so the total can't go negative.
+pub(super) fn apply_discount_to_totals(totals: &mut Totals, discount_minor: i64, currency: &str) {
+    let subtotal = totals
+        .subtotal
+        .as_ref()
+        .map(|m| m.amount_minor)
+        .unwrap_or(0);
+    let discount = discount_minor.clamp(0, subtotal);
+    let discounted = subtotal - discount;
+    let tax = flat_tax_minor(discounted);
+    totals.discount = Some(Money::new(discount, currency));
+    totals.tax = Some(Money::new(tax, currency));
+    totals.total = Some(Money::new(discounted.saturating_add(tax), currency));
 }
 
 pub(super) fn total_amount_minor(totals: &Totals) -> i64 {
@@ -409,5 +430,44 @@ impl IcpService {
             updated_at: Utc::now(),
             external_refs: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_discount_recomputes_tax_on_post_discount_subtotal() {
+        // 10_000 subtotal, 8.75% tax. Apply a 2_000 discount → tax is on
+        // the 8_000 discounted subtotal (700), total = 8_000 + 700 = 8_700.
+        let mut totals = Totals {
+            subtotal: Some(Money::new(10_000, "USD")),
+            discount: None,
+            shipping: None,
+            tax: Some(Money::new(flat_tax_minor(10_000), "USD")),
+            total: Some(Money::new(10_000 + flat_tax_minor(10_000), "USD")),
+        };
+        apply_discount_to_totals(&mut totals, 2_000, "USD");
+        assert_eq!(totals.discount.as_ref().unwrap().amount_minor, 2_000);
+        assert_eq!(totals.tax.as_ref().unwrap().amount_minor, 700);
+        assert_eq!(totals.total.as_ref().unwrap().amount_minor, 8_700);
+        // Subtotal is unchanged — the discount is shown separately.
+        assert_eq!(totals.subtotal.as_ref().unwrap().amount_minor, 10_000);
+    }
+
+    #[test]
+    fn discount_is_clamped_to_subtotal_so_total_never_goes_negative() {
+        let mut totals = Totals {
+            subtotal: Some(Money::new(5_000, "USD")),
+            discount: None,
+            shipping: None,
+            tax: Some(Money::new(flat_tax_minor(5_000), "USD")),
+            total: Some(Money::new(5_000 + flat_tax_minor(5_000), "USD")),
+        };
+        // A discount larger than the subtotal clamps to the subtotal.
+        apply_discount_to_totals(&mut totals, 9_999_999, "USD");
+        assert_eq!(totals.discount.as_ref().unwrap().amount_minor, 5_000);
+        assert_eq!(totals.total.as_ref().unwrap().amount_minor, 0);
     }
 }

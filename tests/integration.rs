@@ -1184,6 +1184,70 @@ async fn quote_with_huge_amount_does_not_overflow_tax() {
 }
 
 #[tokio::test]
+async fn unknown_discount_code_leaves_totals_unchanged() {
+    // The discount-code path must be safe-by-default: against the engine with
+    // no provisioned coupons, an unknown code is rejected and the quote is
+    // priced exactly as if no code was sent (no surprise discount, no error).
+    // This also exercises the full promotions request-construction + engine
+    // call end-to-end.
+    let app = setup_with(config_with_engine()).await;
+    let base = json!({
+        "intent": "intent.quote",
+        "agent_id": DEMO_AGENT,
+        "params": {
+            "items": [{ "sku": "WIDGET-001", "quantity": 2,
+                        "unit_price_hint": { "amount_minor": 5000, "currency": "USD" } }]
+        },
+        "context": { "currency": "USD" }
+    });
+    let (s1, no_code) = send(&app, req("POST", "/icp/v1/intents").json_body(base.clone())).await;
+    assert_eq!(s1, StatusCode::OK);
+
+    let mut with_code = base;
+    with_code["params"]["discount_codes"] = json!(["DEFINITELY-NOT-A-REAL-CODE"]);
+    let (s2, coded) = send(&app, req("POST", "/icp/v1/intents").json_body(with_code)).await;
+    assert_eq!(s2, StatusCode::OK, "{coded}");
+
+    assert_eq!(
+        coded["transaction"]["totals"]["total"], no_code["transaction"]["totals"]["total"],
+        "an unknown discount code must not change the total"
+    );
+    assert!(
+        coded["transaction"]["totals"]["discount"].is_null(),
+        "no discount should be recorded for an unknown code"
+    );
+}
+
+#[tokio::test]
+async fn huge_amount_with_discount_code_does_not_panic() {
+    // The discount path builds a Decimal subtotal, and rust_decimal's multiply
+    // PANICS on overflow. A crafted huge amount × quantity plus a discount code
+    // must not abort the process — the discount path bails to no discount.
+    let app = setup_with(config_with_engine()).await;
+    let body = json!({
+        "intent": "intent.quote",
+        "agent_id": DEMO_AGENT,
+        "params": {
+            "items": [{
+                "sku": "WIDGET-001",
+                "quantity": 1_000_000_000_000i64,
+                "unit_price_hint": { "amount_minor": i64::MAX, "currency": "USD" }
+            }],
+            "discount_codes": ["ANYTHING"]
+        },
+        "context": { "currency": "USD" }
+    });
+    let (status, resp) = send(&app, req("POST", "/icp/v1/intents").json_body(body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "huge amount + discount must not panic: {resp}"
+    );
+    // No discount could be represented, so none is applied.
+    assert!(resp["transaction"]["totals"]["discount"].is_null());
+}
+
+#[tokio::test]
 async fn intent_error_carries_intent_id_for_correlation() {
     // Spec §12: an error SHOULD carry `intent_id` so the caller can
     // correlate it to the failing intent. A buy against a nonexistent

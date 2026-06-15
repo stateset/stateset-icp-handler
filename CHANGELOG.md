@@ -17,6 +17,16 @@ and this project adheres to date-based ICP versioning — see
 ## [Unreleased]
 
 ### Added
+- **Discount codes routed through the engine (first slice of real pricing).**
+  `intent.quote` now honors `params.discount_codes` — previously parsed and
+  silently dropped. Codes are applied via the embedded engine's promotions
+  engine; the resulting discount is shown in `totals.discount`, tax is
+  recomputed on the post-discount subtotal, and the discount is baked into
+  the stored transaction total so the later charge (and mandate spend
+  reservation) is consistent with the quote. Additive and safe-by-default:
+  with no codes, no engine, or no matching coupon (the un-seeded default),
+  the quote is priced exactly as before. (Engine routing for tax and
+  shipping remains on the roadmap.)
 - **Subscription free trials.** `intent.subscribe` accepts `trial_days`:
   when set, no charge is taken at subscribe time, the subscription starts in
   a new `trialing` status with the payment instrument on file, and the first
